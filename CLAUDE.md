@@ -2,11 +2,11 @@
 
 ## What this is
 A home/pet-monitoring companion robot ("cat sitter"). Runs on a Jetson Orin Nano.
-The GUI (`robot_control.py`) is the single control surface — it shows live sensor data and sends motor/servo commands to an Arduino over I2C.
+The GUI (`logots_ui.py`) is the single control surface — it shows live sensor data and sends motor/servo commands to an Arduino over I2C.
 
 ## How to run
 ```bash
-conda run -n logots python /home/logots/Desktop/logots/robot_control.py
+conda run -n logots python /home/logots/Desktop/Logots_V2/src/logots_ui.py
 ```
 - Conda env: `logots` (Python 3.10, NumPy 2.2.5)
 - Always run through conda — system Python is missing deps and system OpenCV is incompatible (NumPy 1.x vs 2.x)
@@ -20,7 +20,7 @@ conda run -n logots python /home/logots/Desktop/logots/robot_control.py
 ## Key files
 | File | Purpose |
 |---|---|
-| `robot_control.py` | Main GUI — all sensors + motor control |
+| `src/logots_ui.py` | Main GUI — all sensors + motor control |
 | `logots_motor_control/logots_motor_control.ino` | Arduino firmware |
 | `pinout.txt` | Full 40-pin header wiring reference |
 | `camera_test.sh` | Capture 10 test frames from IMX219 to Desktop |

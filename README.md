@@ -72,7 +72,7 @@ Arduino IDE 2.x has no Linux ARM64 build — flash from a Mac or Windows machine
 ## Running the GUI
 
 ```bash
-conda run -n logots python src/robot_control.py
+conda run -n logots python src/logots_ui.py
 ```
 
 For headless / NoMachine sessions the GUI connects automatically. No display variable needs to be set — the camera pipeline uses `EGL_PLATFORM=surfaceless` internally.
