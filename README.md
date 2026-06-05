@@ -1,6 +1,6 @@
-# Logots V2
+# Logots V2 — PlantSitter
 
-A home and pet-monitoring companion robot. Logots sits in your home, streams live camera and audio, shows IMU orientation, and lets you drive it remotely and point its camera with pan/tilt servos — all from a single GUI.
+An autonomous home plant-monitoring and care robot. Logots roams your home, keeps an eye on your plants, streams live camera and audio, and lets you drive it remotely and inspect any plant up close using a pan/tilt camera tower — all from a single GUI.
 
 Built around a **Jetson Orin Nano** running JetPack 6, with an **Arduino** handling motor and servo control over I2C.
 

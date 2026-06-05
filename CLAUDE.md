@@ -1,7 +1,7 @@
 # Logots Robot — Project Guide for Claude
 
 ## What this is
-A home/pet-monitoring companion robot ("cat sitter"). Runs on a Jetson Orin Nano.
+A home plant-monitoring and care robot ("PlantSitter"). Runs on a Jetson Orin Nano.
 The GUI (`logots_ui.py`) is the single control surface — it shows live sensor data and sends motor/servo commands to an Arduino over I2C.
 
 ## How to run
