@@ -4,6 +4,13 @@
 A home plant-monitoring and care robot ("PlantSitter"). Runs on a Jetson Orin Nano.
 The GUI (`logots_ui.py`) is the single control surface — it shows live sensor data and sends motor/servo commands to an Arduino over I2C.
 
+## Working directory
+All work happens in the git repo:
+```
+/home/logots/Desktop/Logots_V2/
+```
+Do not edit files in the old `/home/logots/Desktop/logots/` directory.
+
 ## How to run
 ```bash
 conda run -n logots python /home/logots/Desktop/Logots_V2/src/logots_ui.py
@@ -17,14 +24,27 @@ conda run -n logots python /home/logots/Desktop/Logots_V2/src/logots_ui.py
 - **Storage**: NVMe nvme0n1p1 (500GB Kingston). SD card removed.
 - **Shutdown timeout**: systemd set to 5s (`/etc/systemd/system.conf`)
 
+## Repo structure
+```
+Logots_V2/
+├── README.md
+├── CLAUDE.md
+├── environment.yml          — conda env spec (python 3.10, numpy 2.x)
+└── src/
+    ├── logots_ui.py         — main GUI (all sensors + motor control)
+    ├── pinout.txt           — full 40-pin header wiring reference
+    └── firmware/
+        └── logots_motor_control/
+            └── logots_motor_control.ino  — Arduino firmware
+```
+
 ## Key files
 | File | Purpose |
 |---|---|
 | `src/logots_ui.py` | Main GUI — all sensors + motor control |
-| `logots_motor_control/logots_motor_control.ino` | Arduino firmware |
-| `pinout.txt` | Full 40-pin header wiring reference |
-| `camera_test.sh` | Capture 10 test frames from IMX219 to Desktop |
-| `imu_test.py` | Standalone IMU test |
+| `src/firmware/logots_motor_control/logots_motor_control.ino` | Arduino firmware |
+| `src/pinout.txt` | Full 40-pin header wiring reference |
+| `environment.yml` | Conda environment spec |
 
 ## Hardware wiring
 
@@ -88,6 +108,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 2. **Camera always needs `EGL_PLATFORM=surfaceless`** — DISPLAY=:0 and DISPLAY=:1001.0 both fail for nvarguscamerasrc.
 3. **Don't use system cv2 from conda** — it's compiled for NumPy 1.x and will crash with conda's NumPy 2.x.
 4. **Arduino I2C is always bus 1** — confirmed with `i2cdetect -y -r 1`, shows 0x08.
+5. **Always work in the git repo** — `/home/logots/Desktop/Logots_V2/`. The old `logots/` directory is archived.
 
 ## Known issues / next steps
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
