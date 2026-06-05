@@ -1,0 +1,90 @@
+================================================
+LOGOTS PROJECT: HARDWARE PINOUT
+Device: Jetson Orin Nano (40-pin Header)
+================================================
+
+------------------------------------------------
+1. INMP441 MICROPHONE (INPUT)
+------------------------------------------------
+VDD  --> Pin 1 or 17  (Jetson: 3.3V)        *** DO NOT USE 5V ***
+GND  --> Pin 39       (Jetson: GND)
+L/R  --> Pin 39       (Jetson: GND)          [Sets mic to Mono Left Channel]
+SCK  --> Pin 12       (Jetson: i2s2_sclk)    [Shared with Amp BCLK]
+WS   --> Pin 35       (Jetson: i2s2_fs)      [Shared with Amp LRC]
+SD   --> Pin 38       (Jetson: i2s2_din)
+
+------------------------------------------------
+2. MAX98357A AMPLIFIER (OUTPUT)
+------------------------------------------------
+VIN  --> Pin 2 or 4   (Jetson: 5V)
+GND  --> Pin 6        (Jetson: GND)
+BCLK --> Pin 12       (Jetson: i2s2_sclk)    [Shared with Mic SCK]
+LRC  --> Pin 35       (Jetson: i2s2_fs)      [Shared with Mic WS]
+DIN  --> Pin 40       (Jetson: i2s2_dout)
+
+------------------------------------------------
+3. GROVE IMU 9DOF V2.2 — MPU-9250 (I2C)
+------------------------------------------------
+VCC  --> Pin 1        (Jetson: 3.3V)         *** DO NOT USE 5V ***
+GND  --> Pin 6        (Jetson: GND)
+SDA  --> Pin 3        (Jetson: i2c8)         [Kernel bus: /dev/i2c-7]
+SCL  --> Pin 5        (Jetson: i2c8)         [Kernel bus: /dev/i2c-7]
+
+I2C address : 0x68
+Detect      : i2cdetect -y -r 7
+Orientation : X right, Y forward, Z up (as printed on chip)
+Test script : imu_test.py
+
+NOTE: jetson-io labels these pins as i2c8 but the kernel
+      exposes the bus as /dev/i2c-7. Always use bus 7.
+
+------------------------------------------------
+4. ARDUINO MOTOR CONTROLLER (I2C via Level Shifter)
+------------------------------------------------
+*** LEVEL SHIFTER REQUIRED (e.g. BSS138 4-channel bidirectional) ***
+Jetson runs at 3.3V logic; Arduino runs at 5V logic.
+
+  LEVEL SHIFTER — JETSON SIDE (LV = 3.3V):
+  LV (Vcc)  --> Pin 1  (Jetson: 3.3V)
+  GND       --> Pin 6  (Jetson: GND)
+  LV1 / A1  --> Pin 27 (Jetson: i2c1 SDA)   [Kernel bus: /dev/i2c-1]
+  LV2 / A2  --> Pin 28 (Jetson: i2c1 SCL)   [Kernel bus: /dev/i2c-1]
+
+  LEVEL SHIFTER — ARDUINO SIDE (HV = 5V):
+  HV (Vcc)  --> Arduino 5V
+  GND       --> Arduino GND
+  HV1 / B1  --> Arduino A4  (SDA)
+  HV2 / B2  --> Arduino A5  (SCL)
+
+Arduino I2C address : 0x08
+Detect              : i2cdetect -y -r 1   (should show 08)
+Firmware            : src/firmware/logots_motor_control/logots_motor_control.ino
+Protocol            : "{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"
+
+  ARDUINO — MOTOR SHIELD (Adafruit Motor Shield v1):
+  Left DC motor  : Channel 3
+  Right DC motor : Channel 4
+
+  ARDUINO — SERVOS (MG90S):
+  Pan servo  (camera rotation)  : Pin 10
+  Tilt servo (camera elevation) : Pin 9
+
+------------------------------------------------
+HOW TO VIEW CURRENT JETSON HEADER STATE:
+------------------------------------------------
+Interactive GUI (shows full 40-pin layout + configure):
+  sudo python3 /opt/nvidia/jetson-io/jetson-io.py
+
+Print current pin assignments (non-interactive):
+  sudo python3 /opt/nvidia/jetson-io/config-by-pin.py --list
+
+------------------------------------------------
+WIRING NOTES:
+------------------------------------------------
+* THE I2S BUS: Clocks (Pin 12 and 35) are shared. Both the mic and the amp
+  connect to these exact same pins on the Jetson.
+* GROUND: All grounds are connected together to form a common reference.
+* POWER: Power lines must remain isolated! The mic needs 3.3V, and the amp
+  needs 5V to drive the speaker.
+* LEVEL SHIFTER: Always connect LV side to Jetson (3.3V) and HV side to
+  Arduino (5V). Swapping sides will not work and may damage the Jetson.

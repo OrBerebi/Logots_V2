@@ -1,0 +1,15 @@
+name: logots
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=2.0
+  - matplotlib>=3.8
+  - portaudio        # required by sounddevice
+  - pip
+  - pip:
+      - pillow
+      - sounddevice
+      - smbus2
+      - pyaudio
