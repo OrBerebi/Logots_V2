@@ -103,6 +103,17 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 - Keyboard: W/S = forward/back, A/D = turn, SPACE = stop
 - Arduino auto-connects on startup, retries every 3s if lost
 
+## Git setup
+- Remote: `https://github.com/OrBerebi/Logots_V2.git`
+- Credentials stored in `~/.git-credentials` via `git credential.helper store`
+- Git identity: `Or Berebi <or.berebi1@gmail.com>`
+- To push: `git -C /home/logots/Desktop/Logots_V2 push origin main`
+- Arduino IDE 2.x has no Linux ARM64 build — flash firmware from MacBook only
+
+## System tweaks (already applied)
+- gnome-terminal copy/paste remapped to `Ctrl+C` / `Ctrl+V` via gsettings
+- systemd `DefaultTimeoutStopSec=5s` for fast headless shutdown
+
 ## Critical rules
 1. **Never manually edit `/boot/extlinux/extlinux.conf`** — always use `jetson-io.py`. Manual edits brick the boot.
 2. **Camera always needs `EGL_PLATFORM=surfaceless`** — DISPLAY=:0 and DISPLAY=:1001.0 both fail for nvarguscamerasrc.
