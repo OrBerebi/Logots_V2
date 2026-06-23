@@ -1,0 +1,205 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1840 960" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowLoop" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0ea5e9"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1840" height="960" fill="#f8fafc"/>
+
+  <!-- title -->
+  <text x="44" y="56" font-size="30" font-weight="700" fill="#0f172a">Logots V1 — System Architecture</text>
+  <text x="46" y="86" font-size="15" fill="#64748b">Sensory Input → Staging → Transformation → Mart → Decision → Execution → back to hardware</text>
+
+  <!-- cadence chip -->
+  <rect x="1430" y="36" width="370" height="40" rx="20" fill="#ffffff" stroke="#e2e8f0" filter="url(#shadow)"/>
+  <text x="1615" y="61" font-size="13" fill="#334155" text-anchor="middle">FPS 4  ·  chunk 12 frames (~3 s)  ·  reflective ~20 s</text>
+
+  <!-- ============ LAYER BANDS ============ -->
+  <!-- 1 Sensory -->
+  <rect x="40"   y="150" width="200" height="620" rx="22" fill="#eef2f7" stroke="#94a3b8"/>
+  <rect x="60"   y="168" width="160" height="38" rx="19" fill="#64748b"/>
+  <text x="140"  y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">1 · Sensory Input</text>
+  <!-- 2 Staging -->
+  <rect x="310"  y="150" width="200" height="620" rx="22" fill="#e8f1fd" stroke="#7aa0d2"/>
+  <rect x="330"  y="168" width="160" height="38" rx="19" fill="#3b82f6"/>
+  <text x="410"  y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">2 · Staging</text>
+  <!-- 3 Transformation -->
+  <rect x="580"  y="150" width="280" height="620" rx="22" fill="#e9f7e7" stroke="#86bf6a"/>
+  <rect x="600"  y="168" width="240" height="38" rx="19" fill="#22a558"/>
+  <text x="720"  y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">3 · Transformation</text>
+  <!-- 4 Mart -->
+  <rect x="930"  y="150" width="200" height="620" rx="22" fill="#fdf4e3" stroke="#e0b15f"/>
+  <rect x="950"  y="168" width="160" height="38" rx="19" fill="#f59e0b"/>
+  <text x="1030" y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">4 · Mart</text>
+  <!-- 5 Decision -->
+  <rect x="1200" y="150" width="290" height="620" rx="22" fill="#f1ebfb" stroke="#a78bd0"/>
+  <rect x="1220" y="168" width="250" height="38" rx="19" fill="#8b5cf6"/>
+  <text x="1345" y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">5 · Decision</text>
+  <!-- 6 Execution -->
+  <rect x="1560" y="150" width="200" height="620" rx="22" fill="#fde9e9" stroke="#d98989"/>
+  <rect x="1580" y="168" width="160" height="38" rx="19" fill="#ef4444"/>
+  <text x="1660" y="193" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">6 · Execution</text>
+
+  <!-- ============ FLOW ARROWS BETWEEN BANDS ============ -->
+  <g stroke="#475569" stroke-width="2.5" fill="none">
+    <line x1="246" y1="460" x2="302" y2="460" marker-end="url(#arrow)"/>
+    <line x1="516" y1="460" x2="572" y2="460" marker-end="url(#arrow)"/>
+    <line x1="866" y1="460" x2="922" y2="460" marker-end="url(#arrow)"/>
+    <line x1="1136" y1="460" x2="1192" y2="460" marker-end="url(#arrow)"/>
+    <line x1="1496" y1="460" x2="1552" y2="460" marker-end="url(#arrow)"/>
+  </g>
+  <g font-size="11" fill="#64748b" text-anchor="middle" font-style="italic">
+    <text x="274" y="450">stream</text>
+    <text x="544" y="450">extract</text>
+    <text x="894" y="450">join</text>
+    <text x="1164" y="450">decide</text>
+    <text x="1524" y="450">to PWM</text>
+  </g>
+
+  <!-- ============ CARDS ============ -->
+  <!-- helper visual: each card = white rounded rect + colored accent bar + title + subtitle (+ optional model tag) -->
+
+  <!--1 Sensory cards (accent #64748b)-->
+  <g filter="url(#shadow)"><rect x="56" y="228" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="64" y="244" width="4" height="54" rx="2" fill="#64748b"/>
+  <text x="80" y="262" font-size="14" font-weight="700" fill="#0f172a">ESP32-CAM</text>
+  <text x="80" y="284" font-size="11" fill="#64748b">640×480 JPEG · /capture</text>
+  <text x="80" y="300" font-size="10" fill="#94a3b8">port 80</text>
+
+  <g filter="url(#shadow)"><rect x="56" y="330" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="64" y="346" width="4" height="54" rx="2" fill="#64748b"/>
+  <text x="80" y="364" font-size="14" font-weight="700" fill="#0f172a">ESP32 + INMP441</text>
+  <text x="80" y="386" font-size="11" fill="#64748b">I²S mic · 16 kHz mono</text>
+  <text x="80" y="402" font-size="10" fill="#94a3b8">TCP 12345</text>
+
+  <g filter="url(#shadow)"><rect x="56" y="432" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="64" y="448" width="4" height="54" rx="2" fill="#64748b"/>
+  <text x="80" y="466" font-size="14" font-weight="700" fill="#0f172a">ESP32 + 9DOF</text>
+  <text x="80" y="488" font-size="11" fill="#64748b">Grove IMU · yaw/pitch/roll</text>
+  <text x="80" y="504" font-size="10" fill="#94a3b8">TCP 12345</text>
+
+  <g filter="url(#shadow)"><rect x="56" y="534" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="64" y="550" width="4" height="54" rx="2" fill="#64748b"/>
+  <text x="80" y="568" font-size="14" font-weight="700" fill="#0f172a">ESP32 → Arduino</text>
+  <text x="80" y="590" font-size="11" fill="#64748b">L293D motors + speaker</text>
+  <text x="80" y="606" font-size="10" fill="#94a3b8">TCP 12345 / 12346</text>
+
+  <!--2 Staging cards (accent #3b82f6)-->
+  <g filter="url(#shadow)"><rect x="326" y="228" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="334" y="244" width="4" height="54" rx="2" fill="#3b82f6"/>
+  <text x="350" y="262" font-size="13" font-weight="700" fill="#0f172a">stg_visual_data</text>
+  <text x="350" y="284" font-size="11" fill="#64748b">raw frames</text>
+
+  <g filter="url(#shadow)"><rect x="326" y="330" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="334" y="346" width="4" height="54" rx="2" fill="#3b82f6"/>
+  <text x="350" y="364" font-size="13" font-weight="700" fill="#0f172a">stg_audio_data</text>
+  <text x="350" y="386" font-size="11" fill="#64748b">raw PCM</text>
+
+  <g filter="url(#shadow)"><rect x="326" y="432" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="334" y="448" width="4" height="54" rx="2" fill="#3b82f6"/>
+  <text x="350" y="466" font-size="13" font-weight="700" fill="#0f172a">stg_imu_data</text>
+  <text x="350" y="488" font-size="11" fill="#64748b">raw YPR</text>
+
+  <g filter="url(#shadow)"><rect x="326" y="534" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="334" y="550" width="4" height="54" rx="2" fill="#3b82f6"/>
+  <text x="350" y="568" font-size="13" font-weight="700" fill="#0f172a">stg_motor_data</text>
+  <text x="350" y="590" font-size="11" fill="#64748b">PWM log (proprioception)</text>
+
+  <!--3 Transformation cards (accent #22a558)-->
+  <g filter="url(#shadow)"><rect x="596" y="228" width="248" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="604" y="244" width="4" height="54" rx="2" fill="#22a558"/>
+  <text x="620" y="262" font-size="13" font-weight="700" fill="#0f172a">trans_visual_cat_detection</text>
+  <text x="620" y="284" font-size="11" fill="#64748b">cat centroid + area</text>
+  <rect x="762" y="290" width="74" height="18" rx="9" fill="#dcfce7"/>
+  <text x="799" y="303" font-size="10" font-weight="700" fill="#16a34a" text-anchor="middle">YOLOv8m</text>
+
+  <g filter="url(#shadow)"><rect x="596" y="330" width="248" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="604" y="346" width="4" height="54" rx="2" fill="#22a558"/>
+  <text x="620" y="364" font-size="13" font-weight="700" fill="#0f172a">trans_audio_features</text>
+  <text x="620" y="386" font-size="11" fill="#64748b">meow vs. motor noise</text>
+  <rect x="800" y="392" width="36" height="18" rx="9" fill="#dcfce7"/>
+  <text x="818" y="405" font-size="10" font-weight="700" fill="#16a34a" text-anchor="middle">AST</text>
+
+  <g filter="url(#shadow)"><rect x="596" y="432" width="248" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="604" y="448" width="4" height="54" rx="2" fill="#22a558"/>
+  <text x="620" y="466" font-size="13" font-weight="700" fill="#0f172a">trans_audio_transcribe</text>
+  <text x="620" y="488" font-size="11" fill="#64748b">speech → text</text>
+  <rect x="772" y="494" width="64" height="18" rx="9" fill="#dcfce7"/>
+  <text x="804" y="507" font-size="10" font-weight="700" fill="#16a34a" text-anchor="middle">Whisper</text>
+
+  <g filter="url(#shadow)"><rect x="596" y="534" width="248" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="604" y="550" width="4" height="54" rx="2" fill="#22a558"/>
+  <text x="620" y="568" font-size="13" font-weight="700" fill="#0f172a">trans_imu_features</text>
+  <text x="620" y="590" font-size="11" fill="#64748b">movement intensity, balance</text>
+
+  <g filter="url(#shadow)"><rect x="596" y="636" width="248" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="604" y="652" width="4" height="54" rx="2" fill="#22a558"/>
+  <text x="620" y="670" font-size="13" font-weight="700" fill="#0f172a">trans_motor_data</text>
+  <text x="620" y="692" font-size="11" fill="#64748b">thrust + rotation vectors</text>
+
+  <!--4 Mart cards (accent #f59e0b)-->
+  <g filter="url(#shadow)"><rect x="946" y="228" width="168" height="160" rx="12" fill="#fffbeb" stroke="#f1d99a"/></g>
+  <rect x="954" y="246" width="4" height="124" rx="2" fill="#f59e0b"/>
+  <text x="970" y="266" font-size="14" font-weight="700" fill="#0f172a">mrt_experiences</text>
+  <text x="970" y="290" font-size="11" fill="#64748b">unified multi-modal</text>
+  <text x="970" y="306" font-size="11" fill="#64748b">12-frame window</text>
+  <text x="970" y="330" font-size="10" fill="#b45309">single source of truth</text>
+  <text x="970" y="352" font-size="10" fill="#94a3b8">build_mrt_experiences()</text>
+
+  <g filter="url(#shadow)"><rect x="946" y="404" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="954" y="420" width="4" height="54" rx="2" fill="#f59e0b"/>
+  <text x="970" y="438" font-size="13" font-weight="700" fill="#0f172a">mart_play_kpis</text>
+  <text x="970" y="460" font-size="11" fill="#64748b">interaction stats</text>
+
+  <!--5 Decision cards (accent #8b5cf6)-->
+  <g filter="url(#shadow)"><rect x="1216" y="228" width="258" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="1224" y="244" width="4" height="54" rx="2" fill="#8b5cf6"/>
+  <text x="1240" y="262" font-size="13" font-weight="700" fill="#0f172a">decision_definitions</text>
+  <text x="1240" y="284" font-size="11" fill="#64748b">action templates / params</text>
+
+  <g filter="url(#shadow)"><rect x="1216" y="330" width="258" height="120" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="1224" y="346" width="4" height="88" rx="2" fill="#8b5cf6"/>
+  <text x="1240" y="364" font-size="13" font-weight="700" fill="#0f172a">mrt_immediate_decisions</text>
+  <text x="1240" y="386" font-size="11" fill="#64748b">rule engine, priority-ranked</text>
+  <text x="1240" y="404" font-size="10" fill="#94a3b8">safety 99 · voice 50 · greet 10 · gaze 5</text>
+  <rect x="1392" y="416" width="58" height="18" rx="9" fill="#ede9fe"/>
+  <text x="1421" y="429" font-size="10" font-weight="700" fill="#7c3aed" text-anchor="middle">Rules · 3 s</text>
+
+  <g filter="url(#shadow)"><rect x="1216" y="466" width="258" height="120" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="1224" y="482" width="4" height="88" rx="2" fill="#8b5cf6"/>
+  <text x="1240" y="500" font-size="13" font-weight="700" fill="#0f172a">mrt_reflective_decisions</text>
+  <text x="1240" y="522" font-size="11" fill="#64748b">LLM strategic layer</text>
+  <text x="1240" y="540" font-size="10" fill="#94a3b8">reads last 80 rows → JSON action</text>
+  <rect x="1366" y="552" width="84" height="18" rx="9" fill="#ede9fe"/>
+  <text x="1408" y="565" font-size="10" font-weight="700" fill="#7c3aed" text-anchor="middle">Claude Haiku</text>
+
+  <!--6 Execution cards (accent #ef4444)-->
+  <g filter="url(#shadow)"><rect x="1576" y="228" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="1584" y="244" width="4" height="54" rx="2" fill="#ef4444"/>
+  <text x="1600" y="262" font-size="12" font-weight="700" fill="#0f172a">mrt_decisions_to_actions</text>
+  <text x="1600" y="284" font-size="11" fill="#64748b">decision → params</text>
+
+  <g filter="url(#shadow)"><rect x="1576" y="330" width="168" height="86" rx="12" fill="#ffffff" stroke="#e2e8f0"/></g>
+  <rect x="1584" y="346" width="4" height="54" rx="2" fill="#ef4444"/>
+  <text x="1600" y="364" font-size="13" font-weight="700" fill="#0f172a">mrt_motor</text>
+  <text x="1600" y="386" font-size="11" fill="#64748b">PWM frames @ 10 Hz</text>
+  <rect x="1686" y="392" width="50" height="18" rx="9" fill="#fee2e2"/>
+  <text x="1711" y="405" font-size="10" font-weight="700" fill="#dc2626" text-anchor="middle">PWM</text>
+
+  <!-- ============ CLOSED LOOP (Execution → Hardware) ============ -->
+  <path d="M 1660 770 L 1660 868 Q 1660 888 1640 888 L 160 888 Q 140 888 140 868 L 140 774"
+        fill="none" stroke="#0ea5e9" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#arrowLoop)"/>
+  <rect x="700" y="872" width="440" height="32" rx="16" fill="#ffffff" stroke="#bae6fd"/>
+  <text x="920" y="893" font-size="12" font-weight="600" fill="#0369a1" text-anchor="middle">closing the loop · BRAIN_COMMAND_QUEUE → stream_motors → motor ESP32 (PWM @ 4 fps)</text>
+
+  <!-- footer note -->
+  <text x="46" y="936" font-size="11" fill="#94a3b8">Manual GUI control overrides the brain at all times · debug mode adds audio/video/GIF capture · normal mode streams CSVs with bounded RAM</text>
+</svg>
