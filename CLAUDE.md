@@ -30,8 +30,11 @@ Logots_V2/
 ├── README.md
 ├── CLAUDE.md
 ├── environment.yml          — conda env spec (python 3.10, numpy 2.x)
+├── recordings/              — session CSVs written here (gitignored)
+│   └── session_YYYYMMDD_HHMMSS/
+│       └── session_YYYYMMDD_HHMMSS.csv
 └── src/
-    ├── logots_ui.py         — main GUI (all sensors + motor control)
+    ├── logots_ui.py         — main GUI (all sensors + motor control + recording)
     ├── pinout.txt           — full 40-pin header wiring reference
     └── firmware/
         └── logots_motor_control/
@@ -41,7 +44,7 @@ Logots_V2/
 ## Key files
 | File | Purpose |
 |---|---|
-| `src/logots_ui.py` | Main GUI — all sensors + motor control |
+| `src/logots_ui.py` | Main GUI — all sensors + motor control + recording |
 | `src/firmware/logots_motor_control/logots_motor_control.ino` | Arduino firmware |
 | `src/pinout.txt` | Full 40-pin header wiring reference |
 | `environment.yml` | Conda environment spec |
@@ -98,10 +101,38 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS     │  live IMX219 feed   │
 └─────────────────────┴─────────────────────┘
-  L: +0000  R: +0000  PAN:090°  TLT:090°   ■ STOP
+  L: +0000  R: +0000  PAN:090°  TLT:090°  ⚫ REC  ■ STOP
 ```
 - Keyboard: W/S = forward/back, A/D = turn, SPACE = stop
 - Arduino auto-connects on startup, retries every 3s if lost
+
+## Recording feature
+
+Press **⚫ REC** to start recording; press again to stop. Output:
+```
+recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
+```
+
+### CSV schema (staging layer — one row per 20 Hz tick)
+| Column | Type | Description |
+|---|---|---|
+| `frame_id` | int | 0-based counter per session |
+| `timestamp` | ISO 8601 | wall-clock time |
+| `frame_data` | base64 str | grayscale 640×640 JPEG, base64-encoded; `""` if no camera |
+| `yaw` | JSON array | all IMU yaw readings (°) since last frame |
+| `pitch` | JSON array | all IMU pitch readings (°) since last frame |
+| `roll` | JSON array | all IMU roll readings (°) since last frame |
+| `audio_samples` | JSON array | all mic samples since last frame (~800 floats at 20 FPS) |
+| `left_pwm` | int | left motor command, –255…+255 |
+| `right_pwm` | int | right motor command, –255…+255 |
+| `pan_angle` | int | pan servo, 0…180° |
+| `tilt_angle` | int | tilt servo, 0…180° |
+
+### Architecture notes
+- `self.latest_frame` is populated every tick regardless of recording state — downstream processing blocks can read it from any `_tick_*` method added to `_loop()`.
+- `IMUReader.drain_samples()` and `AudioReader.drain_samples()` atomically swap their internal buffers, so all readings since the last frame are captured as arrays (not just the latest snapshot).
+- `RecordingManager` writer thread handles frame encoding (PIL BGR→gray→640×640→JPEG→base64) and CSV writes off the main thread.
+- Frame encoding uses PIL, not cv2, to stay compatible with NumPy 2.x.
 
 ## Git setup
 - Remote: `https://github.com/OrBerebi/Logots_V2.git`
@@ -124,4 +155,4 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 ## Known issues / next steps
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
 - Motors and servos not yet physically connected to Arduino — I2C command flow confirmed working, hardware wiring pending.
-- No unified SensorFrame / MotorCommand schema yet — main robot loop not written.
+- Staging layer CSV implemented; transformation + mart + decision layers not yet written.

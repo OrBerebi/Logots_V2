@@ -1,0 +1,261 @@
+# Cat Sitter Data Architecture V2
+
+# Cat Sitter Data Architecture
+
+## 1. Staging Layer
+
+The **staging layer** captures raw sensor data, which is used as input for further processing in the transformation layer.
+
+Frame assumption: `sec / 5`, defined by the visual data as a bottleneck (the slowest sensor).
+
+### Tables in the Staging Layer
+
+1. **`stg_audio_data`**
+    
+    Captures raw audio samples from the microphone sensor (set to 16000Hz sampling).
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | Unique identifier for each audio frame |
+    | `timestamp` | DATETIME | Timestamp when the audio frame was recorded |
+    | `audio_samples` | ARRAY | The audio sample |
+2. **`stg_imu_data`**
+    
+    Stores raw IMU sensor readings, capturing motion, orientation, and magnetic data.
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | Unique identifier for each imu frame |
+    | `timestamp` | DATETIME | Timestamp when the IMU data was recorded |
+    | `yaw` | ARRAY | Azimuth angle with respect to magnetic north [deg] |
+    | `pitch` | ARRAY | Elevation angle [deg] |
+    | `roll` | ARRAY | Roll in degrees [deg] |
+3. **`stg_visual_data`**
+    
+    Stores raw image frames captured from the camera. (Resolution: 480×480)
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | Unique identifier for each frame |
+    | `timestamp` | DATETIME | Time when the frame was captured |
+    | `frame_data` | BLOB | Grayscale data array |
+
+---
+
+## 2. Transformation Layer
+
+The **transformation layer** processes the raw data from the staging layer and extracts meaningful features.
+
+### Tables in the Transformation Layer
+
+1. **`trans_audio_features`**
+    
+    Extracts spectral and categorical information from each ≈20 ms audio frame.
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | ID carried over from the staging audio chunk. |
+    | `timestamp` | DATETIME | Recording time of the frame. |
+    | `fft_result` | JSON | Array of `{frequency, magnitude}` pairs after FFT. |
+    | `classification` | VARCHAR | `Voice` vs `Noise` first-pass label. |
+    | `is_cat_voice` | BOOLEAN | `1` when spectral shape matches a meow. |
+    | `is_human_voice` | BOOLEAN | `1` when speech formants dominate. |
+    | `meow_loudness` | VARCHAR | `low / medium / high / none` (SPL in meow band). |
+    | `dominant_frequency` | FLOAT | Highest-magnitude frequency (Hz). |
+2. **`trans_visual_cat_detection`**
+    
+    Bounding-box information per processed video frame.
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | Matches the row in `stg_visual_data`. |
+    | `timestamp` | DATETIME | Capture time of the frame. |
+    | `cat_detected` | BOOLEAN | `1` if at least one *cat* box found. |
+    | `cat_position_x` | INT | X-coordinate of the cat centroid. |
+    | `cat_position_y` | INT | Y-coordinate of the cat centroid. |
+    | `bounding_box` | JSON | `{x, y, width, height}` of best box. |
+    | `confidence_score` | FLOAT | Model confidence (0–1). |
+3. **`trans_imu_features`**
+    
+    Movement, orientation and interaction cues derived from raw IMU triples.
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | ID aligned with the other modalities. |
+    | `timestamp` | DATETIME | Time sample was logged. |
+    | `rotation_speed` | FLOAT | ‖(`gx`, `gy`, `gz`)‖ – angular velocity magnitude. |
+    | `movement_intensity` | FLOAT | ‖(`ax`, `ay`, `az`)‖ – linear acceleration magnitude. |
+    | `balance_state` | BOOLEAN | `1` when orientation angles ≈ steady. |
+    | `cat_interaction_detected` | BOOLEAN | Flag set on sharp accel/gyro spikes. |
+    | `is_rest` | BOOLEAN | `1` when both intensities below idle thresholds. |
+    | `delta_yaw` | FLOAT | Change in yaw since previous frame (°). |
+    | `delta_pitch` | FLOAT | Change in pitch (°). |
+    | `delta_roll` | FLOAT | Change in roll (°). |
+4. **`trans_motor_features`**
+    
+    Statelessly translates motor commands from `mart_motor` into instantaneous movement vectors (velocities).
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `frame_id` | BIGINT | ID aligned with `mart_motor`. (note: the delay) |
+    | `timestamp` | DATETIME | Time of the motor command. |
+    | `thrust_velocity` | FLOAT | Proportional to forward/backward velocity (left_pwm + right_pwm). |
+    | `rotation_velocity` | FLOAT | Proportional to angular velocity (left_pwm - right_pwm). |
+    | `arm_angle` | INT | Pass-through of the arm angle for aggregation. |
+
+---
+
+## 3. Mart Layer
+
+The **mart layer** aggregates and integrates features extracted in the transformation layer and prepares them for model training and evaluation.
+
+### Tables in the Mart Layer
+
+1. **`mrt_experiences`**
+    
+    Combines all sensor data to describe the robot's overall experience for some of the features (with an aggregate of n prior frames).
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `experience_id` | BIGINT | `frame_id` becomes `experience_id`, to give it a meaningful name and not technical |
+    | `last_experience_id_array` | ARRAY | Takes the n frames prior to the current one |
+    | `timestamp` | DATETIME | Synchronized timestamp across all sensors |
+    | `is_cat_voice` | BOOLEAN | Aggregated from `trans_audio_features` |
+    | `is_human_voice` | BOOLEAN | Aggregated from `trans_audio_features` |
+    | `human_voice_sequence` | AUDIO | Aggregated from `trans_audio_features` |
+    | `cat_voice_sequence` | AUDIO | Aggregated from `trans_audio_features` |
+    | `meow_loudness` | VARCHAR | Aggregated from `trans_audio_features` |
+    | `cat_detected` | BOOLEAN | Aggregated from `trans_visual_cat_detection` |
+    | `cat_position_x` | INT | Aggregated from `trans_visual_cat_detection` |
+    | `cat_position_y` | INT | Aggregated from `trans_visual_cat_detection` |
+    | `cat_movement_direction` | VARCHAR | Based on n last frames |
+    | `cat_activity_level` | VARCHAR | Based on n last frames |
+    | `cat_distance_change` | VARCHAR | Based on n last frames |
+    | `delta_cat_position` | VARCHAR | Vector `(x, y)` of the cat's net change in position over the window. |
+    | `sum_cat_position` | FLOAT | Total scalar path length traveled by the cat's centroid over the window. |
+    | `movement_intensity` | FLOAT | Aggregated from `trans_imu_features` |
+    | `cat_interaction_detected` | BOOLEAN | Aggregated from `trans_imu_features` |
+    | `delta_robot_position` | VARCHAR | Vector `(x, y)` of the robot's net change in position over the window. |
+    | `sum_robot_position` | FLOAT | Total scalar path length traveled by the robot over the window. |
+    | `delta_robot_rotation` | FLOAT | Net change in robot's heading (gaze) over the window [deg]. |
+    | `delta_arm_angle` | FLOAT | Net change in arm angle from start to end of the window [deg]. |
+    | `sum_arm_movement` | FLOAT | Total absolute movement of the arm within the window [deg]. |
+2. **`mart_motor`**
+    
+    Captures the robot's motor outputs for each experience frame.
+    
+    | Column | Data Type | Range | Description |
+    | --- | --- | --- | --- |
+    | `frame_id` | INT | 0…∞ | Packet counter for synchronization/debug. |
+    | `timestamp` | DATETIME | any | Time at which ESP32 sampled or issued this command. |
+    | `left_pwm` | INT | –255…+255 | Left wheel: >0 ⇒ forward at that PWM value; <0 ⇒ backward; =0 ⇒ release. |
+    | `right_pwm` | INT | –255…+255 | Right wheel, same semantics as `left_pwm`. |
+    | `arm_angle` | INT | 0…360 | Servo arm position in degrees (`Servo.write(angle)`). |
+3. **`mart_play_kpis`**
+    
+    Tracks KPIs related to play sessions, aggregating experiences across a play.
+    
+    | Column | Data Type | Description |
+    | --- | --- | --- |
+    | `play_id` | BIGINT | Unique identifier for the play session |
+    | `experience_id_array` | ARRAY | Array of experiences for a play |
+    | `timestamp` | DATETIME | Time when the record was created |
+    | `start_time` | DATETIME | Start timestamp of the play |
+    | `end_time` | DATETIME | End timestamp of the play |
+    | `cat_entertainment_score` | INT | Score (1–5) of how entertained the cat was |
+    | `owner_happiness_score` | INT | Score (1–5) based on owner's feedback |
+
+---
+
+## 4. Decision Components
+
+### 4.1 `mrt_immediate_decisions` (event log)
+
+Rule-based decisions emitted from threshold/rule checks on the latest `mrt_experiences` (e.g., *very strong noise ⇒ decision X*).
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `immed_id` | BIGINT | Unique identifier of the rule-based decision event |
+| `timestamp` | DATETIME | Time the rule fired |
+| `experience_id` | BIGINT | Reference to `mrt_experiences.experience_id` |
+| `rule_name` | VARCHAR | Identifier of the rule (e.g., `NOISE_SPIKE`) |
+| `rule_version` | VARCHAR | Version/hash of the rule when it fired |
+| `trigger_values` | JSON | Snapshot of feature values evaluated (e.g., `noise_score`, etc.) |
+| `proposed_decision` | ENUM('send_user_text','send_user_picture','get_closer','back_off','play_arm') | Decision proposed by the rule |
+| `decision_id` | BIGINT | If executed, back-reference to `mrt_decisions.decision_id` |
+
+### 4.2 `mrt_reflective_decisions` (LLM reviewer log)
+
+Periodic LLM pass (every **X** minutes) over recent `mrt_experiences` to propose higher-level actions.
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `refl_id` | BIGINT | Unique identifier of the reflective event |
+| `timestamp` | DATETIME | Time the LLM review completed |
+| `window_start` | DATETIME | Start of the reviewed window |
+| `window_end` | DATETIME | End of the reviewed window |
+| `experience_ids` | ARRAY | Experiences in scope (optional) |
+| `prompt` | TEXT | Prompt sent to the LLM |
+| `llm_model` | VARCHAR | Model used |
+| `llm_summary` | TEXT | Short summary of reasoning |
+| `proposed_decision` | ENUM('send_user_text','send_user_picture','get_closer','back_off','play_arm') | Decision proposed by the LLM |
+| `confidence` | FLOAT | Confidence score (0–1) |
+| `decision_id` | BIGINT | If executed, back-reference to `mrt_decisions.decision_id` |
+
+### 4.3 `mrt_decisions_to_actions` (canonical action log)
+
+Finite decision set used by **both** decision modules.
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `decision_id` | BIGINT | Unique identifier of the decision event |
+| `timestamp` | DATETIME | Time the decision was made |
+| `source_module` | ENUM('mg_immediate_decisions','mrt_reflective_decisions') | Origin of the decision |
+| `source_event_id` | BIGINT | `immed_id` or `refl_id` depending on source |
+| `experience_id` | BIGINT | Primary triggering experience (if applicable) |
+| `decision_type` | ENUM('send_user_text','send_user_picture','get_closer','back_off','play_arm') | Action type |
+| `parameters` | JSON | Parameters for the action (e.g., `{ "text": "...", "arm_angle": 120 }`) |
+
+tbd: mrt_decision_definition
+
+**Writes to:**
+
+- **`mart_motor`** (motor control) when `decision_type` ∈ {`get_closer`, `back_off`, `play_arm`}.
+Suggested mapping (implementation detail): `parameters` → motor row fields (e.g., PWM deltas, `arm_angle`).
+- **`mrt_communicate_user`** when `decision_type` ∈ {`send_user_text`, `send_user_picture`}.
+
+### 4.4 `mrt_communicate_user` (outbound message queue)
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `message_id` | BIGINT | Unique identifier |
+| `timestamp` | DATETIME | Enqueue time |
+| `decision_id` | BIGINT | Reference to `mrt_decisions.decision_id` |
+| `message_type` | ENUM('text','image') | Type of message |
+| `content` | TEXT/JSON | Payload or reference to captured image |
+| `status` | ENUM('queued','sent','failed') | Delivery status |
+
+---
+
+## 5. ANN Training Join (per your note)
+
+A materialized view or training extract built from the **join** of `mrt_decisions` and `mart_motor`. Example schema:
+
+**`vw_ann_training_actions`** (view)
+
+| Column | Source | Description |
+| --- | --- | --- |
+| `decision_id` | `mrt_decisions` | Action ID |
+| `timestamp` | `mrt_decisions` | Action time |
+| `decision_type` | `mrt_decisions` | One of the finite action set |
+| `parameters` | `mrt_decisions` | Action parameters |
+| `frame_id` | `mart_motor` | Motor frame affected |
+| `left_pwm` | `mart_motor` | Motor command |
+| `right_pwm` | `mart_motor` | Motor command |
+| `arm_angle` | `mart_motor` | Motor command |
+
+Downstream training sets can further **left-join** `mrt_experiences` on nearest time to add context features.
+
+tbd: from mrt_experince to mrt_decision also ann
+
+---

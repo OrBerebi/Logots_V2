@@ -10,7 +10,13 @@ import time
 import threading
 import subprocess
 import os
+import csv
+import queue
+import json
+import io
+import base64
 from collections import deque
+from datetime import datetime
 
 import numpy as np
 
@@ -111,12 +117,19 @@ class IMUReader(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.roll=self.pitch=self.yaw=0.0
-        self.status   = 'starting'
-        self.cal_prog = 0
-        self._stop    = threading.Event()
-        self._bus     = None
+        self.status      = 'starting'
+        self.cal_prog    = 0
+        self._stop       = threading.Event()
+        self._bus        = None
+        self._sample_buf  = []
+        self._sample_lock = threading.Lock()
 
     def stop(self): self._stop.set()
+
+    def drain_samples(self):
+        with self._sample_lock:
+            out, self._sample_buf = self._sample_buf, []
+        return out
 
     def run(self):
         try:
@@ -138,6 +151,8 @@ class IMUReader(threading.Thread):
                 if roll>180: roll-=360
                 if roll<-180: roll+=360
                 self.yaw=yaw; self.pitch=pitch; self.roll=roll
+                with self._sample_lock:
+                    self._sample_buf.append((yaw, pitch, roll))
         except Exception as e:
             self.status=f'error: {e}'
 
@@ -188,10 +203,12 @@ class IMUReader(threading.Thread):
 # ── Audio reader ──────────────────────────────────────────────────────────────
 class AudioReader:
     def __init__(self):
-        self._buf   = deque(maxlen=AUDIO_RATE)   # 1 s rolling
-        self._stream= None
-        self.status = 'stopped'
-        self._rms_ema = 0.0
+        self._buf      = deque(maxlen=AUDIO_RATE)   # 1 s rolling
+        self._stream   = None
+        self.status    = 'stopped'
+        self._rms_ema  = 0.0
+        self._drain_buf  = []
+        self._drain_lock = threading.Lock()
 
     def start(self):
         if not AUDIO_OK:
@@ -205,6 +222,8 @@ class AudioReader:
 
     def _cb(self,indata,frames,t,status):
         self._buf.extend(indata[:,0])
+        with self._drain_lock:
+            self._drain_buf.extend(indata[:, 0].tolist())
 
     def get_samples(self,n=512):
         buf=list(self._buf)
@@ -219,6 +238,11 @@ class AudioReader:
         raw=float(np.sqrt(np.mean(window**2)))
         self._rms_ema=0.25*raw+0.75*self._rms_ema   # smooth out spikes
         return self._rms_ema
+
+    def drain_samples(self):
+        with self._drain_lock:
+            out, self._drain_buf = self._drain_buf, []
+        return out
 
     def stop(self):
         if self._stream:
@@ -300,6 +324,69 @@ def _rotmat(r,p,y):
     Rz=np.array([[math.cos(y),-math.sin(y),0],[math.sin(y),math.cos(y),0],[0,0,1]])
     return Rz@Ry@Rx
 
+# ── Frame encoding ────────────────────────────────────────────────────────────
+def _encode_frame(frame_bgr):
+    """BGR numpy (H×W×3) → grayscale 640×640 JPEG base64 string."""
+    img = Image.fromarray(frame_bgr[:, :, ::-1]).convert('L')
+    img = img.resize((640, 640), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=70)
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+# ── Recording manager ─────────────────────────────────────────────────────────
+class RecordingManager:
+    FIELDNAMES = [
+        'frame_id', 'timestamp', 'frame_data',
+        'yaw', 'pitch', 'roll',
+        'audio_samples',
+        'left_pwm', 'right_pwm', 'pan_angle', 'tilt_angle',
+    ]
+
+    def __init__(self):
+        self._active   = False
+        self._queue    = queue.Queue(maxsize=300)
+        self._thread   = None
+        self._csv_path = None
+
+    @property
+    def active(self): return self._active
+
+    def start(self):
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_dir = os.path.join(_repo, 'recordings', f'session_{ts}')
+        os.makedirs(out_dir, exist_ok=True)
+        self._csv_path = os.path.join(out_dir, f'session_{ts}.csv')
+        self._active = True
+        self._thread = threading.Thread(target=self._writer, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._active = False
+        self._queue.put(None)
+        if self._thread:
+            self._thread.join(timeout=15)
+
+    def enqueue(self, frame: dict, frame_bgr):
+        if not self._active: return
+        try:
+            self._queue.put_nowait((dict(frame), frame_bgr))
+        except queue.Full:
+            pass
+
+    def _writer(self):
+        with open(self._csv_path, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
+            w.writeheader()
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                row, frame_bgr = item
+                row['frame_data'] = _encode_frame(frame_bgr) if frame_bgr is not None else ''
+                w.writerow(row)
+                f.flush()
+
 # ── Widget helpers ────────────────────────────────────────────────────────────
 def _hline(p):
     tk.Frame(p,bg=C_BORDER,height=1).pack(fill='x',padx=16,pady=3)
@@ -338,6 +425,10 @@ class RobotControlGUI:
 
         self.i2c=None; self.connected=False
         self._last_reconnect=0
+
+        self._rec_manager  = RecordingManager()
+        self._rec_frame_id = 0
+        self.latest_frame  = {}
 
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
@@ -575,6 +666,7 @@ class RobotControlGUI:
         self.lbl_pan.pack(side='left',padx=(0,5))
         self.lbl_tlt.pack(side='left',padx=(0,5))
         _btn(f,'■  STOP',C_RED,self._estop).pack(side='right')
+        self.btn_rec=_btn(f,'⚫  REC',C_SUB,self._toggle_rec); self.btn_rec.pack(side='right',padx=(0,6))
         self.lbl_tx=_lbl(f,'',fg=C_SUB,font=('Courier',8)); self.lbl_tx.pack(side='right',padx=10)
         _lbl(f,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8)).pack(side='left',padx=10)
 
@@ -602,6 +694,15 @@ class RobotControlGUI:
 
     def _estop(self):
         self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0; self._draw_joy()
+
+    def _toggle_rec(self):
+        if self._rec_manager.active:
+            self._rec_manager.stop()
+            self._rec_frame_id=0
+            self.btn_rec.config(text='⚫  REC',bg=C_SUB)
+        else:
+            self._rec_manager.start()
+            self.btn_rec.config(text='🔴  REC',bg=C_RED)
 
     # ── Arduino I2C ───────────────────────────────────────────────────────────
     def _conn(self):
@@ -662,6 +763,26 @@ class RobotControlGUI:
         self._tick_imu()
         self._tick_audio()
         self._tick_camera()
+        # ── Always-on sensor snapshot ──────────────────────────────────────────
+        frame_bgr   = self.camera_reader.get_frame()   if self.camera_reader  else None
+        imu_samples = self.imu_reader.drain_samples()  if self.imu_reader     else []
+        audio_samps = self.audio_reader.drain_samples() if self.audio_reader  else []
+        self.latest_frame = {
+            'frame_id':      self._rec_frame_id,
+            'timestamp':     datetime.now().isoformat(),
+            'frame_data':    '',
+            'yaw':           json.dumps([round(s[0],4) for s in imu_samples]),
+            'pitch':         json.dumps([round(s[1],4) for s in imu_samples]),
+            'roll':          json.dumps([round(s[2],4) for s in imu_samples]),
+            'audio_samples': json.dumps([round(v,6) for v in audio_samps]),
+            'left_pwm':      self.left_pwm,
+            'right_pwm':     self.right_pwm,
+            'pan_angle':     self.pan_angle,
+            'tilt_angle':    self.tilt_angle,
+        }
+        self._rec_frame_id += 1
+        if self._rec_manager.active:
+            self._rec_manager.enqueue(self.latest_frame, frame_bgr)
         self.root.after(50,self._loop)
 
     def _tick_camera(self):
