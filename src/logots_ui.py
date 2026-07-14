@@ -5,7 +5,9 @@ Panels: Drive + Arm  |  IMU orientation  |  Audio waveform  |  Video feed
 """
 
 import tkinter as tk
+from tkinter import filedialog
 import math
+import sys
 import time
 import threading
 import subprocess
@@ -15,8 +17,11 @@ import queue
 import json
 import io
 import base64
-from collections import deque
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Base64 color JPEG fields exceed the default 128 KB csv field limit
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 import numpy as np
 
@@ -52,6 +57,7 @@ except ImportError:
     CV2_OK = False
 
 # ── Hardware constants ────────────────────────────────────────────────────────
+API_PORT      = 8787
 ARDUINO_ADDR  = 0x08
 IMU_I2C_BUS   = 7
 MPU_ADDR      = 0x68
@@ -203,10 +209,8 @@ class IMUReader(threading.Thread):
 # ── Audio reader ──────────────────────────────────────────────────────────────
 class AudioReader:
     def __init__(self):
-        self._buf      = deque(maxlen=AUDIO_RATE)   # 1 s rolling
         self._stream   = None
         self.status    = 'stopped'
-        self._rms_ema  = 0.0
         self._drain_buf  = []
         self._drain_lock = threading.Lock()
 
@@ -221,23 +225,8 @@ class AudioReader:
             self.status=f'error: {e}'
 
     def _cb(self,indata,frames,t,status):
-        self._buf.extend(indata[:,0])
         with self._drain_lock:
             self._drain_buf.extend(indata[:, 0].tolist())
-
-    def get_samples(self,n=512):
-        buf=list(self._buf)
-        if len(buf)<n: return np.zeros(n)
-        arr=np.array(buf[-n:])
-        return np.clip(arr,-0.5,0.5)   # clamp glitch samples before display
-
-    def rms(self):
-        buf=np.array(list(self._buf))
-        if not len(buf): return self._rms_ema
-        window=np.clip(buf[-2048:],-0.5,0.5)   # reject full-scale glitches
-        raw=float(np.sqrt(np.mean(window**2)))
-        self._rms_ema=0.25*raw+0.75*self._rms_ema   # smooth out spikes
-        return self._rms_ema
 
     def drain_samples(self):
         with self._drain_lock:
@@ -326,12 +315,20 @@ def _rotmat(r,p,y):
 
 # ── Frame encoding ────────────────────────────────────────────────────────────
 def _encode_frame(frame_bgr):
-    """BGR numpy (H×W×3) → grayscale 640×640 JPEG base64 string."""
-    img = Image.fromarray(frame_bgr[:, :, ::-1]).convert('L')
+    """BGR numpy (H×W×3) → color 640×640 JPEG base64 string."""
+    img = Image.fromarray(frame_bgr[:, :, ::-1])
     img = img.resize((640, 640), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=70)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+def _decode_frame(b64):
+    """base64 JPEG string → BGR numpy (H×W×3), or None if empty.
+    Handles both old grayscale and new color recordings."""
+    if not b64:
+        return None
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+    return np.asarray(img)[:, :, ::-1]
 
 # ── Recording manager ─────────────────────────────────────────────────────────
 class RecordingManager:
@@ -387,6 +384,167 @@ class RecordingManager:
                 w.writerow(row)
                 f.flush()
 
+# ── Sim player ────────────────────────────────────────────────────────────────
+class SimPlayer:
+    """Replays a recorded session CSV row-by-row, paced by its timestamps
+    so playback runs in real time regardless of the rate the recording
+    actually achieved."""
+
+    WAIT = 'wait'   # sentinel: current frame should be held, next row not due yet
+
+    def __init__(self, csv_path):
+        self.csv_path  = csv_path
+        self.loop      = True
+        self.row_index = 0
+        self.n_skipped = 0
+        self._pending    = None   # parsed (frame, decoded, bgr) not yet due
+        self._pending_ts = None   # its recorded timestamp (datetime or None)
+        self._open()
+
+    def _open(self):
+        self._file   = open(self.csv_path, 'r', newline='')
+        self._reader = csv.DictReader(self._file)
+        fields = self._reader.fieldnames or []
+        if not set(RecordingManager.FIELDNAMES) <= set(fields):
+            self._file.close()
+            raise ValueError('not a Logots recording CSV')
+        self._wall_start = None   # monotonic time when this pass started
+        self._rec_start  = None   # first row's recorded timestamp of this pass
+
+    def next_frame(self):
+        """Return the next (frame, decoded, frame_bgr) once its recorded
+        timestamp is due, SimPlayer.WAIT while the current frame should be
+        held, or None at end-of-file when loop is off. Malformed rows are
+        skipped; rows without a parsable timestamp are due immediately."""
+        if self._pending is None and not self._advance():
+            return None
+        if self._pending_ts is not None:
+            now = time.monotonic()
+            if self._wall_start is None:
+                self._wall_start = now
+                self._rec_start  = self._pending_ts
+            due = (self._pending_ts - self._rec_start).total_seconds()
+            if now - self._wall_start < due:
+                return SimPlayer.WAIT
+        out = self._pending
+        self._pending = None
+        return out
+
+    def _advance(self):
+        """Parse the next valid row into self._pending. False at EOF (no loop)."""
+        while True:
+            try:
+                row = next(self._reader)
+            except StopIteration:
+                if not self.loop:
+                    return False
+                self._file.close()
+                self._open()          # resets this pass's time origins
+                continue
+            self.row_index += 1
+            try:
+                self._pending = self._parse(row)
+            except Exception:
+                self.n_skipped += 1
+                continue
+            try:
+                self._pending_ts = datetime.fromisoformat(self._pending[0]['timestamp'])
+            except Exception:
+                self._pending_ts = None
+            return True
+
+    def _parse(self, row):
+        def arr(key):
+            try:    return json.loads(row.get(key) or '[]')
+            except Exception: return []
+        def num(key, fallback):
+            try:    return int(float(row.get(key)))
+            except Exception: return fallback
+        yaw, pitch, roll = arr('yaw'), arr('pitch'), arr('roll')
+        decoded = {
+            'imu':        list(zip(yaw, pitch, roll)),
+            'audio':      arr('audio_samples'),
+            'left_pwm':   num('left_pwm', 0),
+            'right_pwm':  num('right_pwm', 0),
+            'pan_angle':  num('pan_angle', 90),
+            'tilt_angle': num('tilt_angle', 90),
+        }
+        frame = {
+            'frame_id':      num('frame_id', self.row_index - 1),
+            'timestamp':     row.get('timestamp') or '',
+            'frame_data':    row.get('frame_data') or '',
+            'yaw':           row.get('yaw') or '[]',
+            'pitch':         row.get('pitch') or '[]',
+            'roll':          row.get('roll') or '[]',
+            'audio_samples': row.get('audio_samples') or '[]',
+            'left_pwm':      decoded['left_pwm'],
+            'right_pwm':     decoded['right_pwm'],
+            'pan_angle':     decoded['pan_angle'],
+            'tilt_angle':    decoded['tilt_angle'],
+        }
+        return frame, decoded, _decode_frame(frame['frame_data'])
+
+    def close(self):
+        try: self._file.close()
+        except Exception: pass
+
+# ── Frame API server ──────────────────────────────────────────────────────────
+class FrameServer:
+    """Stdlib HTTP server exposing the GUI's latest_frame at GET /latest_frame.
+    JPEG encoding for real mode happens lazily per request (cached by frame_id)
+    so the 20 Hz tick never pays for it."""
+
+    def __init__(self, gui, host='0.0.0.0', port=API_PORT):
+        self.gui    = gui
+        self._cache = (None, '')   # (frame_id, base64 jpeg)
+        self._server = ThreadingHTTPServer((host, port), self._make_handler())
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def _payload(self):
+        gui = self.gui
+        with gui._frame_lock:
+            frame = dict(gui.latest_frame)
+            bgr   = gui.latest_frame_bgr
+            sim   = gui.sim_mode
+        if not frame:
+            return None
+        if not frame.get('frame_data') and bgr is not None:
+            fid, b64 = self._cache
+            if fid != frame['frame_id']:
+                b64 = _encode_frame(bgr)
+                self._cache = (frame['frame_id'], b64)
+            frame['frame_data'] = b64
+        for k in ('yaw', 'pitch', 'roll', 'audio_samples'):
+            try:    frame[k] = json.loads(frame.get(k) or '[]')
+            except Exception: frame[k] = []
+        frame['sim_mode'] = sim
+        return frame
+
+    def _make_handler(server_self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def _send(self, code, obj):
+                body = json.dumps(obj).encode('utf-8')
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                if self.path.split('?')[0] != '/latest_frame':
+                    self._send(404, {'error': 'unknown path, use /latest_frame'})
+                    return
+                try:
+                    payload = server_self._payload()
+                except Exception as e:
+                    self._send(500, {'error': str(e)})
+                    return
+                if payload is None:
+                    self._send(503, {'error': 'no frame yet'})
+                else:
+                    self._send(200, payload)
+        return Handler
+
 # ── Widget helpers ────────────────────────────────────────────────────────────
 def _hline(p):
     tk.Frame(p,bg=C_BORDER,height=1).pack(fill='x',padx=16,pady=3)
@@ -397,8 +555,9 @@ def _lbl(p,txt,fg=C_SUB,font=('Courier',9),bg=C_BG,**kw):
 def _plbl(p,txt,fg=C_SUB,font=('Courier',9),**kw):
     return tk.Label(p,text=txt,bg=C_PANEL,fg=fg,font=font,**kw)
 
-def _vallbl(p,txt,fg=C_BLUE):
-    return tk.Label(p,text=txt,bg=C_PANEL,fg=fg,font=('Courier',11,'bold'),padx=8,pady=4)
+def _vallbl(p,txt,fg=C_BLUE,width=0):
+    return tk.Label(p,text=txt,bg=C_PANEL,fg=fg,font=('Courier',11,'bold'),
+                    padx=8,pady=4,width=width)
 
 def _btn(p,txt,color,cmd,**kw):
     return tk.Button(p,text=txt,bg=color,fg=C_TEXT,relief='flat',
@@ -428,7 +587,16 @@ class RobotControlGUI:
 
         self._rec_manager  = RecordingManager()
         self._rec_frame_id = 0
-        self.latest_frame  = {}
+        self.latest_frame     = {}
+        self.latest_frame_bgr = None
+        self.latest_decoded   = {'imu': [], 'audio': []}
+        self._frame_lock      = threading.Lock()
+        self._rms_ema         = 0.0
+
+        self.sim_mode   = False
+        self.sim_player = None
+        self._sim_ended = False
+        self._pre_sim_angles = (90, 90)
 
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
@@ -436,6 +604,11 @@ class RobotControlGUI:
         self._build_ui()
         self._bind_keys()
         self._start_sensors()
+        try:
+            self._frame_server = FrameServer(self)
+        except Exception as e:
+            print(f'[logots] frame API server not started: {e}')
+            self._frame_server = None
         self._loop()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
@@ -504,9 +677,14 @@ class RobotControlGUI:
         for txt,x,y in [('FWD',cx,cy-R+8),('BWD',cx,cy+R-8),('L',cx-R+8,cy),('R',cx+R-8,cy)]:
             cv.create_text(x,y,text=txt,fill=C_SUB,font=('Courier',7))
 
-    def _jp(self,e): self.joy_dragging=True;  self._jxy(e.x,e.y)
-    def _jm(self,e): self._jxy(e.x,e.y)
+    def _jp(self,e):
+        if self.sim_mode: return
+        self.joy_dragging=True;  self._jxy(e.x,e.y)
+    def _jm(self,e):
+        if self.sim_mode: return
+        self._jxy(e.x,e.y)
     def _jr(self,e):
+        if self.sim_mode: return
         self.joy_dragging=False; self.joy_x=self.joy_y=0.0
         self._pwm(); self._draw_joy()
     def _jxy(self,mx,my):
@@ -518,7 +696,7 @@ class RobotControlGUI:
 
     def _cam_sliders(self,parent):
         for attr,label in [('pan','PAN'),('tilt','TILT')]:
-            f=tk.Frame(parent,bg=C_PANEL); f.pack(side='left',padx=6)
+            f=tk.Frame(parent,bg=C_PANEL); f.pack(side='left',padx=2)
             _plbl(f,label,font=('Courier',8,'bold')).pack(pady=(4,0))
             _plbl(f,'180°',font=('Courier',7)).pack()
             var=tk.IntVar(value=90)
@@ -527,7 +705,8 @@ class RobotControlGUI:
                      length=190,width=16,bg=C_PANEL,fg=C_TEXT,troughcolor='#16162a',
                      activebackground=C_BLUE_HI,highlightthickness=0,bd=0,
                      sliderrelief='flat',sliderlength=20,showvalue=True,
-                     command=lambda v,a=attr:setattr(self,f'{a}_angle',int(v))).pack()
+                     command=lambda v,a=attr:None if self.sim_mode
+                             else setattr(self,f'{a}_angle',int(v))).pack()
             _plbl(f,'0°',font=('Courier',7)).pack(pady=(0,4))
 
     # ── Audio panel ───────────────────────────────────────────────────────────
@@ -652,22 +831,28 @@ class RobotControlGUI:
         self._photo=ImageTk.PhotoImage(img)
         self.vid_cv.delete('all')
         self.vid_cv.create_image(0,0,anchor='nw',image=self._photo)
-        self.lbl_vs.config(text='live',fg=C_GREEN)
 
     # ── Status bar ────────────────────────────────────────────────────────────
     def _status_bar(self):
         f=tk.Frame(self.root,bg=C_BG); f.pack(fill='x',padx=16,pady=(4,14))
-        self.lbl_l  =_vallbl(f,'L:  +000',fg=C_BLUE);  self.lbl_l.configure(bg=C_PANEL)
-        self.lbl_r  =_vallbl(f,'R:  +000',fg=C_BLUE);  self.lbl_r.configure(bg=C_PANEL)
-        self.lbl_pan=_vallbl(f,'PAN:090°',fg=C_GREEN);  self.lbl_pan.configure(bg=C_PANEL)
-        self.lbl_tlt=_vallbl(f,'TLT:090°',fg=C_AMBER);  self.lbl_tlt.configure(bg=C_PANEL)
-        self.lbl_l.pack(side='left',padx=(0,5))
-        self.lbl_r.pack(side='left',padx=(0,5))
+        self.lbl_lm =_vallbl(f,'L:  +000',fg=C_BLUE,width=8)
+        self.lbl_rm =_vallbl(f,'R:  +000',fg=C_BLUE,width=8)
+        self.lbl_pan=_vallbl(f,'PAN:090°',fg=C_GREEN,width=8)
+        self.lbl_tlt=_vallbl(f,'TLT:090°',fg=C_AMBER,width=8)
+        self.lbl_lm.pack(side='left',padx=(0,5))
+        self.lbl_rm.pack(side='left',padx=(0,5))
         self.lbl_pan.pack(side='left',padx=(0,5))
         self.lbl_tlt.pack(side='left',padx=(0,5))
         _btn(f,'■  STOP',C_RED,self._estop).pack(side='right')
         self.btn_rec=_btn(f,'⚫  REC',C_SUB,self._toggle_rec); self.btn_rec.pack(side='right',padx=(0,6))
-        self.lbl_tx=_lbl(f,'',fg=C_SUB,font=('Courier',8)); self.lbl_tx.pack(side='right',padx=10)
+        self.btn_sim=_btn(f,'▶  SIM',C_SUB,self._toggle_sim,width=7)
+        self.btn_sim.pack(side='right',padx=(0,6))
+        self.sim_loop_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(f,text='LOOP',variable=self.sim_loop_var,bg=C_BG,fg=C_SUB,
+                       font=('Courier',8),selectcolor=C_PANEL,activebackground=C_BG,
+                       activeforeground=C_TEXT,highlightthickness=0).pack(side='right',padx=(0,6))
+        self.lbl_tx=_lbl(f,'',fg=C_SUB,font=('Courier',8),width=26,anchor='e')
+        self.lbl_tx.pack(side='right',padx=10)
         _lbl(f,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8)).pack(side='left',padx=10)
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
@@ -675,8 +860,12 @@ class RobotControlGUI:
         self.root.bind('<KeyPress>',  self._kd)
         self.root.bind('<KeyRelease>',self._ku)
 
-    def _kd(self,e): self.keys_held.add(e.keysym.lower());  self._k2j()
-    def _ku(self,e): self.keys_held.discard(e.keysym.lower()); self._k2j()
+    def _kd(self,e):
+        if self.sim_mode: return
+        self.keys_held.add(e.keysym.lower());  self._k2j()
+    def _ku(self,e):
+        if self.sim_mode: return
+        self.keys_held.discard(e.keysym.lower()); self._k2j()
     def _k2j(self):
         if 'space' in self.keys_held:
             self.joy_x=self.joy_y=0.0
@@ -704,6 +893,40 @@ class RobotControlGUI:
             self._rec_manager.start()
             self.btn_rec.config(text='🔴  REC',bg=C_RED)
 
+    def _toggle_sim(self):
+        if self.sim_mode:                                   # Sim → Real
+            self.sim_mode=False; self._sim_ended=False
+            if self.sim_player:
+                self.sim_player.close(); self.sim_player=None
+            # Restore the pre-sim control state so the robot doesn't jump
+            # to the last replayed values when real sends resume
+            self.pan_angle,self.tilt_angle=self._pre_sim_angles
+            self.pan_var.set(self.pan_angle); self.tilt_var.set(self.tilt_angle)
+            self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0
+            self._draw_joy()
+            self.btn_sim.config(text='▶  SIM',bg=C_SUB)
+            self.btn_rec.config(state='normal')
+            self.lbl_tx.config(text='')
+            if self.connected: self.lbl_cs.config(text='⬤  CONNECTED',fg=C_GREEN)
+            else:              self.lbl_cs.config(text='⬤  DISCONNECTED',fg=C_RED)
+            return
+        _repo=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path=filedialog.askopenfilename(
+            title='Load recording CSV',
+            initialdir=os.path.join(_repo,'recordings'),
+            filetypes=[('Recording CSV','*.csv'),('All files','*.*')])
+        if not path: return                                 # cancelled → stay Real
+        try:
+            player=SimPlayer(path)
+        except Exception as e:
+            self.lbl_tx.config(text=f'SIM load failed: {e}'[:44]); return
+        if self._rec_manager.active: self._toggle_rec()
+        self._pre_sim_angles=(self.pan_angle,self.tilt_angle)
+        self.sim_player=player; self.sim_mode=True; self._sim_ended=False
+        self.btn_sim.config(text='⏹  REAL',bg=C_BLUE)
+        self.btn_rec.config(state='disabled')
+        self.lbl_cs.config(text='⬤  SIM MODE',fg=C_BLUE_HI)
+
     # ── Arduino I2C ───────────────────────────────────────────────────────────
     def _conn(self):
         try:
@@ -723,14 +946,16 @@ class RobotControlGUI:
             self.i2c=None
         self.lbl_cs.config(text='⬤  DISCONNECTED',fg=C_RED)
 
+    def _update_motor_labels(self,l,r,pa,ta):
+        self.lbl_lm.config(text=f'L:  {l:+04d}')
+        self.lbl_rm.config(text=f'R:  {r:+04d}')
+        self.lbl_pan.config(text=f'PAN:{pa:03d}°')
+        self.lbl_tlt.config(text=f'TLT:{ta:03d}°')
+
     def _send_motors(self):
         l=self.left_pwm; r=self.right_pwm
         pa=self.pan_angle; ta=self.tilt_angle
-        sg=lambda v:'+' if v>=0 else ''
-        self.lbl_l.config(text=f'L:  {sg(l)}{l:04d}')
-        self.lbl_r.config(text=f'R:  {sg(r)}{r:04d}')
-        self.lbl_pan.config(text=f'PAN:{pa:03d}°')
-        self.lbl_tlt.config(text=f'TLT:{ta:03d}°')
+        self._update_motor_labels(l,r,pa,ta)
         if not(self.connected and self.i2c):
             self.lbl_tx.config(text='(not sent)'); return
         msg=f'{l},{r},{pa},{ta}\n'.encode()
@@ -756,18 +981,24 @@ class RobotControlGUI:
 
     # ── 20 Hz update loop ─────────────────────────────────────────────────────
     def _loop(self):
+        if self.sim_mode: self._tick_sim()
+        else:             self._tick_real()
+        self._update_imu_widgets()
+        self._update_audio_widgets()
+        self._update_video_widgets()
+        if self._rec_manager.active and not self.sim_mode:
+            self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
+        self.root.after(50,self._loop)
+
+    def _tick_real(self):
         if not self.connected and time.time()-self._last_reconnect>3:
             self._last_reconnect=time.time()
             self._conn()
         self._send_motors()
-        self._tick_imu()
-        self._tick_audio()
-        self._tick_camera()
-        # ── Always-on sensor snapshot ──────────────────────────────────────────
-        frame_bgr   = self.camera_reader.get_frame()   if self.camera_reader  else None
-        imu_samples = self.imu_reader.drain_samples()  if self.imu_reader     else []
+        frame_bgr   = self.camera_reader.get_frame()    if self.camera_reader else None
+        imu_samples = self.imu_reader.drain_samples()   if self.imu_reader    else []
         audio_samps = self.audio_reader.drain_samples() if self.audio_reader  else []
-        self.latest_frame = {
+        frame = {
             'frame_id':      self._rec_frame_id,
             'timestamp':     datetime.now().isoformat(),
             'frame_data':    '',
@@ -780,24 +1011,65 @@ class RobotControlGUI:
             'pan_angle':     self.pan_angle,
             'tilt_angle':    self.tilt_angle,
         }
+        with self._frame_lock:
+            self.latest_frame     = frame
+            self.latest_frame_bgr = frame_bgr
+            self.latest_decoded   = {'imu': imu_samples, 'audio': audio_samps}
         self._rec_frame_id += 1
-        if self._rec_manager.active:
-            self._rec_manager.enqueue(self.latest_frame, frame_bgr)
-        self.root.after(50,self._loop)
 
-    def _tick_camera(self):
+    def _tick_sim(self):
+        if not self.sim_player: return
+        self.sim_player.loop = self.sim_loop_var.get()
+        nxt = self.sim_player.next_frame()
+        if nxt is None:
+            self._sim_ended = True
+            self.lbl_tx.config(text='SIM ended')
+            return
+        if nxt is SimPlayer.WAIT:       # next row not due yet → hold this frame
+            return
+        self._sim_ended = False
+        frame, decoded, frame_bgr = nxt
+        with self._frame_lock:
+            self.latest_frame     = frame
+            self.latest_frame_bgr = frame_bgr
+            self.latest_decoded   = decoded
+        self._update_motor_labels(decoded['left_pwm'],decoded['right_pwm'],
+                                  decoded['pan_angle'],decoded['tilt_angle'])
+        # Animate the drive/cam controls from the recorded values
+        self.pan_var.set(decoded['pan_angle'])
+        self.tilt_var.set(decoded['tilt_angle'])
+        l,r=decoded['left_pwm'],decoded['right_pwm']
+        self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # inverse of _pwm mixing
+        self.joy_x=max(-1.0,min(1.0,(l-r)/510.0))
+        self._draw_joy()
+        txt=f'SIM row {self.sim_player.row_index}'
+        if self.sim_player.n_skipped: txt+=f' ({self.sim_player.n_skipped} skipped)'
+        self.lbl_tx.config(text=txt)
+
+    # ── Monitoring widgets (driven by latest_frame snapshot in both modes) ────
+    def _update_video_widgets(self):
+        if self.sim_mode:
+            if self.latest_frame_bgr is not None:
+                self.display_frame(self.latest_frame_bgr)
+            self.lbl_vs.config(text='SIM ended' if self._sim_ended else 'SIM',fg=C_BLUE_HI)
+            return
         if not self.camera_reader: return
         st=self.camera_reader.status
         if st=='running':
-            frame=self.camera_reader.get_frame()
-            if frame is not None:
-                self.display_frame(frame)
+            if self.latest_frame_bgr is not None:
+                self.display_frame(self.latest_frame_bgr)
+                self.lbl_vs.config(text='live',fg=C_GREEN)
         elif st=='stopped':
             self.lbl_vs.config(text='stopped',fg=C_AMBER)
         elif 'error' in str(st):
             self.lbl_vs.config(text=st[:28],fg=C_RED)
 
-    def _tick_imu(self):
+    def _update_imu_widgets(self):
+        if self.sim_mode:
+            self.lbl_is.config(text='SIM ended' if self._sim_ended else 'SIM',fg=C_BLUE_HI)
+            if not self._imu_live: self._imu_go_live()
+            self._imu_show_last()
+            return
         if not self.imu_reader: return
         st=self.imu_reader.status
         if st=='calibrating':
@@ -808,25 +1080,44 @@ class RobotControlGUI:
         elif st=='running':
             self.lbl_is.config(text='running',fg=C_GREEN)
             if not self._imu_live: self._imu_go_live()
-            r=self.imu_reader.roll; p=self.imu_reader.pitch; y=self.imu_reader.yaw
-            self._imu_redraw(r,p,y)
-            self.lbl_r.config( text=f'Roll:  {r:+6.1f}°')
-            self.lbl_pi.config(text=f'Pitch: {p:+6.1f}°')
-            self.lbl_y.config( text=f'Yaw:   {y:+6.1f}°')
+            self._imu_show_last()
         elif 'error' in str(st):
             self.lbl_is.config(text=st,fg=C_RED)
 
-    def _tick_audio(self):
+    def _imu_show_last(self):
+        samples=self.latest_decoded.get('imu') or []
+        if not samples: return                 # nothing new this tick → hold pose
+        y,p,r=samples[-1]
+        self._imu_redraw(r,p,y)
+        self.lbl_r.config( text=f'Roll:  {r:+6.1f}°')
+        self.lbl_pi.config(text=f'Pitch: {p:+6.1f}°')
+        self.lbl_y.config( text=f'Yaw:   {y:+6.1f}°')
+
+    def _update_audio_widgets(self):
+        if self.sim_mode:
+            self.lbl_as.config(text='SIM ended' if self._sim_ended else 'SIM',fg=C_BLUE_HI)
+            self._draw_audio()
+            return
         if not self.audio_reader: return
         st=self.audio_reader.status
         if st=='running':
             self.lbl_as.config(text='live',fg=C_GREEN)
-            self._draw_wave(self.audio_reader.get_samples())
-            self._draw_rms(self.audio_reader.rms())
+            self._draw_audio()
         elif 'error' in str(st):
             self.lbl_as.config(text=st[:28],fg=C_RED)
         elif st=='unavailable':
             self.lbl_as.config(text='sounddevice not installed',fg=C_RED)
+
+    def _draw_audio(self):
+        samples=self.latest_decoded.get('audio') or []
+        if samples:
+            arr=np.clip(np.asarray(samples,dtype=float),-0.5,0.5)  # reject glitches
+            raw=float(np.sqrt(np.mean(arr**2)))
+            self._rms_ema=0.25*raw+0.75*self._rms_ema   # smooth out spikes
+            self._draw_wave(arr[-512:])
+        else:
+            self._draw_wave(np.zeros(512))
+        self._draw_rms(self._rms_ema)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

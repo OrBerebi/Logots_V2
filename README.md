@@ -90,12 +90,49 @@ For headless / NoMachine sessions the GUI connects automatically. No display var
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS     │  live IMX219 feed   │
 └─────────────────────┴─────────────────────┘
-  L: +0000  R: +0000  PAN:090°  TLT:090°   ■ STOP
+  L: +0000  R: +0000  PAN:090°  TLT:090°   LOOP ▶ SIM  ⚫ REC  ■ STOP
 ```
 
 **Keyboard shortcuts:** `W/S` = forward/back · `A/D` = turn · `SPACE` = stop
 
 The GUI auto-connects to the Arduino on startup and retries every 3 seconds if the connection drops.
+
+---
+
+## Sim mode (no robot needed)
+
+Press **▶ SIM** and pick a session CSV (the output of the **⚫ REC** feature). The GUI replays the recording row-by-row exactly as if the data were sampled live: video, IMU orientation, audio waveform, joystick, sliders, and motor/servo values all come from the file. Playback is paced by the recording's own timestamps, so it runs in real time. The **LOOP** checkbox chooses whether playback wraps around at the end of the file or freezes on the last frame. Press **⏹ REAL** to return to live sensors.
+
+Sim mode runs on any machine — no Jetson, no hardware. On a MacBook:
+
+```bash
+conda env create -f environment.yml
+conda activate logots
+python src/logots_ui.py        # then press SIM and pick a recording CSV
+```
+
+## Frame API
+
+In both Real and Sim modes the GUI serves its latest sensor snapshot over HTTP on port **8787**. From any script or notebook (same conda env, GUI running):
+
+```python
+import sys; sys.path.append('path/to/Logots_V2/src')
+from logots_api import get_latest_frame
+
+frame = get_latest_frame()
+frame['image']           # 640×640×3 uint8 RGB numpy array (None if no camera)
+frame['yaw']             # list of yaw readings (°) since the previous frame
+frame['audio_samples']   # list of mic samples (~800 per frame at 20 Hz)
+frame['left_pwm']        # motor/servo commands: left_pwm, right_pwm, pan_angle, tilt_angle
+```
+
+The raw endpoint is `GET http://localhost:8787/latest_frame` (JSON), if you'd rather not use the helper.
+
+For a complete working example — video playback with synchronized audio — run the GUI (sim or real), then in a second terminal:
+
+```bash
+python src/api_demo.py
+```
 
 ---
 
