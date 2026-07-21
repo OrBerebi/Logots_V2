@@ -99,13 +99,16 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  joystick + pan/    │  3D Madgwick AHRS   │
-│  tilt sliders       │  YPR display        │
+│  tilt sliders +     │  YPR display        │
+│  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS     │  live IMX219 feed   │
 └─────────────────────┴─────────────────────┘
-  L: +0000  R: +0000  PAN:090°  TLT:090°  LOOP  ▶ SIM  ⚫ REC  ■ STOP
+  L +000  R +000  PAN:090°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP
 ```
+- Position mini-map (bottom of DRIVE & CAM): top-down trail of the dead-reckoned body
+  position with a heading arrow; `⌖ POS` in the status bar zeros the estimate (origin = here).
 - Keyboard: W/S = forward/back, A/D = turn, SPACE = stop
 - Arduino auto-connects on startup, retries every 3s if lost
 
@@ -130,6 +133,15 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `right_pwm` | int | right motor command, –255…+255 |
 | `pan_angle` | int | pan servo, 0…180° |
 | `tilt_angle` | int | tilt servo, 0…180° |
+| `pos_x` | float | estimated body X position (m), origin = recording start; see position note |
+| `pos_y` | float | estimated body Y position (m), origin = recording start |
+| `heading` | float | body heading (°) used for the estimate = IMU yaw at that tick |
+
+> **Position is a dead-reckoning estimate, not measured odometry.** There are no wheel
+> encoders, so `PositionEstimator` models forward speed as `K_V·(left_pwm+right_pwm)/2`
+> with direction from the IMU yaw, integrated per tick. Accuracy depends on the
+> `ROBOT_MAX_SPEED_MPS` constant (currently a guess — calibrate on the robot). Columns are
+> optional: recordings made before this feature lack them and still replay (origin/0.0).
 
 ### Architecture notes
 - Each 20 Hz tick builds a snapshot trio under `self._frame_lock`: `latest_frame` (CSV-shaped dict), `latest_frame_bgr` (BGR numpy image or None), and `latest_decoded` (parsed IMU tuples + audio floats for the widgets). All GUI monitoring widgets render from this snapshot in both Real and Sim modes.
@@ -137,6 +149,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 - `RecordingManager` writer thread handles frame encoding (PIL BGR→RGB→640×640→JPEG→base64) and CSV writes off the main thread.
 - Frame encoding uses PIL, not cv2, to stay compatible with NumPy 2.x.
 - `csv.field_size_limit` is raised at module import — color base64 fields exceed the 128 KB default.
+- `PositionEstimator` (module-level, near `IMUReader`) integrates X/Y each `_tick_real`; the DRIVE & CAM panel shows a top-down mini-map (`_position_map`/`_draw_pos_map`) and the status bar shows an `X/Y/HDG` readout + a `⌖ POS` reset button. In Sim mode the map/readout replay the recorded `pos_*` columns. `RecordingManager.CORE_FIELDNAMES` (the original 11 columns) is what `SimPlayer` requires, so adding columns never breaks playback of older CSVs.
 
 ## Sim mode
 
@@ -150,7 +163,7 @@ The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a 
 
 ## Frame API (for downstream processing)
 
-`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the 20 Hz tick never pays for it; the four array fields are real JSON arrays; `sim_mode` (bool) is included. Client helper:
+`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the 20 Hz tick never pays for it; the four array fields are real JSON arrays; `pos_x`/`pos_y` (m) and `heading` (°) carry the dead-reckoned body position; `sim_mode` (bool) is included. Client helper:
 
 ```python
 from logots_api import get_latest_frame   # src/logots_api.py
@@ -181,3 +194,4 @@ frame = get_latest_frame()                # adds frame['image']: 640×640×3 uin
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The 20 Hz loop actually achieves ~10.5 Hz on the Jetson (tick work + `after(50)` re-arm). Recordings are timestamped so sim playback is unaffected, but worth knowing for downstream timing assumptions.
+- **Calibrate `ROBOT_MAX_SPEED_MPS`** (in `logots_ui.py`) on the robot once motors are connected: drive a known distance at full PWM for a known time and set the constant to `distance/time`. Until then `pos_x`/`pos_y` are directionally right (heading is real IMU data) but not metrically accurate, and they assume motors track commands (no encoder feedback). Position also drifts with IMU yaw drift over long sessions.

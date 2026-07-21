@@ -15,6 +15,7 @@ import os
 import csv
 import queue
 import json
+import collections
 import io
 import base64
 from datetime import datetime
@@ -68,6 +69,14 @@ PWR_MGMT_1 = 0x6B;  CONFIG_REG = 0x1A
 GYRO_CFG   = 0x1B;  ACCEL_CFG  = 0x1C;  ACCEL_CFG2 = 0x1D
 ACCEL_OUT  = 0x3B;  GYRO_OUT   = 0x43
 ACCEL_SCALE = 16384.0;  GYRO_SCALE = 131.0
+
+# ── Position estimation ───────────────────────────────────────────────────────
+# PWM dead-reckoning: forward speed is modelled as proportional to the commanded
+# average PWM, direction taken from the IMU yaw. This is a MODEL, not measured
+# odometry (no wheel encoders) — accuracy depends on calibrating ROBOT_MAX_SPEED_MPS
+# on the real robot with the motors connected.
+ROBOT_MAX_SPEED_MPS = 0.30            # forward speed at |PWM|=255 — GUESS, calibrate
+K_V = ROBOT_MAX_SPEED_MPS / 255.0     # m/s per PWM unit
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C_BG      = '#1e1e2e'
@@ -206,6 +215,34 @@ class IMUReader(threading.Thread):
                 self._s16(d[2],d[3])/GYRO_SCALE,
                 self._s16(d[4],d[5])/GYRO_SCALE)
 
+# ── Position estimator ────────────────────────────────────────────────────────
+class PositionEstimator:
+    """Dead-reckons body (x, y) in metres from commanded PWM + IMU heading.
+
+    Forward speed v = k_v · (left_pwm + right_pwm)/2; heading θ from IMU yaw.
+    Integrated each tick: x += v·cosθ·dt, y += v·sinθ·dt. Pure spins (L=+, R=−)
+    average to ~0 forward speed, so heading changes without translation."""
+
+    def __init__(self, k_v=K_V):
+        self.k_v = k_v
+        self.reset()
+
+    def reset(self):
+        self.x = self.y = self.heading = 0.0
+        self._t = None
+
+    def update(self, left_pwm, right_pwm, yaw_deg, now=None):
+        now = now if now is not None else time.monotonic()
+        if self._t is None:                 # first sample: seed time + heading only
+            self._t = now; self.heading = yaw_deg; return
+        dt = now - self._t; self._t = now
+        if dt <= 0 or dt > 0.5: return      # guard stalls / first big gap
+        v  = self.k_v * (left_pwm + right_pwm) / 2.0
+        th = math.radians(yaw_deg)
+        self.x += v * math.cos(th) * dt
+        self.y += v * math.sin(th) * dt
+        self.heading = yaw_deg
+
 # ── Audio reader ──────────────────────────────────────────────────────────────
 class AudioReader:
     def __init__(self):
@@ -332,12 +369,16 @@ def _decode_frame(b64):
 
 # ── Recording manager ─────────────────────────────────────────────────────────
 class RecordingManager:
-    FIELDNAMES = [
+    # Original columns — the minimal set required for a CSV to count as a Logots
+    # recording (SimPlayer checks against this so pre-position recordings still load).
+    CORE_FIELDNAMES = [
         'frame_id', 'timestamp', 'frame_data',
         'yaw', 'pitch', 'roll',
         'audio_samples',
         'left_pwm', 'right_pwm', 'pan_angle', 'tilt_angle',
     ]
+    # pos_x/pos_y (metres) + heading (deg): dead-reckoning estimate, see PositionEstimator.
+    FIELDNAMES = CORE_FIELDNAMES + ['pos_x', 'pos_y', 'heading']
 
     def __init__(self):
         self._active   = False
@@ -405,7 +446,7 @@ class SimPlayer:
         self._file   = open(self.csv_path, 'r', newline='')
         self._reader = csv.DictReader(self._file)
         fields = self._reader.fieldnames or []
-        if not set(RecordingManager.FIELDNAMES) <= set(fields):
+        if not set(RecordingManager.CORE_FIELDNAMES) <= set(fields):
             self._file.close()
             raise ValueError('not a Logots recording CSV')
         self._wall_start = None   # monotonic time when this pass started
@@ -460,6 +501,9 @@ class SimPlayer:
         def num(key, fallback):
             try:    return int(float(row.get(key)))
             except Exception: return fallback
+        def fnum(key, fallback):            # float variant, for the position columns
+            try:    return float(row.get(key))
+            except Exception: return fallback
         yaw, pitch, roll = arr('yaw'), arr('pitch'), arr('roll')
         decoded = {
             'imu':        list(zip(yaw, pitch, roll)),
@@ -468,6 +512,9 @@ class SimPlayer:
             'right_pwm':  num('right_pwm', 0),
             'pan_angle':  num('pan_angle', 90),
             'tilt_angle': num('tilt_angle', 90),
+            'pos_x':      fnum('pos_x', 0.0),   # 0.0 when column absent (old CSVs)
+            'pos_y':      fnum('pos_y', 0.0),
+            'heading':    fnum('heading', 0.0),
         }
         frame = {
             'frame_id':      num('frame_id', self.row_index - 1),
@@ -481,6 +528,9 @@ class SimPlayer:
             'right_pwm':     decoded['right_pwm'],
             'pan_angle':     decoded['pan_angle'],
             'tilt_angle':    decoded['tilt_angle'],
+            'pos_x':         decoded['pos_x'],
+            'pos_y':         decoded['pos_y'],
+            'heading':       decoded['heading'],
         }
         return frame, decoded, _decode_frame(frame['frame_data'])
 
@@ -582,6 +632,9 @@ class RobotControlGUI:
         self.pan_angle=90
         self.tilt_angle=90
 
+        self._pos_est   = PositionEstimator()
+        self._pos_trail = collections.deque(maxlen=400)  # (x,y) points for the mini-map
+
         self.i2c=None; self.connected=False
         self._last_reconnect=0
 
@@ -650,8 +703,12 @@ class RobotControlGUI:
     def _ctrl_panel(self,parent):
         p=parent
         _plbl(p,'DRIVE  &  CAM',font=('Courier',9,'bold')).pack(pady=(8,4))
-        row=tk.Frame(p,bg=C_PANEL); row.pack(padx=10,pady=(0,10))
-        self._joystick(row); self._cam_sliders(row)
+        row=tk.Frame(p,bg=C_PANEL); row.pack(padx=10,pady=(0,8))
+        self._joystick(row)
+        rc=tk.Frame(row,bg=C_PANEL); rc.pack(side='left')   # sliders on top, map below
+        sl=tk.Frame(rc,bg=C_PANEL); sl.pack(side='top')
+        self._cam_sliders(sl)
+        self._position_map(rc)
 
     def _joystick(self,parent):
         sz=(self.JOY_R+14)*2
@@ -702,12 +759,57 @@ class RobotControlGUI:
             var=tk.IntVar(value=90)
             setattr(self,f'{attr}_var',var)
             tk.Scale(f,from_=180,to=0,variable=var,orient='vertical',
-                     length=190,width=16,bg=C_PANEL,fg=C_TEXT,troughcolor='#16162a',
+                     length=120,width=16,bg=C_PANEL,fg=C_TEXT,troughcolor='#16162a',
                      activebackground=C_BLUE_HI,highlightthickness=0,bd=0,
                      sliderrelief='flat',sliderlength=20,showvalue=True,
                      command=lambda v,a=attr:None if self.sim_mode
                              else setattr(self,f'{a}_angle',int(v))).pack()
             _plbl(f,'0°',font=('Courier',7)).pack(pady=(0,4))
+
+    # ── Position mini-map ─────────────────────────────────────────────────────
+    POS_MAP = 118   # canvas size (px) for the top-down trail
+
+    def _position_map(self,parent):
+        _plbl(parent,'POSITION (m)',font=('Courier',7,'bold')).pack(pady=(2,0))
+        self.pos_cv=tk.Canvas(parent,width=self.POS_MAP,height=self.POS_MAP,
+                              bg='#16162a',highlightthickness=1,
+                              highlightbackground=C_BORDER)
+        self.pos_cv.pack(pady=(1,0))
+        self._draw_pos_map()
+
+    def _draw_pos_map(self):
+        """Auto-scaled top-down view of the trail; +X right, +Y up, heading arrow."""
+        cv=self.pos_cv; S=self.POS_MAP; cv.delete('all')
+        pts=list(self._pos_trail)
+        # world bounds (always include origin), with a minimum span so a still
+        # robot doesn't zoom to infinity
+        xs=[p[0] for p in pts]+[0.0]; ys=[p[1] for p in pts]+[0.0]
+        xmin,xmax=min(xs),max(xs); ymin,ymax=min(ys),max(ys)
+        span=max(xmax-xmin, ymax-ymin, 0.5); pad=span*0.15+1e-6
+        cx=(xmin+xmax)/2; cy=(ymin+ymax)/2
+        half=span/2+pad
+        def to_px(wx,wy):
+            px=(wx-cx)/(2*half)*(S-8)+S/2
+            py=S/2-(wy-cy)/(2*half)*(S-8)   # +Y up
+            return px,py
+        # grid crosshair through origin
+        ox,oy=to_px(0.0,0.0)
+        cv.create_line(0,oy,S,oy,fill='#25253a')
+        cv.create_line(ox,0,ox,S,fill='#25253a')
+        cv.create_oval(ox-2,oy-2,ox+2,oy+2,outline=C_SUB,fill='')  # origin marker
+        # trail polyline
+        if len(pts)>=2:
+            flat=[]
+            for wx,wy in pts:
+                px,py=to_px(wx,wy); flat+=[px,py]
+            cv.create_line(*flat,fill=C_BLUE,width=1)
+        # current position + heading arrow
+        if pts:
+            wx,wy=pts[-1]; px,py=to_px(wx,wy)
+            th=math.radians(self.latest_frame.get('heading',0.0) if self.latest_frame else 0.0)
+            ax=px+10*math.cos(th); ay=py-10*math.sin(th)
+            cv.create_line(px,py,ax,ay,fill=C_GREEN,width=2,arrow='last')
+            cv.create_oval(px-3,py-3,px+3,py+3,fill=C_BLUE_HI,outline='')
 
     # ── Audio panel ───────────────────────────────────────────────────────────
     def _audio_panel(self,parent):
@@ -839,10 +941,15 @@ class RobotControlGUI:
         self.lbl_rm =_vallbl(f,'R:  +000',fg=C_BLUE,width=8)
         self.lbl_pan=_vallbl(f,'PAN:090°',fg=C_GREEN,width=8)
         self.lbl_tlt=_vallbl(f,'TLT:090°',fg=C_AMBER,width=8)
+        self.lbl_pos=_vallbl(f,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
+        self.lbl_hdg=_vallbl(f,'HDG:000°',fg=C_GREEN,width=9)
         self.lbl_lm.pack(side='left',padx=(0,5))
         self.lbl_rm.pack(side='left',padx=(0,5))
         self.lbl_pan.pack(side='left',padx=(0,5))
         self.lbl_tlt.pack(side='left',padx=(0,5))
+        self.lbl_pos.pack(side='left',padx=(0,5))
+        self.lbl_hdg.pack(side='left',padx=(0,5))
+        _btn(f,'⌖  POS',C_SUB,self._reset_pos,width=7).pack(side='left',padx=(0,5))
         _btn(f,'■  STOP',C_RED,self._estop).pack(side='right')
         self.btn_rec=_btn(f,'⚫  REC',C_SUB,self._toggle_rec); self.btn_rec.pack(side='right',padx=(0,6))
         self.btn_sim=_btn(f,'▶  SIM',C_SUB,self._toggle_sim,width=7)
@@ -884,12 +991,18 @@ class RobotControlGUI:
     def _estop(self):
         self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0; self._draw_joy()
 
+    def _reset_pos(self):
+        """Zero the position estimate (origin = here). Blocked during sim."""
+        if self.sim_mode: return
+        self._pos_est.reset(); self._pos_trail.clear(); self._draw_pos_map()
+
     def _toggle_rec(self):
         if self._rec_manager.active:
             self._rec_manager.stop()
             self._rec_frame_id=0
             self.btn_rec.config(text='⚫  REC',bg=C_SUB)
         else:
+            self._pos_est.reset(); self._pos_trail.clear()   # session starts at origin
             self._rec_manager.start()
             self.btn_rec.config(text='🔴  REC',bg=C_RED)
 
@@ -904,6 +1017,7 @@ class RobotControlGUI:
             self.pan_var.set(self.pan_angle); self.tilt_var.set(self.tilt_angle)
             self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0
             self._draw_joy()
+            self._pos_est.reset(); self._pos_trail.clear()   # real odometry starts fresh
             self.btn_sim.config(text='▶  SIM',bg=C_SUB)
             self.btn_rec.config(state='normal')
             self.lbl_tx.config(text='')
@@ -923,6 +1037,7 @@ class RobotControlGUI:
         if self._rec_manager.active: self._toggle_rec()
         self._pre_sim_angles=(self.pan_angle,self.tilt_angle)
         self.sim_player=player; self.sim_mode=True; self._sim_ended=False
+        self._pos_trail.clear()                             # replay draws the recorded path
         self.btn_sim.config(text='⏹  REAL',bg=C_BLUE)
         self.btn_rec.config(state='disabled')
         self.lbl_cs.config(text='⬤  SIM MODE',fg=C_BLUE_HI)
@@ -986,6 +1101,7 @@ class RobotControlGUI:
         self._update_imu_widgets()
         self._update_audio_widgets()
         self._update_video_widgets()
+        self._update_position_widgets()
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
         self.root.after(50,self._loop)
@@ -998,6 +1114,9 @@ class RobotControlGUI:
         frame_bgr   = self.camera_reader.get_frame()    if self.camera_reader else None
         imu_samples = self.imu_reader.drain_samples()   if self.imu_reader    else []
         audio_samps = self.audio_reader.drain_samples() if self.audio_reader  else []
+        yaw_now = (imu_samples[-1][0] if imu_samples
+                   else (self.imu_reader.yaw if self.imu_reader else 0.0))
+        self._pos_est.update(self.left_pwm, self.right_pwm, yaw_now)
         frame = {
             'frame_id':      self._rec_frame_id,
             'timestamp':     datetime.now().isoformat(),
@@ -1010,6 +1129,9 @@ class RobotControlGUI:
             'right_pwm':     self.right_pwm,
             'pan_angle':     self.pan_angle,
             'tilt_angle':    self.tilt_angle,
+            'pos_x':         round(self._pos_est.x, 4),
+            'pos_y':         round(self._pos_est.y, 4),
+            'heading':       round(self._pos_est.heading, 2),
         }
         with self._frame_lock:
             self.latest_frame     = frame
@@ -1118,6 +1240,17 @@ class RobotControlGUI:
         else:
             self._draw_wave(np.zeros(512))
         self._draw_rms(self._rms_ema)
+
+    def _update_position_widgets(self):
+        """Read pos_x/pos_y/heading from the current snapshot (Real: live estimate,
+        Sim: recorded values) and refresh the readout + mini-map."""
+        fr=self.latest_frame or {}
+        x=fr.get('pos_x',0.0); y=fr.get('pos_y',0.0); hdg=fr.get('heading',0.0)
+        if not self._pos_trail or (x,y)!=self._pos_trail[-1]:
+            self._pos_trail.append((x,y))
+        self.lbl_pos.config(text=f'X{x:+05.2f} Y{y:+05.2f}')
+        self.lbl_hdg.config(text=f'HDG:{int(hdg)%360:03d}°')
+        self._draw_pos_map()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
