@@ -190,8 +190,8 @@ frame = get_latest_frame()                # adds frame['image']: 640×640×3 uin
 
 ## Known issues / next steps
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
-- Motors and servos not yet physically connected to Arduino — I2C command flow confirmed working, hardware wiring pending.
+- Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. The drive motors are simple **non-feedback** motors (no encoders / no velocity readback) — a feedback-capable drivetrain is planned for the next body iteration.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The 20 Hz loop actually achieves ~10.5 Hz on the Jetson (tick work + `after(50)` re-arm). Recordings are timestamped so sim playback is unaffected, but worth knowing for downstream timing assumptions.
-- **Calibrate `ROBOT_MAX_SPEED_MPS`** (in `logots_ui.py`) on the robot once motors are connected: drive a known distance at full PWM for a known time and set the constant to `distance/time`. Until then `pos_x`/`pos_y` are directionally right (heading is real IMU data) but not metrically accurate, and they assume motors track commands (no encoder feedback). Position also drifts with IMU yaw drift over long sessions.
+- **Calibrate `ROBOT_MAX_SPEED_MPS`** (in `logots_ui.py`) on the robot (motors are now connected): drive a known distance at full PWM for a known time and set the constant to `distance/time`. Until then `pos_x`/`pos_y` are directionally right (heading is real IMU data) but not metrically accurate, and they assume motors track commands (no encoder feedback). Position also drifts with IMU yaw drift over long sessions.
