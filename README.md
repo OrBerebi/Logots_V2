@@ -85,17 +85,22 @@ For headless / NoMachine sessions the GUI connects automatically. No display var
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  joystick + pan/    │  3D Madgwick AHRS   │
-│  tilt sliders       │  YPR display        │
+│  tilt sliders +     │  YPR display        │
+│  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS     │  live IMX219 feed   │
 └─────────────────────┴─────────────────────┘
-  L: +0000  R: +0000  PAN:090°  TLT:090°   LOOP ▶ SIM  ⚫ REC  ■ STOP
+  L:+000  R:+000  PAN:090°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS   LOOP ▶ SIM  ⚫ REC  ■ STOP
 ```
+
+A **position mini-map** at the bottom of the DRIVE & CAM panel shows a top-down trail of where the robot thinks its body is (dead-reckoned from motor commands + IMU heading), with an `X/Y/HDG` readout in the status bar and a `⌖ POS` button to reset the origin to "here". See the position note below.
 
 **Keyboard shortcuts:** `W/S` = forward/back · `A/D` = turn · `SPACE` = stop
 
 The GUI auto-connects to the Arduino on startup and retries every 3 seconds if the connection drops.
+
+The header shows a live **`FPS:actual/target`** readout (green when within 10% of target, amber below). The capture/recording rate is `TARGET_FPS` (default **10 Hz**) and the camera runs at `CAMERA_FPS` (default **15**, down from the sensor's 30) — both are constants at the top of `src/logots_ui.py`. The loop is drift-compensated, so the actual rate tracks the target as long as the Jetson can keep up.
 
 ---
 
@@ -122,9 +127,15 @@ from logots_api import get_latest_frame
 frame = get_latest_frame()
 frame['image']           # 640×640×3 uint8 RGB numpy array (None if no camera)
 frame['yaw']             # list of yaw readings (°) since the previous frame
-frame['audio_samples']   # list of mic samples (~800 per frame at 20 Hz)
+frame['audio_samples']   # list of mic samples (~1600 per frame at 10 FPS)
 frame['left_pwm']        # motor/servo commands: left_pwm, right_pwm, pan_angle, tilt_angle
+frame['pos_x']           # estimated body position (m): pos_x, pos_y, and heading (°)
 ```
+
+> **Position (`pos_x`/`pos_y`/`heading`) is a dead-reckoning estimate, not measured odometry** — the
+> drive motors have no encoders. Forward speed is modelled from the commanded PWM and direction from the
+> IMU yaw, so distances are only as accurate as the `ROBOT_MAX_SPEED_MPS` calibration constant in
+> `logots_ui.py`. Recordings made before this feature simply omit the columns.
 
 The raw endpoint is `GET http://localhost:8787/latest_frame` (JSON), if you'd rather not use the helper.
 
@@ -138,7 +149,7 @@ python src/api_demo.py
 
 ## Arduino I2C protocol
 
-Messages are sent from the Jetson to the Arduino at 20 Hz:
+Messages are sent from the Jetson to the Arduino once per capture tick (`TARGET_FPS`, default 10 Hz):
 
 ```
 "{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"
@@ -167,4 +178,4 @@ NoMachine at `192.168.68.114:4000` — provides a full remote desktop on the Jet
 ## Known issues
 
 - Camera has a pink/IR hue — the IMX219-160 fisheye has no IR cut filter. Fix: M12 IR cut filter (hardware).
-- Motors and servos not yet physically wired to the Arduino — I2C command flow is confirmed working.
+- Drive motors have no encoders (open-loop), so the `pos_x`/`pos_y` estimate is directional but not metrically accurate until `ROBOT_MAX_SPEED_MPS` is calibrated. A feedback drivetrain is planned for the next body iteration.

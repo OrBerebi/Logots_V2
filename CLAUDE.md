@@ -85,7 +85,7 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
 Always requires `EGL_PLATFORM=surfaceless` for headless/NoMachine use:
 ```
 nvarguscamerasrc sensor-id=0
-  ! video/x-raw(memory:NVMM),width=640,height=480,framerate=30/1
+  ! video/x-raw(memory:NVMM),width=640,height=480,framerate=15/1   # CAMERA_FPS
   ! nvvidconv
   ! video/x-raw,format=BGRx
   ! videoconvert
@@ -119,7 +119,7 @@ Press **⚫ REC** to start recording; press again to stop. Output:
 recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 ```
 
-### CSV schema (staging layer — one row per 20 Hz tick)
+### CSV schema (staging layer — one row per capture tick, `TARGET_FPS` default 10 Hz)
 | Column | Type | Description |
 |---|---|---|
 | `frame_id` | int | 0-based counter per session |
@@ -128,7 +128,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `yaw` | JSON array | all IMU yaw readings (°) since last frame |
 | `pitch` | JSON array | all IMU pitch readings (°) since last frame |
 | `roll` | JSON array | all IMU roll readings (°) since last frame |
-| `audio_samples` | JSON array | all mic samples since last frame (~800 floats at 20 FPS) |
+| `audio_samples` | JSON array | all mic samples since last frame (~1600 floats at 10 FPS) |
 | `left_pwm` | int | left motor command, –255…+255 |
 | `right_pwm` | int | right motor command, –255…+255 |
 | `pan_angle` | int | pan servo, 0…180° |
@@ -144,7 +144,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 > optional: recordings made before this feature lack them and still replay (origin/0.0).
 
 ### Architecture notes
-- Each 20 Hz tick builds a snapshot trio under `self._frame_lock`: `latest_frame` (CSV-shaped dict), `latest_frame_bgr` (BGR numpy image or None), and `latest_decoded` (parsed IMU tuples + audio floats for the widgets). All GUI monitoring widgets render from this snapshot in both Real and Sim modes.
+- Each capture tick builds a snapshot trio under `self._frame_lock`: `latest_frame` (CSV-shaped dict), `latest_frame_bgr` (BGR numpy image or None), and `latest_decoded` (parsed IMU tuples + audio floats for the widgets). All GUI monitoring widgets render from this snapshot in both Real and Sim modes.
 - `IMUReader.drain_samples()` and `AudioReader.drain_samples()` atomically swap their internal buffers, so all readings since the last frame are captured as arrays (not just the latest snapshot).
 - `RecordingManager` writer thread handles frame encoding (PIL BGR→RGB→640×640→JPEG→base64) and CSV writes off the main thread.
 - Frame encoding uses PIL, not cv2, to stay compatible with NumPy 2.x.
@@ -153,8 +153,8 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 
 ## Sim mode
 
-The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a file dialog for a session CSV; `SimPlayer` then replays it row-by-row inside the same 20 Hz `_loop`, rebuilding the snapshot trio as if the data were sampled live. Details:
-- **Playback is paced by the CSV's timestamps** (real-time replay). The recorder's actual tick rate is ~10.5 Hz on the Jetson (tick work + `after(50)`), so fixed-rate replay would run ~1.9× fast. `SimPlayer.next_frame()` returns `SimPlayer.WAIT` while the current frame should be held.
+The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a file dialog for a session CSV; `SimPlayer` then replays it row-by-row inside the same capture `_loop`, rebuilding the snapshot trio as if the data were sampled live. Details:
+- **Playback is paced by the CSV's timestamps** (real-time replay), so it is correct regardless of the rate a given recording actually achieved. `SimPlayer.next_frame()` returns `SimPlayer.WAIT` while the current frame should be held.
 - The joystick knob and pan/tilt sliders animate from the recorded values; user input to those controls is blocked during sim, and pre-sim pan/tilt is restored on exit (so servos don't jump when real sends resume).
 - Works on any machine (macOS included) — only needs the `logots` conda env and a recording CSV. Hardware readers keep running but are ignored (stopping `IMUReader` would force a ~10 s recalibration per toggle); I2C sends and reconnects are skipped.
 - **LOOP** checkbox: wrap at end-of-file vs freeze on last frame (`SIM ended`).
@@ -163,7 +163,7 @@ The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a 
 
 ## Frame API (for downstream processing)
 
-`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the 20 Hz tick never pays for it; the four array fields are real JSON arrays; `pos_x`/`pos_y` (m) and `heading` (°) carry the dead-reckoned body position; `sim_mode` (bool) is included. Client helper:
+`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the capture tick never pays for it; the four array fields are real JSON arrays; `pos_x`/`pos_y` (m) and `heading` (°) carry the dead-reckoned body position; `sim_mode` (bool) is included. Client helper:
 
 ```python
 from logots_api import get_latest_frame   # src/logots_api.py
@@ -193,5 +193,5 @@ frame = get_latest_frame()                # adds frame['image']: 640×640×3 uin
 - Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. The drive motors are simple **non-feedback** motors (no encoders / no velocity readback) — a feedback-capable drivetrain is planned for the next body iteration.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
-- The 20 Hz loop actually achieves ~10.5 Hz on the Jetson (tick work + `after(50)` re-arm). Recordings are timestamped so sim playback is unaffected, but worth knowing for downstream timing assumptions.
+- The capture loop is **drift-compensated**: it waits `PERIOD_MS` minus the time the tick's work took, so the actual rate tracks `TARGET_FPS` (default **10 Hz**, set in `logots_ui.py`) as long as the per-tick work fits inside the period. The header shows a live `FPS:actual/target` readout (green within 10% of target, amber below) — run on the Jetson and, if it can't hold green, set `TARGET_FPS` just under the sustained value. The camera runs at `CAMERA_FPS` (default 15, down from the sensor's 30) since the loop only keeps the latest frame; if `nvarguscamerasrc` rejects that framerate for its sensor mode, raise it or drop frames downstream with a `videorate` element. Recordings are timestamped, so sim playback is unaffected by the exact rate.
 - **Calibrate `ROBOT_MAX_SPEED_MPS`** (in `logots_ui.py`) on the robot (motors are now connected): drive a known distance at full PWM for a known time and set the constant to `distance/time`. Until then `pos_x`/`pos_y` are directionally right (heading is real IMU data) but not metrically accurate, and they assume motors track commands (no encoder feedback). Position also drifts with IMU yaw drift over long sessions.

@@ -65,6 +65,21 @@ MPU_ADDR      = 0x68
 AUDIO_RATE    = 16000
 AUDIO_BLOCK   = 512
 
+# ── Capture loop rate ─────────────────────────────────────────────────────────
+# Sensory-capture / recording tick rate. The loop is drift-compensated (it waits
+# PERIOD_MS minus however long the tick's work took), so the ACTUAL rate tracks
+# TARGET_FPS as long as the per-tick work fits inside PERIOD_MS. 10 FPS (100 ms)
+# is sustainable on the Jetson, whose per-tick work is ~45-90 ms.
+TARGET_FPS = 10
+PERIOD_MS  = int(round(1000 / TARGET_FPS))   # 100 ms per tick
+
+# Camera capture rate. The FIFO reader keeps only the latest frame, so the camera
+# only needs to feed the ~10 FPS loop — running it at the sensor's full 30 FPS just
+# burns ISP + videoconvert + FIFO bandwidth on frames that get discarded. A little
+# headroom above TARGET_FPS keeps the displayed frame fresh. Drop to match if you
+# want maximum savings.
+CAMERA_FPS = 15
+
 PWR_MGMT_1 = 0x6B;  CONFIG_REG = 0x1A
 GYRO_CFG   = 0x1B;  ACCEL_CFG  = 0x1C;  ACCEL_CFG2 = 0x1D
 ACCEL_OUT  = 0x3B;  GYRO_OUT   = 0x43
@@ -308,7 +323,7 @@ class CameraReader(threading.Thread):
 
         pipeline = (
             f'nvarguscamerasrc sensor-id=0 '
-            f'! "video/x-raw(memory:NVMM),width={self.W},height={self.H},framerate=30/1" '
+            f'! "video/x-raw(memory:NVMM),width={self.W},height={self.H},framerate={CAMERA_FPS}/1" '
             f'! nvvidconv '
             f'! "video/x-raw,format=BGRx" '
             f'! videoconvert '
@@ -635,6 +650,9 @@ class RobotControlGUI:
         self._pos_est   = PositionEstimator()
         self._pos_trail = collections.deque(maxlen=400)  # (x,y) points for the mini-map
 
+        self._fps_ema     = 0.0    # smoothed actual capture rate (Hz)
+        self._last_tick_t = None   # monotonic time of the previous tick start
+
         self.i2c=None; self.connected=False
         self._last_reconnect=0
 
@@ -677,6 +695,8 @@ class RobotControlGUI:
         _lbl(f,'LOGOTS  ROBOT CONTROL',fg=C_TEXT,font=('Courier',14,'bold')).pack(side='left')
         self.lbl_cs=_lbl(f,'⬤  DISCONNECTED',fg=C_RED,font=('Courier',9,'bold'))
         self.lbl_cs.pack(side='right')
+        self.lbl_fps=_lbl(f,'FPS: --',fg=C_SUB,font=('Courier',9,'bold'))
+        self.lbl_fps.pack(side='right',padx=(0,16))
 
 
     def _main_panels(self):
@@ -1094,8 +1114,17 @@ class RobotControlGUI:
         self.camera_reader=CameraReader(); self.camera_reader.start()
         self._conn()
 
-    # ── 20 Hz update loop ─────────────────────────────────────────────────────
+    # ── Capture loop (TARGET_FPS, drift-compensated) ──────────────────────────
     def _loop(self):
+        t0 = time.monotonic()
+        # Actual capture rate = 1 / (time between successive tick starts), smoothed.
+        if self._last_tick_t is not None:
+            dt = t0 - self._last_tick_t
+            if dt > 0:
+                inst = 1.0 / dt
+                self._fps_ema = inst if self._fps_ema == 0 else 0.2*inst + 0.8*self._fps_ema
+        self._last_tick_t = t0
+
         if self.sim_mode: self._tick_sim()
         else:             self._tick_real()
         self._update_imu_widgets()
@@ -1104,7 +1133,14 @@ class RobotControlGUI:
         self._update_position_widgets()
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
-        self.root.after(50,self._loop)
+        self._update_fps_label()
+
+        # Drift compensation: wait only the remainder of the period, so the actual
+        # rate tracks TARGET_FPS instead of (work + fixed delay). If a tick overruns
+        # PERIOD_MS we re-arm immediately (min 1 ms) and just run slower that tick.
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        delay = max(1, int(round(PERIOD_MS - elapsed_ms)))
+        self.root.after(delay, self._loop)
 
     def _tick_real(self):
         if not self.connected and time.time()-self._last_reconnect>3:
@@ -1251,6 +1287,12 @@ class RobotControlGUI:
         self.lbl_pos.config(text=f'X{x:+05.2f} Y{y:+05.2f}')
         self.lbl_hdg.config(text=f'HDG:{int(hdg)%360:03d}°')
         self._draw_pos_map()
+
+    def _update_fps_label(self):
+        fps = self._fps_ema
+        ok  = fps >= 0.9 * TARGET_FPS           # green when within 10% of target
+        self.lbl_fps.config(text=f'FPS:{fps:4.1f}/{TARGET_FPS}',
+                            fg=(C_GREEN if ok else C_AMBER))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
