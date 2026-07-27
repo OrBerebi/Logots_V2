@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 700" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#5b6472"/></marker>
+    <marker id="arG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2fa84f"/></marker>
+    <marker id="arO" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#e08a1e"/></marker>
+    <marker id="arB" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2f6fed"/></marker>
+  </defs>
+
+  <text x="40" y="42" font-size="23" font-weight="700" fill="#1b1f27">Logots V2 — Architecture</text>
+  <text x="40" y="68" font-size="13" fill="#5b6472">V1's two-tier skeleton, kept. The mart delivers raw reality; Gemma + .md do the interpreting.</text>
+
+  <!-- ===== DARAB sensors ===== -->
+  <rect x="40" y="120" width="192" height="180" rx="10" fill="#e0edff" stroke="#2f6fed" stroke-width="1.5"/>
+  <text x="54" y="145" font-size="13" font-weight="700" fill="#14346b">DARAB</text>
+  <text x="54" y="162" font-size="11" fill="#3a5a9b">per-sensor dataframes</text>
+  <rect x="58" y="174" width="156" height="32" rx="7" fill="#fff" stroke="#2f6fed"/><text x="136" y="195" font-size="12" fill="#14346b" text-anchor="middle">Camera</text>
+  <rect x="58" y="212" width="156" height="32" rx="7" fill="#fff" stroke="#2f6fed"/><text x="136" y="233" font-size="12" fill="#14346b" text-anchor="middle">Microphone</text>
+  <rect x="58" y="250" width="156" height="32" rx="7" fill="#fff" stroke="#2f6fed"/><text x="136" y="271" font-size="12" fill="#14346b" text-anchor="middle">IMU</text>
+
+  <!-- boundary -->
+  <line x1="258" y1="108" x2="258" y2="612" stroke="#9aa3b2" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="258" y="100" font-size="10.5" fill="#7a8494" text-anchor="middle">handoff boundary</text>
+
+  <!-- ===== mrt_experience = REALITY ===== -->
+  <rect x="300" y="120" width="252" height="256" rx="10" fill="#eef0f3" stroke="#8a94a6" stroke-width="1.6"/>
+  <text x="318" y="148" font-size="15" font-weight="700" fill="#2b3141">mrt_experience</text>
+  <text x="318" y="167" font-size="10.5" font-style="italic" fill="#7a8494">REALITY — raw, frame_id-keyed</text>
+  <line x1="314" y1="177" x2="538" y2="177" stroke="#d3d8e0"/>
+  <g font-size="11.5" fill="#3a3f49">
+    <text x="318" y="200"><tspan font-weight="700">frame_id</tspan>  ·  shared join key</text>
+    <text x="318" y="226"><tspan font-weight="700">ts</tspan>  ·  timestamp</text>
+    <text x="318" y="252"><tspan font-weight="700">frame</tspan>  ·  raw image</text>
+    <text x="318" y="278"><tspan font-weight="700">audio</tspan>  ·  raw clip</text>
+    <text x="318" y="304"><tspan font-weight="700">pose</tspan>  ·  x, y, heading</text>
+    <text x="318" y="330"><tspan font-weight="700">touch_intensity</tspan>  ·  IMU force</text>
+  </g>
+  <text x="318" y="358" font-size="10" font-style="italic" fill="#7a8494">only what informs the LLM — nothing derived</text>
+
+  <line x1="232" y1="205" x2="298" y2="215" stroke="#5b6472" stroke-width="1.6" marker-end="url(#ar)"/>
+
+  <!-- ===== INTERPRETATION container ===== -->
+  <rect x="600" y="118" width="316" height="374" rx="12" fill="none" stroke="#2fa84f" stroke-width="1.3" stroke-dasharray="7 5"/>
+  <text x="616" y="138" font-size="11" font-weight="700" fill="#2fa84f">INTERPRETATION &amp; KNOWLEDGE  (LLM-leaning)</text>
+
+  <!-- Gemma -->
+  <rect x="620" y="150" width="278" height="118" rx="10" fill="#e3f7e8" stroke="#2fa84f" stroke-width="1.5"/>
+  <text x="636" y="176" font-size="13" font-weight="700" fill="#14532d">mrt_reflective — Gemma (local)</text>
+  <text x="636" y="197" font-size="11" fill="#256b3a">sees + hears + interprets</text>
+  <text x="636" y="215" font-size="11" fill="#256b3a">on-demand · ~1–2 s</text>
+  <text x="636" y="233" font-size="11" fill="#256b3a">decides + interprets (points at the pot)</text>
+
+  <!-- md -->
+  <rect x="620" y="296" width="278" height="176" rx="10" fill="#eefaf1" stroke="#2fa84f" stroke-width="1.5"/>
+  <text x="636" y="322" font-size="13" font-weight="700" fill="#14532d">knowledge/ · .md files</text>
+  <text x="636" y="345" font-size="11" fill="#256b3a">guidelines · roster · room_map</text>
+  <text x="636" y="364" font-size="11" fill="#256b3a">species/ · plants/ · journal</text>
+  <line x1="636" y1="378" x2="882" y2="378" stroke="#bfe6ca"/>
+  <text x="636" y="400" font-size="11" font-style="italic" fill="#2fa84f">read + write → continual learning</text>
+  <text x="636" y="419" font-size="10.5" fill="#4a515e">history · learned care · the map</text>
+  <text x="636" y="439" font-size="10" font-style="italic" fill="#7a8494">the robot's memory (V1 had none)</text>
+
+  <!-- mart -> gemma -->
+  <line x1="552" y1="200" x2="618" y2="200" stroke="#5b6472" stroke-width="1.8" marker-end="url(#ar)"/>
+  <text x="585" y="192" font-size="10" fill="#3a3f49" text-anchor="middle">raw frames + audio clips</text>
+  <!-- gemma <-> md -->
+  <line x1="759" y1="268" x2="759" y2="296" stroke="#2fa84f" stroke-width="1.6" marker-end="url(#arG)" marker-start="url(#arG)"/>
+  <text x="769" y="286" font-size="10" fill="#2fa84f">read / write</text>
+
+  <!-- ===== ACTIONS ===== -->
+  <rect x="954" y="150" width="200" height="342" rx="10" fill="#fff3df" stroke="#e08a1e" stroke-width="1.5"/>
+  <text x="972" y="178" font-size="15" font-weight="700" fill="#7a4a08">ACTIONS</text>
+  <text x="972" y="195" font-size="9.5" font-style="italic" fill="#a3701f">the Or↔Asaf contract</text>
+  <g font-size="11.5" fill="#5a3a0a">
+    <text x="972" y="222">initiation</text>
+    <text x="972" y="246">scan_room</text>
+    <text x="972" y="270">approach_plant(id)</text>
+    <text x="972" y="294">inspect_plant(id)</text>
+    <text x="972" y="318">capture_photo(subject)</text>
+    <text x="972" y="342">water_plant(id, ml)</text>
+    <text x="972" y="366">flag_issue(sev, …)</text>
+    <text x="972" y="390">speak(text)</text>
+    <text x="972" y="414">daily_summary</text>
+    <text x="972" y="438">return_to_base</text>
+    <text x="972" y="462">wait_until(next)</text>
+  </g>
+  <line x1="898" y1="210" x2="952" y2="228" stroke="#e08a1e" stroke-width="1.6" marker-end="url(#arO)"/>
+
+  <!-- ===== DARAB actuators ===== -->
+  <rect x="40" y="336" width="192" height="96" rx="10" fill="#e0edff" stroke="#2f6fed" stroke-width="1.5"/>
+  <text x="54" y="362" font-size="13" font-weight="700" fill="#14346b">DARAB · actuators</text>
+  <text x="54" y="384" font-size="11" fill="#3a5a9b">motors · servos · water pump</text>
+  <text x="54" y="405" font-size="10" font-style="italic" fill="#7a8494">executes commands</text>
+
+  <!-- actions -> actuators loop back -->
+  <polyline points="1054,492 1054,560 136,560 136,432" fill="none" stroke="#2f6fed" stroke-width="1.6" marker-end="url(#arB)"/>
+  <text x="595" y="554" font-size="11" fill="#2f6fed" text-anchor="middle">actuator commands</text>
+
+  <!-- legend -->
+  <g font-size="11" fill="#3a3f49">
+    <rect x="40" y="638" width="15" height="15" rx="3" fill="#e0edff" stroke="#2f6fed"/><text x="62" y="650">Darab — sensors + actuators</text>
+    <rect x="270" y="638" width="15" height="15" rx="3" fill="#eef0f3" stroke="#8a94a6"/><text x="292" y="650">mart — reality (raw)</text>
+    <rect x="470" y="638" width="15" height="15" rx="3" fill="#e3f7e8" stroke="#2fa84f"/><text x="492" y="650">Asaf — Gemma + .md (interpretation)</text>
+    <rect x="770" y="638" width="15" height="15" rx="3" fill="#fff3df" stroke="#e08a1e"/><text x="792" y="650">action schema — the interface</text>
+  </g>
+</svg>
