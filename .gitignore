@@ -2,3 +2,8 @@
 recordings/
 __pycache__/
 *.pyc
+
+# large input recordings (Darab's, also mirrored under recordings/)
+experiments/staging_to_action/raw/
+experiments/staging_to_action_v2/*.csv
+experiments/audio_on_demand/service.log
