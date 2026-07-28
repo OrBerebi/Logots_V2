@@ -4,10 +4,11 @@
     <marker id="arG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2fa84f"/></marker>
     <marker id="arO" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#e08a1e"/></marker>
     <marker id="arB" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2f6fed"/></marker>
+    <marker id="arP" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8b5cf6"/></marker>
   </defs>
 
   <text x="40" y="42" font-size="23" font-weight="700" fill="#1b1f27">Logots V2 — Architecture</text>
-  <text x="40" y="68" font-size="13" fill="#5b6472">V1's two-tier skeleton, kept. The mart delivers raw reality; Gemma + .md do the interpreting.</text>
+  <text x="40" y="68" font-size="13" fill="#5b6472">V1's two-tier skeleton, kept. The mart delivers raw visual reality; the ears wake on "Hi Robot"; Gemma + .md do the interpreting.</text>
 
   <!-- ===== DARAB sensors ===== -->
   <rect x="40" y="120" width="192" height="180" rx="10" fill="#e0edff" stroke="#2f6fed" stroke-width="1.5"/>
@@ -24,15 +25,14 @@
   <!-- ===== mrt_experience = REALITY ===== -->
   <rect x="300" y="120" width="252" height="256" rx="10" fill="#eef0f3" stroke="#8a94a6" stroke-width="1.6"/>
   <text x="318" y="148" font-size="15" font-weight="700" fill="#2b3141">mrt_experience</text>
-  <text x="318" y="167" font-size="10.5" font-style="italic" fill="#7a8494">REALITY — raw, frame_id-keyed</text>
+  <text x="318" y="167" font-size="10.5" font-style="italic" fill="#7a8494">REALITY — 1 row = 1 s · last 30 s in RAM</text>
   <line x1="314" y1="177" x2="538" y2="177" stroke="#d3d8e0"/>
   <g font-size="11.5" fill="#3a3f49">
-    <text x="318" y="200"><tspan font-weight="700">frame_id</tspan>  ·  shared join key</text>
-    <text x="318" y="226"><tspan font-weight="700">ts</tspan>  ·  timestamp</text>
-    <text x="318" y="252"><tspan font-weight="700">frame</tspan>  ·  raw image</text>
-    <text x="318" y="278"><tspan font-weight="700">audio</tspan>  ·  raw clip</text>
-    <text x="318" y="304"><tspan font-weight="700">pose</tspan>  ·  x, y, heading</text>
-    <text x="318" y="330"><tspan font-weight="700">touch_intensity</tspan>  ·  IMU force</text>
+    <text x="318" y="202"><tspan font-weight="700">experience_id</tspan>  ·  consecutive, 1-based</text>
+    <text x="318" y="230"><tspan font-weight="700">ts</tspan>  ·  timestamp</text>
+    <text x="318" y="258"><tspan font-weight="700">frame</tspan>  ·  1 image / second (1 fps)</text>
+    <text x="318" y="286"><tspan font-weight="700">pos_x, pos_y</tspan>  ·  metres (dead-reckoned)</text>
+    <text x="318" y="314"><tspan font-weight="700">heading</tspan>  ·  degrees</text>
   </g>
   <text x="318" y="358" font-size="10" font-style="italic" fill="#7a8494">only what informs the LLM — nothing derived</text>
 
@@ -61,7 +61,22 @@
 
   <!-- mart -> gemma -->
   <line x1="552" y1="200" x2="618" y2="200" stroke="#5b6472" stroke-width="1.8" marker-end="url(#ar)"/>
-  <text x="585" y="192" font-size="10" fill="#3a3f49" text-anchor="middle">raw frames + audio clips</text>
+  <text x="585" y="192" font-size="10" fill="#3a3f49" text-anchor="middle">raw frames + pose</text>
+
+  <!-- ===== audio_on_demand = EARS ===== -->
+  <rect x="300" y="420" width="252" height="120" rx="10" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="1.6"/>
+  <text x="318" y="446" font-size="14" font-weight="700" fill="#4c1d95">audio_on_demand</text>
+  <text x="318" y="463" font-size="10.5" font-style="italic" fill="#7c5cbf">EARS — event-driven, asleep by default</text>
+  <g font-size="11" fill="#4c1d95">
+    <text x="318" y="486">"Hi Robot" wake word (tiny, CPU)</text>
+    <text x="318" y="504">records until ~1 s silence (VAD)</text>
+    <text x="318" y="522">utterance → Gemma, bypasses the mart</text>
+  </g>
+  <!-- mic -> ears -->
+  <polyline points="232,228 266,228 266,480 298,480" fill="none" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#arP)"/>
+  <!-- ears -> gemma -->
+  <polyline points="552,450 585,450 585,250 618,250" fill="none" stroke="#8b5cf6" stroke-width="1.6" marker-end="url(#arP)"/>
+  <text x="560" y="440" font-size="10" fill="#8b5cf6">utterance</text>
   <!-- gemma <-> md -->
   <line x1="759" y1="268" x2="759" y2="296" stroke="#2fa84f" stroke-width="1.6" marker-end="url(#arG)" marker-start="url(#arG)"/>
   <text x="769" y="286" font-size="10" fill="#2fa84f">read / write</text>
@@ -101,5 +116,6 @@
     <rect x="270" y="638" width="15" height="15" rx="3" fill="#eef0f3" stroke="#8a94a6"/><text x="292" y="650">mart — reality (raw)</text>
     <rect x="470" y="638" width="15" height="15" rx="3" fill="#e3f7e8" stroke="#2fa84f"/><text x="492" y="650">Asaf — Gemma + .md (interpretation)</text>
     <rect x="770" y="638" width="15" height="15" rx="3" fill="#fff3df" stroke="#e08a1e"/><text x="792" y="650">action schema — the interface</text>
+    <rect x="1000" y="638" width="15" height="15" rx="3" fill="#f3e8ff" stroke="#8b5cf6"/><text x="1022" y="650">ears (event-driven)</text>
   </g>
 </svg>

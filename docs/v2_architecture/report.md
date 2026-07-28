@@ -37,12 +37,12 @@ Three limits shaped V2:
 
 This is the heart of V2. We split the system in two:
 
-- **`mrt_experience` = reality.** Raw, time-aligned sensory truth, keyed by `frame_id`. Its only job is to tell the LLM what is true *right now*. It holds nothing derived, and nothing that already lives in `.md`.
+- **`mrt_experience` = reality.** Raw, time-aligned sensory truth — one row per second, keyed by `experience_id`. Its only job is to tell the LLM what is true *right now*. It holds nothing derived, and nothing that already lives in `.md`.
 - **`.md` files + Gemma = interpretation & knowledge.** The `.md` files hold what we know *over time* (history, species care, the map, learned corrections). Gemma interprets the raw frame *in the moment* (reads a plant's health, points at a pot).
 
 V1 blurred these — it computed interpretations (bounding boxes, audio classes) *inside* the pipeline and fed the LLM the conclusions. V2 keeps them apart: **the pipeline delivers reality; the model interprets it.**
 
-In practice this "lean on the LLM" move comes down to one concrete change: **we send raw pictures and audio clips to the reflective layer — not features.**
+In practice this "lean on the LLM" move comes down to one concrete change: **we send raw pictures to the reflective layer — not features** — and when someone speaks to the robot, the raw utterance audio goes straight to it too (§8).
 
 ---
 
@@ -50,7 +50,7 @@ In practice this "lean on the LLM" move comes down to one concrete change: **we 
 
 1. **Raw perception.** Gemma sees and hears, so YOLO + AST + Whisper + Haiku collapse into one local model and the Transformation feature-layer disappears.
 2. **Persistent memory.** Per-plant `.md` files the LLM reads *and writes* give continual learning — e.g. *"this plant yellows on the generic schedule → stretch its interval."* V1 had none.
-3. **Latency by routing.** Local model + event-triggered capture. Time-critical work never waits on the LLM; slow decisions (water / flag) tolerate its ~1–2 s because nobody is standing there waiting.
+3. **Latency by routing.** Local model + event-triggered capture. Time-critical work never waits on the LLM; slow decisions (water / flag) tolerate its ~3 s median (measured on the Mac; heavy tail) because nobody is standing there waiting.
 
 ---
 
@@ -65,7 +65,9 @@ In practice this "lean on the LLM" move comes down to one concrete change: **we 
 
 The flow (see diagram):
 
-> Darab delivers one dataframe per sensor → we assemble **`mrt_experience`** (reality) → **Gemma** reads it plus the **`.md`** memory, decides and interprets → emits an **action** → Darab's **actuators** execute it.
+> Darab delivers one dataframe per sensor → we assemble **`mrt_experience`** (visual reality) → **Gemma** reads it plus the **`.md`** memory, decides and interprets → emits an **action** → Darab's **actuators** execute it.
+>
+> In parallel, **`audio_on_demand`** — the ears — sleeps until someone says *"Hi Robot"*, records the utterance, and hands it straight to Gemma (§8).
 
 Gemma both reads and writes the `.md` files, which closes the learning loop.
 
@@ -75,24 +77,38 @@ The handoff boundary is unchanged: **Darab owns the sensors and actuators** (and
 
 ## 7. `mrt_experience` — the reality contract
 
-One row per tick, keyed by **`frame_id`** — a consecutive id shared across every component so all modalities join on the same moment (V1's convention, kept).
+One row per **experience** — an experience spans one second. Rows are **consecutive and non-overlapping**: row *N*+1 begins exactly where row *N* ends, no shared frames, no gaps. The table lives in RAM — the last **30 rows ≈ 30 s** (~40 MB) — it is the present, not a stored history.
 
 | field | what |
 |---|---|
-| `frame_id` | consecutive per-tick id — the shared join key across components |
-| `ts` | timestamp |
-| `frame` | raw camera image |
-| `audio` | raw audio clip |
-| `pose` | x, y, heading — current location on the map |
-| `touch_intensity` | IMU force spike above the normal-driving baseline (bump / collision / being handled) |
+| `experience_id` | 1-based consecutive id — one per experience |
+| `ts` | timestamp of the experience's representative instant |
+| `frame` | one raw camera image for that second (**1 fps**) |
+| `pos_x`, `pos_y` | body position in metres |
+| `heading` | body heading in degrees |
 
-The rule that keeps it clean: **it carries exactly the reality needed to execute the actions, and nothing else.** Anything derived (where's the pot), anything historical (when we last watered), and anything about a decision belongs to Gemma or `.md` — not here.
+Notes: pose is Darab's **dead-reckoning estimate** (integrated motor PWM + IMU yaw) — it drifts; an estimate, not ground truth. **Audio is not in the mart** — plants are silent, so continuously buffering sound bought nothing; speech reaches Gemma through `audio_on_demand` (§8). `touch_intensity` is deferred — a future transformation over the IMU stream, not a raw field.
 
-We arrived at this list by walking every action and asking what reality it needs. That is why `pose` and `touch_intensity` are in, and why target-offsets, obstacle flags, and bounding boxes are out — those are interpretation, not reality.
+The rule that keeps it clean: **it carries exactly the reality needed to execute the actions, and nothing else.** Anything derived (where's the pot), anything historical (when we last watered), and anything about a decision belongs to Gemma or `.md` — not here. That is why target-offsets, obstacle flags, and bounding boxes are out — those are interpretation, not reality.
 
 ---
 
-## 8. Action schema
+## 8. `audio_on_demand` — the ears
+
+The robot's hearing is **event-driven, not continuous**:
+
+> sleep → *"Hi Robot"* wakes it → record while you speak → ~1 s of silence closes the capture → the utterance goes **straight to Gemma** (bypassing the mart) → Gemma answers with an action.
+
+- The always-on part is a **tiny CPU wake-word model** — never Gemma (a ~3 s-per-call model can't be a continuous listener). Gemma wakes once per utterance.
+- End-of-speech is silence detection (VAD); Gemma's 30 s audio ceiling bounds the utterance anyway.
+- Gemma receives the **raw utterance audio** (no separate ASR stage — the reflection + ASR experiment already validated this) with output constrained to the action list. A request that maps to no action → `speak("I can't do that — I can only …")`.
+- Replies start as **text**; routing them through the robot's speaker (TTS) is a later step on the actuator side.
+
+**Unverified — needs testing:** wake-word detection quality, and whether a custom *"Hi Robot"* phrase needs a trained model (we can build the pipeline with a pretrained phrase and swap).
+
+---
+
+## 9. Action schema
 
 The command list is the contract between Or's layer and ours. The robot can do exactly these, and each consumes a defined slice of reality:
 
@@ -105,7 +121,7 @@ The command list is the contract between Or's layer and ours. The robot can do e
 | `capture_photo(subject)` | `frame` |
 | `water_plant(id, ml)` | `frame` + `pose` (+ Gemma points at the pot) |
 | `flag_issue(sev, …)` | `frame` |
-| `speak(text)` | `audio` |
+| `speak(text)` | — (the utterance it answers arrived via `audio_on_demand`) |
 | `daily_summary` | — (reads `.md` journal) |
 | `return_to_base` | `pose` — base's spot comes from `.md` |
 | `wait_until(next)` | — |
@@ -114,7 +130,7 @@ The command list is the contract between Or's layer and ours. The robot can do e
 
 ---
 
-## 9. Interpretation, not data — the watering example
+## 10. Interpretation, not data — the watering example
 
 The clearest case of the split is watering. To aim, the robot needs the pot's position *in the frame*. In V1 that would be a bounding-box model — which was problematic. In V2 we **ask Gemma**: it is multimodal and can point at the pot on demand.
 
@@ -124,15 +140,13 @@ So the coordinate is **produced by the model when watering** — not precomputed
 
 ---
 
-## 10. Open decisions for Darab
+## 11. Open decisions for Darab
 
-- **Sensor set.** Confirmed today: camera, IMU, mic. New requests if we want them:
-  - wheel **odometry** or another **localization** source — needed to produce `pose`;
+- **Sensor set.** Confirmed today: camera, IMU, mic. Pose now ships in the staging layer as a **dead-reckoning estimate** (`pos_x/pos_y/heading` from PWM + IMU yaw) — it drifts, so true wheel **odometry** or visual localization remains open. Still-new requests:
   - **battery** level — informs `return_to_base`;
   - **ambient** light / temperature / humidity — informs care.
 - **Watering hardware** — does the robot physically water, and with what tolerance? The whole premise rests on this.
-- **Pose source** — odometry vs. visual localization against the stored map.
-- **Audio window** — clip length *N* for `mrt_experience` (a few seconds; well under Gemma's 30 s ceiling).
+- **Speaker output** — replies start as text; wiring TTS through the robot's amp so `speak()` is actually spoken.
 
 ---
 
