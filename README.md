@@ -67,6 +67,40 @@ Arduino IDE 2.x has no Linux ARM64 build — flash from a Mac or Windows machine
 3. Open `src/firmware/logots_motor_control/logots_motor_control.ino`
 4. Select your board and USB port, then upload
 
+### 5. Set up the voice assistant (optional)
+
+The GUI can listen for a wake word, understand a spoken request with a local LLM, and speak
+the answer back — see [Voice assistant](#voice-assistant) below for how it works. It runs
+automatically once these one-time pieces are in place:
+
+**Piper TTS voice** (needed on any machine, ~60 MB, one-time download):
+```bash
+mkdir -p ~/models/piper
+curl -L -o ~/models/piper/en_US-lessac-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+curl -L -o ~/models/piper/en_US-lessac-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+```
+
+**Wake-word models** (needed on any machine, one-time — the pip package doesn't bundle them):
+```bash
+conda run -n logots python -c "from openwakeword.utils import download_models; download_models()"
+```
+
+**On the Jetson**, the LLM ("brain") runs locally via a [llama.cpp](https://github.com/ggml-org/llama.cpp)
+`llama-server` build with CUDA enabled, plus a Gemma 4 E2B GGUF (weights + mmproj file) under
+`~/models/`. Build llama.cpp per its own instructions (`-DGGML_CUDA=ON`) and point
+`LLAMACPP_BIN`/`LLAMACPP_MODEL`/`LLAMACPP_MMPROJ` (env vars, see `src/audio_on_demand.py`) at
+your build if it lives somewhere other than `~/llama.cpp/build/bin/llama-server` and
+`~/models/gemma-4-E2B-it-qat-q4_0-gguf/`.
+
+**On a Mac** (or anywhere without that Jetson-specific build), the GUI automatically falls back
+to a Hugging Face `transformers` pipeline instead — just add:
+```bash
+pip install torch transformers
+```
+to the same `logots` env. No further setup: the correct brain is auto-selected at runtime.
+
 ---
 
 ## Running the GUI
@@ -82,6 +116,7 @@ For headless / NoMachine sessions the GUI connects automatically. No display var
 ## GUI overview
 
 ```
+  LOGOTS ROBOT CONTROL          ⬤ MIC: asleep  ⬤ LLM: ready  FPS:8.2/10  ⬤ CONNECTED
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  joystick + pan/    │  3D Madgwick AHRS   │
@@ -89,10 +124,14 @@ For headless / NoMachine sessions the GUI connects automatically. No display var
 │  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
-│  waveform + RMS     │  live IMX219 feed   │
+│  waveform + RMS +   │  live IMX219 feed   │
+│  last voice action  │                     │
 └─────────────────────┴─────────────────────┘
   L:+000  R:+000  PAN:090°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS   LOOP ▶ SIM  ⚫ REC  ■ STOP
 ```
+
+The header's `⬤ MIC:`/`⬤ LLM:` indicators and the AUDIO INPUT panel's `ACTION` line show the
+[voice assistant](#voice-assistant)'s live status.
 
 A **position mini-map** at the bottom of the DRIVE & CAM panel shows a top-down trail of where the robot thinks its body is (dead-reckoned from motor commands + IMU heading), with an `X/Y/HDG` readout in the status bar and a `⌖ POS` button to reset the origin to "here". See the position note below.
 
@@ -115,6 +154,28 @@ conda env create -f environment.yml
 conda activate logots
 python src/logots_ui.py        # then press SIM and pick a recording CSV
 ```
+
+---
+
+## Voice assistant
+
+Say **"Hey Jarvis"** followed by a request — e.g. *"water the ficus"*, *"how are my plants
+doing?"* — and the robot listens, decides what to do with a local LLM, and speaks its answer
+back out loud. No extra process or terminal: it starts automatically with the GUI (see
+[setup](#5-set-up-the-voice-assistant-optional) above for the one-time model downloads).
+
+- **Status**: the header shows `⬤ MIC:` (asleep → listening → thinking → speaking) and
+  `⬤ LLM:` (loading → ready), and the AUDIO INPUT panel's `ACTION` line shows the last thing it
+  decided, e.g. `water_plant(id=ficus, ml=250)`.
+- **The LLM ("brain") is auto-selected**: the Jetson runs a fast, GPU-offloaded local
+  `llama-server` (~1-2s per response); a Mac with no such build falls back to a Hugging Face
+  `transformers` pipeline (~2-4s per response) using the same real mic and speakers. Nothing to
+  configure — whichever is available on the machine just gets used.
+- **On NoMachine**: if you hear the response on your *laptop's* speakers instead of the robot's,
+  that's NoMachine's remote-desktop audio redirection, not a bug — run `unset PULSE_SERVER`
+  before launching the GUI from a NoMachine terminal.
+
+---
 
 ## Frame API
 
@@ -179,3 +240,4 @@ NoMachine at `192.168.68.114:4000` — provides a full remote desktop on the Jet
 
 - Camera has a pink/IR hue — the IMX219-160 fisheye has no IR cut filter. Fix: M12 IR cut filter (hardware).
 - Drive motors have no encoders (open-loop), so the `pos_x`/`pos_y` estimate is directional but not metrically accurate until `ROBOT_MAX_SPEED_MPS` is calibrated. A feedback drivetrain is planned for the next body iteration.
+- A NoMachine remote-desktop session runs its own audio server and can silently redirect the voice assistant's spoken replies to your laptop's speakers instead of the robot's — run `unset PULSE_SERVER` before launching the GUI from a NoMachine terminal if that happens.
