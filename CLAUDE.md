@@ -239,28 +239,46 @@ correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`)
   `~/llama.cpp/build/bin/llama-server` plus the downloaded GGUF/mmproj/Piper files under
   `~/models/` — is **not** part of the repo or `environment.yml`; see "Can Asaph run this on
   his Mac?" below for what that means off-robot.
+- **Brain auto-selection (2026-08-16)**: `VoiceAssistant` picks `LlamaCppBrain` if
+  `~/llama.cpp/build/bin/llama-server` exists on disk, else falls back to `GemmaBrain`
+  (transformers, MPS/CUDA/CPU) — so the same GUI code works on the Jetson (fast path) and a
+  MacBook (Mac-native path) with zero config. Override with `VOICE_BRAIN=llamacpp|gemma` env
+  var if needed. `GemmaBrain.ensure_ready()` forces its lazy model load at startup (mirrors
+  `LlamaCppBrain._ensure_server()`) so a missing `torch`/`transformers` install surfaces
+  immediately as `⬤ LLM: error`, not silently on the first utterance.
+- **`SPEAKER_DEVICE` is now platform-aware**: defaults to `"demixer"` only on Linux; elsewhere
+  (macOS) it's `None`, meaning "use the system's default output device" — `sounddevice`'s
+  normal behavior, so Piper's audio plays out the Mac's actual speakers instead of erroring on
+  a nonexistent ALSA device name.
 
-### Can Asaph run this on his Mac (Sim mode)?
-**Yes for everything except the new voice feature itself, and that's fine.** `VoiceAssistant`
-degrades gracefully: `Ears()`/`LlamaCppBrain._ensure_server()` failures (missing binary, missing
-model files) are caught, set the `⬤ LLM:`/`⬤ MIC:` indicators to `error`, and the thread exits
-cleanly — the rest of the GUI (Sim mode, sensors, frame API, everything he actually needs) is
-completely unaffected, since `VoiceAssistant` only ever touches its own thread and the shared
-`:8787` API like any other client.
+### Can Asaph run this on his Mac?
+**Sim mode: yes, unaffected, always has been.** `VoiceAssistant` degrades gracefully on any
+startup failure (missing binary, missing deps) — caught, sets `⬤ LLM:`/`⬤ MIC:` to `error`,
+thread exits cleanly, nothing else in the GUI (Sim mode, sensors, frame API) is affected.
+
+**The real voice feature (live mic → LLM → spoken reply), with his own Mac hardware: also yes,
+as of the 2026-08-16 brain-auto-selection fix — with one manual step.** `GemmaBrain` needs
+`torch` + `transformers`, deliberately **not** added to the shared `environment.yml` (adding
+them would force a heavy, Jetson-risky install — generic PyPI `torch` doesn't have Jetson/CUDA
+support, unlike NVIDIA's special Jetson wheels, and the Jetson doesn't need `GemmaBrain` at all
+since `LlamaCppBrain` already covers it there). So on his Mac, after the normal
+`conda env create -f environment.yml`, he additionally needs:
+```bash
+pip install torch transformers
+```
+in the `logots` env — after that, launching `python src/logots_ui.py` in Real mode (not Sim)
+will auto-select `GemmaBrain`, capture from his MacBook's real mic (`AudioReader` uses
+`sounddevice`'s system default, no Jetson-specific code there), decide actions with Gemma 4 on
+MPS, and speak `speak` actions out his Mac's real speakers (`SPEAKER_DEVICE` fallback above).
+Without that `pip install` step, he'll just see `⬤ LLM: error` with a clear message naming the
+missing dependency — harmless, same graceful-degradation path as before.
 - `openwakeword`/`piper-tts`/`sounddevice`/`soundfile` all install fine on macOS (piper-tts
   ships `macosx_11_0_arm64` wheels; openwakeword's `tflite-runtime` dep is Linux-only per its
   own package metadata, so macOS falls back to the onnx backend anyway — same one we now force
   everywhere, so no behavior difference to fix later).
-- `LlamaCppBrain` hardcodes `~/llama.cpp/build/bin/llama-server` — a Jetson ARM64+CUDA build
-  with no macOS equivalent in this repo. On his Mac this fails fast (`FileNotFoundError` from
-  `subprocess.Popen`) and is caught the same way as above.
-- **He doesn't need any of this anyway** — he already has his own working, Mac-native
-  equivalent: `GemmaBrain` (transformers pipeline, MPS backend) in `audio_on_demand.py`,
-  documented in `docs/v2_architecture/action_api.md` (~2-4s/utterance warm). Setting up a
-  Jetson-only llama.cpp+Piper stack on his laptop would be pure overhead for no gain.
-- Net: `conda env create -f environment.yml` + Sim mode works for him unchanged; he'll just see
-  `⬤ MIC: error` / `⬤ LLM: error` in the header, harmlessly, unless he separately wants to test
-  `--brain llamacpp` specifically (he doesn't need to).
+- This is the same `GemmaBrain` already documented in `docs/v2_architecture/action_api.md`
+  (~2-4s/utterance warm) — nothing new about the model itself, just that `VoiceAssistant` can
+  now reach it automatically instead of him needing a separate script/env.
 
 **Startup steps for Asaph, first run after this update:**
 ```bash
@@ -269,12 +287,12 @@ git pull origin main
 conda env update -n logots -f environment.yml --prune   # picks up openwakeword/piper-tts/soundfile
 conda run -n logots python src/logots_ui.py
 ```
-- The header will show `⬤ MIC: error` and `⬤ LLM: error` a few seconds after launch — **expected,
-  not a bug**, since his Mac doesn't have the Jetson's `llama-server` binary. Ignore both.
-- Click **▶ SIM** and pick any session CSV to enter Sim mode as before — unaffected by any of
-  today's changes.
-- No new setup needed on his end (no model downloads, no env vars) — the voice feature is
-  Jetson-only and inert everywhere else.
+- **Sim mode**: click **▶ SIM**, pick any session CSV — unaffected by any of today's changes,
+  works with the steps above alone.
+- **Real voice feature (his own Mac mic/speakers), optional**: additionally run
+  `pip install torch transformers` in the `logots` env first, per "Can Asaph run this on his
+  Mac?" above, then launch in Real mode (not Sim). Without that extra install, the header just
+  shows `⬤ LLM: error` — harmless, not a bug, and everything else in the GUI still works fine.
 
 ## Git setup
 - Remote: `https://github.com/OrBerebi/Logots_V2.git`

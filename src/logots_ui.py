@@ -52,9 +52,9 @@ except ImportError:
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from audio_on_demand import (Ears, LlamaCppBrain, ActionServer as VoiceActionServer,
+    from audio_on_demand import (Ears, LlamaCppBrain, GemmaBrain, ActionServer as VoiceActionServer,
                                   speak as tts_speak, api_chunks as voice_api_chunks,
-                                  ACTION_PORT as VOICE_ACTION_PORT)
+                                  ACTION_PORT as VOICE_ACTION_PORT, LLAMACPP_BIN as VOICE_LLAMACPP_BIN)
     import soundfile as sf
     VOICE_OK = True
 except ImportError:
@@ -320,15 +320,32 @@ class VoiceAssistant(threading.Thread):
     def run(self):
         if not VOICE_OK:
             return
+        # Auto-pick the brain: LlamaCppBrain needs the Jetson's compiled llama-server
+        # binary (fast, GPU-offloaded); elsewhere (e.g. a MacBook) fall back to
+        # GemmaBrain (transformers + MPS/CUDA/CPU) — that's the proven Mac-native path
+        # (see docs/v2_architecture/action_api.md). Override with VOICE_BRAIN=llamacpp|gemma.
+        brain_choice = os.environ.get('VOICE_BRAIN', 'auto')
+        use_llamacpp = brain_choice == 'llamacpp' or (
+            brain_choice == 'auto' and os.path.exists(VOICE_LLAMACPP_BIN))
         try:
-            self.ears  = Ears()
-            self.brain = LlamaCppBrain()
-            self.brain._ensure_server()
+            self.ears = Ears()
+            if use_llamacpp:
+                self.brain = LlamaCppBrain()
+                self.brain._ensure_server()
+            else:
+                self.brain = GemmaBrain()
+                self.brain.ensure_ready()
             action_server = VoiceActionServer(port=VOICE_ACTION_PORT)
+        except ImportError as e:
+            self.stage = 'error'; self.error = str(e)
+            print(f"[voice] startup failed: missing dependency ({e}) — GemmaBrain needs "
+                  f"'pip install torch transformers' in the logots env", flush=True)
+            return
         except Exception as e:
             self.stage = 'error'; self.error = str(e)
             print(f'[voice] startup failed: {e}', flush=True)
             return
+        print(f"[voice] using {'LlamaCppBrain' if use_llamacpp else 'GemmaBrain'}", flush=True)
 
         self.stage = 'asleep'
         for chunk in voice_api_chunks():

@@ -62,7 +62,9 @@ PIPER_VOICE = os.environ.get("PIPER_VOICE", os.path.expanduser("~/models/piper/e
 # "hw:1,0" device works too but has no rate conversion (Piper's 22050 Hz output plays back
 # sped-up/high-pitched on the hardware's fixed 48000 Hz rate) — "demixer"'s "plug" layer
 # handles that automatically, same as "default" used to before NoMachine intercepted it.
-SPEAKER_DEVICE = os.environ.get("SPEAKER_DEVICE", "demixer")
+# "demixer" is Linux/ALSA-only (this Jetson's setup); elsewhere (e.g. a MacBook, CoreAudio
+# not ALSA) None means "use the system default output device" — sounddevice's normal behavior.
+SPEAKER_DEVICE = os.environ.get("SPEAKER_DEVICE", "demixer" if sys.platform.startswith("linux") else None)
 
 # llama.cpp brain (Jetson path): a persistent llama-server subprocess, GPU-offloaded
 # (fixed by the r36.5 JetPack upgrade — see PLAN_llamacpp_gpu_offload.md), loads the
@@ -183,6 +185,12 @@ class GemmaBrain:
             self._pipe = pipeline(task="any-to-any", model=self.model_id,
                                   dtype=torch.bfloat16, device=device)
         return self._pipe
+
+    def ensure_ready(self):
+        """Force the lazy model load now, matching LlamaCppBrain._ensure_server()'s
+        eager-readiness pattern — so a missing torch/transformers install (or a
+        failed download) surfaces immediately at startup, not on the first utterance."""
+        self._pipeline()
 
     def decide(self, wav_path: str) -> dict:
         messages = [
