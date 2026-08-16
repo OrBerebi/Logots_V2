@@ -12,6 +12,7 @@ import time
 import threading
 import subprocess
 import os
+import tempfile
 import csv
 import queue
 import json
@@ -48,6 +49,16 @@ try:
     AUDIO_OK = True
 except ImportError:
     AUDIO_OK = False
+
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from audio_on_demand import (Ears, LlamaCppBrain, ActionServer as VoiceActionServer,
+                                  speak as tts_speak, api_chunks as voice_api_chunks,
+                                  ACTION_PORT as VOICE_ACTION_PORT)
+    import soundfile as sf
+    VOICE_OK = True
+except ImportError:
+    VOICE_OK = False
 
 from PIL import Image, ImageTk
 
@@ -289,6 +300,58 @@ class AudioReader:
         if self._stream:
             try: self._stream.stop(); self._stream.close()
             except: pass
+
+# ── Voice assistant (wake word → LLM → spoken action) ──────────────────────────
+class VoiceAssistant(threading.Thread):
+    """Runs the audio_on_demand.py pipeline in-process: wake word → LlamaCppBrain
+    (a persistent, GPU-offloaded llama-server, unchanged from audio_on_demand.py)
+    → action, speaking `speak` actions out loud via Piper. Pulls audio from this
+    GUI's own frame API (:8787) — the same contract any external client uses, so
+    audio_on_demand.py's Ears/LlamaCppBrain/speak/api_chunks are reused as-is."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stage = 'unavailable' if not VOICE_OK else 'loading'
+        self.error = None
+        self.ears  = None
+        self.brain = None
+        self.last_action = None
+
+    def run(self):
+        if not VOICE_OK:
+            return
+        try:
+            self.ears  = Ears()
+            self.brain = LlamaCppBrain()
+            self.brain._ensure_server()
+            action_server = VoiceActionServer(port=VOICE_ACTION_PORT)
+        except Exception as e:
+            self.stage = 'error'; self.error = str(e)
+            print(f'[voice] startup failed: {e}', flush=True)
+            return
+
+        self.stage = 'asleep'
+        for chunk in voice_api_chunks():
+            utterance = self.ears.feed(chunk)
+            self.stage = 'listening' if self.ears.capturing else 'asleep'
+            if utterance is None:
+                continue
+            self.stage = 'thinking'
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                    sf.write(tmp.name, utterance, AUDIO_RATE)
+                    decision = self.brain.decide(tmp.name)
+                os.unlink(tmp.name)
+                payload = action_server.publish(decision)
+                args_str = ', '.join(f'{k}={v}' for k, v in payload['args'].items())
+                self.last_action = f"{payload['action']}({args_str})"
+                print(f"[voice] action #{payload['action_id']}  {self.last_action}", flush=True)
+                if payload['action'] == 'speak':
+                    self.stage = 'speaking'
+                    tts_speak(payload['args']['text'])
+            except Exception as e:
+                print(f'[voice] utterance handling failed: {e}', flush=True)
+            self.stage = 'asleep'
 
 # ── Camera reader ─────────────────────────────────────────────────────────────
 class CameraReader(threading.Thread):
@@ -671,6 +734,7 @@ class RobotControlGUI:
 
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
+        self.voice_assistant=None
 
         self._build_ui()
         self._bind_keys()
@@ -680,6 +744,9 @@ class RobotControlGUI:
         except Exception as e:
             print(f'[logots] frame API server not started: {e}')
             self._frame_server = None
+        # Started after FrameServer: it polls this GUI's own :8787, same as any
+        # external client, so the server needs to be up first.
+        self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
         self._loop()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
@@ -697,6 +764,10 @@ class RobotControlGUI:
         self.lbl_cs.pack(side='right')
         self.lbl_fps=_lbl(f,'FPS: --',fg=C_SUB,font=('Courier',9,'bold'))
         self.lbl_fps.pack(side='right',padx=(0,16))
+        self.lbl_llm=_lbl(f,'⬤  LLM: --',fg=C_SUB,font=('Courier',9,'bold'))
+        self.lbl_llm.pack(side='right',padx=(0,16))
+        self.lbl_voice=_lbl(f,'⬤  --',fg=C_SUB,font=('Courier',9,'bold'))
+        self.lbl_voice.pack(side='right',padx=(0,16))
 
 
     def _main_panels(self):
@@ -840,10 +911,14 @@ class RobotControlGUI:
         self.wav_cv=tk.Canvas(p,width=356,height=90,bg='#16162a',highlightthickness=0)
         self.wav_cv.pack(padx=8,pady=(0,4))
         self._wave_idle()
-        br=tk.Frame(p,bg=C_PANEL); br.pack(fill='x',padx=8,pady=(0,8))
+        br=tk.Frame(p,bg=C_PANEL); br.pack(fill='x',padx=8,pady=(0,4))
         _plbl(br,'RMS',font=('Courier',8)).pack(side='left')
         self.rms_cv=tk.Canvas(br,width=286,height=8,bg='#16162a',highlightthickness=0)
         self.rms_cv.pack(side='left',padx=6)
+        ar=tk.Frame(p,bg=C_PANEL); ar.pack(fill='x',padx=8,pady=(0,8))
+        _plbl(ar,'ACTION',font=('Courier',8)).pack(side='left')
+        self.lbl_voice_action=_plbl(ar,'(no action yet)',font=('Courier',8),fg=C_SUB)
+        self.lbl_voice_action.pack(side='left',padx=6)
 
     def _wave_idle(self):
         cv=self.wav_cv; w,h=356,90
@@ -1134,6 +1209,7 @@ class RobotControlGUI:
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
         self._update_fps_label()
+        self._update_voice_widgets()
 
         # Drift compensation: wait only the remainder of the period, so the actual
         # rate tracks TARGET_FPS instead of (work + fixed delay). If a tick overruns
@@ -1293,6 +1369,30 @@ class RobotControlGUI:
         ok  = fps >= 0.9 * TARGET_FPS           # green when within 10% of target
         self.lbl_fps.config(text=f'FPS:{fps:4.1f}/{TARGET_FPS}',
                             fg=(C_GREEN if ok else C_AMBER))
+
+    def _update_voice_widgets(self):
+        stage = self.voice_assistant.stage if self.voice_assistant else 'unavailable'
+        llm_text, llm_fg = {
+            'unavailable': ('LLM: n/a',     C_SUB),
+            'loading':     ('LLM: loading', C_AMBER),
+            'error':       ('LLM: error',   C_RED),
+        }.get(stage, ('LLM: ready', C_GREEN))
+        self.lbl_llm.config(text=f'⬤  {llm_text}', fg=llm_fg)
+
+        voice_text, voice_fg = {
+            'unavailable': ('MIC: n/a',        C_SUB),
+            'loading':     ('MIC: loading',    C_AMBER),
+            'error':       ('MIC: error',      C_RED),
+            'asleep':      ('MIC: asleep',     C_SUB),
+            'listening':   ('MIC: listening',  C_GREEN),
+            'thinking':    ('MIC: thinking',   C_AMBER),
+            'speaking':    ('MIC: speaking',   C_BLUE_HI),
+        }.get(stage, (f'MIC: {stage}', C_SUB))
+        self.lbl_voice.config(text=f'⬤  {voice_text}', fg=voice_fg)
+
+        last_action = self.voice_assistant.last_action if self.voice_assistant else None
+        if last_action:
+            self.lbl_voice_action.config(text=last_action[:48], fg=C_GREEN)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

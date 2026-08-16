@@ -11,5 +11,8 @@ dependencies:
   - pip:
       - pillow
       - sounddevice
+      - soundfile
       - smbus2
       - pyaudio
+      - openwakeword
+      - piper-tts

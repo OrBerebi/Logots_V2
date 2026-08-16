@@ -18,7 +18,7 @@ conda run -n logots python src/logots_ui.py
 - On the Mac there is no hardware: sensors show error/unavailable, Arduino stays DISCONNECTED — use **Sim mode** with a recording CSV
 
 ## Platform
-- **Hardware**: Jetson Orin Nano, JetPack 6 (L4T R36.4.7), ARM64
+- **Hardware**: Jetson Orin Nano, JetPack 6.2.2 (L4T R36.5), ARM64 (upgraded 2026-08-02 from R36.4.7 — see Known issues)
 - **Remote access**: NoMachine at 192.168.68.114:4000. Virtual display is `:1001.0`
 - **Storage**: NVMe nvme0n1p1 (500GB Kingston). SD card removed.
 - **Shutdown timeout**: systemd set to 5s (`/etc/systemd/system.conf`)
@@ -48,6 +48,7 @@ Logots_V2/
 | `src/logots_ui.py` | Main GUI — all sensors + motor control + recording + sim mode + frame API server |
 | `src/logots_api.py` | Client module for the frame API — `get_latest_frame()` |
 | `src/api_demo.py` | Toy example using the API: video + synced audio playback |
+| `src/audio_on_demand.py` | Wake word → local LLM → action → TTS; also runs in-process inside `logots_ui.py` (see "Voice assistant") |
 | `src/firmware/logots_motor_control/logots_motor_control.ino` | Arduino firmware |
 | `src/pinout.txt` | Full 40-pin header wiring reference |
 | `environment.yml` | Conda environment spec |
@@ -96,6 +97,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 
 ## GUI layout
 ```
+  LOGOTS ROBOT CONTROL          ⬤ MIC: asleep  ⬤ LLM: ready  FPS:8.2/10  ⬤ DISCONNECTED
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  joystick + pan/    │  3D Madgwick AHRS   │
@@ -103,12 +105,19 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 │  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
-│  waveform + RMS     │  live IMX219 feed   │
+│  waveform + RMS +   │  live IMX219 feed   │
+│  ACTION (last voice │                     │
+│  command decided)   │                     │
 └─────────────────────┴─────────────────────┘
   L +000  R +000  PAN:090°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP
 ```
 - Position mini-map (bottom of DRIVE & CAM): top-down trail of the dead-reckoned body
   position with a heading arrow; `⌖ POS` in the status bar zeros the estimate (origin = here).
+- Header `⬤ MIC:`/`⬤ LLM:` indicators and the AUDIO INPUT panel's `ACTION` row are the voice
+  assistant's status — see "Voice assistant" below. All status glyphs use the same plain `⬤`
+  dingbat as the connection indicator (not emoji — the deployed GUI's font has no color-emoji
+  support, confirmed 2026-08-16; don't reach for 🎤/🧠-style pictographic emoji anywhere in this
+  file, use `⬤`/`▶`/`⚫`/`■`/`⌖`/`⌨` instead).
 - Keyboard: W/S = forward/back, A/D = turn, SPACE = stop
 - Arduino auto-connects on startup, retries every 3s if lost
 
@@ -170,6 +179,103 @@ from logots_api import get_latest_frame   # src/logots_api.py
 frame = get_latest_frame()                # adds frame['image']: 640×640×3 uint8 RGB numpy
 ```
 
+## Voice assistant ("Hey Jarvis" → local LLM → spoken action)
+
+`src/audio_on_demand.py` (wake word → `Ears` → `LlamaCppBrain` → action → `speak`) now runs
+**in-process inside `logots_ui.py`** via a `VoiceAssistant(threading.Thread)`, started
+automatically on GUI launch — one command line (`python src/logots_ui.py`), no separate
+terminal, no separate conda env. It reuses `audio_on_demand.py`'s classes unmodified (`Ears`,
+`LlamaCppBrain`, `ActionServer`, `speak`, `api_chunks`) and pulls audio the same way any
+external client would — polling this GUI's own frame API on `:8787` — so the module stays a
+correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`) if ever needed.
+
+- **Status in the GUI**: header `⬤ LLM:` (loading/ready/error) and `⬤ MIC:`
+  (asleep/listening/thinking/speaking), plus an `ACTION` row in the AUDIO INPUT panel showing
+  the last decided action (e.g. `water_plant(id=ficus, ml=250)`). All driven by
+  `VoiceAssistant.stage`/`.last_action`, polled each GUI tick in `_update_voice_widgets()`.
+- **Latency (2026-08-16 fix, ~20-30s → ~1-2s/utterance)**: `LlamaCppBrain` used to spawn a
+  fresh `llama-mtmd-cli` process per utterance (full model reload every time) and was still
+  forced CPU-only. It now runs a **persistent `llama-server`** (spawned once, GPU-offloaded,
+  health-checked via `/health`) and `decide()` is just an HTTP call. A second fix was needed on
+  top of that: this GGUF's chain-of-thought reasoning trace added ~300 tokens (~10s) per call
+  for no accuracy benefit on this schema-constrained task — `--reasoning off` on the server
+  cut that to the final ~1-2s. This also closes out the old CPU-only/GPU-OOM workaround
+  documented below.
+- **TTS**: local **Piper** (`pip install piper-tts`; voice model `en_US-lessac-medium` at
+  `~/models/piper/`, ~60 MB, one-time download from `rhasspy/piper-voices` on Hugging Face).
+  Chosen over espeak-ng (its CLI isn't installed, needs `sudo apt install`) — Piper is pure
+  pip + `onnxruntime`, no sudo, prebuilt aarch64 wheels.
+- **Speaker output device — do not use `sd.play(data, fs)` with no device on this Jetson
+  under NoMachine.** A NoMachine remote-desktop session runs its own private PulseAudio server
+  (`PULSE_SERVER` env var points at a `~/.nx/devices/.../audio/native.socket`) that silently
+  hijacks ALSA's `default` device, redirecting playback to the **client** machine's speakers
+  (e.g. a connected MacBook) instead of the robot's. Fix: `speak()` targets the named ALSA PCM
+  `"demixer"` explicitly (`SPEAKER_DEVICE` in `audio_on_demand.py`) — defined in
+  `/etc/asound.conf` as `plug` (auto rate-convert) + `dmix` (software mixing) over the real
+  `hw:APE,0` hardware, bypassing Pulse entirely. The raw `hw:1,0` device works too but has *no*
+  rate conversion (Piper's 22050 Hz output plays back sped-up/high-pitched on the hardware's
+  fixed 48000 Hz rate) — always go through `"demixer"`, never the bare `hw:` device, for
+  playback. If testing playback manually outside the GUI, `unset PULSE_SERVER` first or you'll
+  hear it on the wrong machine and wonder why.
+- **Actual hardware fault found this session**: after ruling out software/OS causes (code,
+  gain, ALSA routing, kernel driver errors — even a *pure* `speaker-test` sine tone was
+  distorted), it turned out to be a **loose physical wire** on the amp side. If speaker output
+  is ever loud/garbled/unintelligible again and doesn't respond to digital volume changes,
+  check the physical DIN/DOUT wiring (pin 38 → mic SD, pin 40 → amp DIN — these are the only
+  wires that differ between mic and amp; 12/35 are correctly shared) before assuming it's a
+  driver/config regression.
+- **openwakeword needs the ONNX backend, not its default TFLite one**: `tflite-runtime` is
+  compiled against NumPy 1.x and crashes (`_ARRAY_API not found`) under NumPy 2.x — breaks in
+  the `logots` env (NumPy 2.x) but not `logots-audio` (NumPy 1.x, used during earlier
+  standalone testing). Fixed by forcing `Ears`'s `Model(..., inference_framework="onnx")` in
+  `audio_on_demand.py` — works under both NumPy versions, and is also required for macOS (see
+  below), so this is the permanent setting, not a Jetson-only patch. Also: openwakeword's model
+  weights (`.onnx`/`.tflite` files) live inside each conda env's own `site-packages/openwakeword/`
+  and don't carry over between envs — run `python -c "from openwakeword.utils import
+  download_models; download_models()"` once per new env that needs it (the pip package alone
+  doesn't include them).
+- **`environment.yml`** now includes `soundfile`, `openwakeword`, `piper-tts` (added
+  2026-08-16) alongside the existing `sounddevice`. The Jetson-specific piece —
+  `~/llama.cpp/build/bin/llama-server` plus the downloaded GGUF/mmproj/Piper files under
+  `~/models/` — is **not** part of the repo or `environment.yml`; see "Can Asaph run this on
+  his Mac?" below for what that means off-robot.
+
+### Can Asaph run this on his Mac (Sim mode)?
+**Yes for everything except the new voice feature itself, and that's fine.** `VoiceAssistant`
+degrades gracefully: `Ears()`/`LlamaCppBrain._ensure_server()` failures (missing binary, missing
+model files) are caught, set the `⬤ LLM:`/`⬤ MIC:` indicators to `error`, and the thread exits
+cleanly — the rest of the GUI (Sim mode, sensors, frame API, everything he actually needs) is
+completely unaffected, since `VoiceAssistant` only ever touches its own thread and the shared
+`:8787` API like any other client.
+- `openwakeword`/`piper-tts`/`sounddevice`/`soundfile` all install fine on macOS (piper-tts
+  ships `macosx_11_0_arm64` wheels; openwakeword's `tflite-runtime` dep is Linux-only per its
+  own package metadata, so macOS falls back to the onnx backend anyway — same one we now force
+  everywhere, so no behavior difference to fix later).
+- `LlamaCppBrain` hardcodes `~/llama.cpp/build/bin/llama-server` — a Jetson ARM64+CUDA build
+  with no macOS equivalent in this repo. On his Mac this fails fast (`FileNotFoundError` from
+  `subprocess.Popen`) and is caught the same way as above.
+- **He doesn't need any of this anyway** — he already has his own working, Mac-native
+  equivalent: `GemmaBrain` (transformers pipeline, MPS backend) in `audio_on_demand.py`,
+  documented in `docs/v2_architecture/action_api.md` (~2-4s/utterance warm). Setting up a
+  Jetson-only llama.cpp+Piper stack on his laptop would be pure overhead for no gain.
+- Net: `conda env create -f environment.yml` + Sim mode works for him unchanged; he'll just see
+  `⬤ MIC: error` / `⬤ LLM: error` in the header, harmlessly, unless he separately wants to test
+  `--brain llamacpp` specifically (he doesn't need to).
+
+**Startup steps for Asaph, first run after this update:**
+```bash
+cd /Users/orberebi/Documents/GitHub/Logots_V2
+git pull origin main
+conda env update -n logots -f environment.yml --prune   # picks up openwakeword/piper-tts/soundfile
+conda run -n logots python src/logots_ui.py
+```
+- The header will show `⬤ MIC: error` and `⬤ LLM: error` a few seconds after launch — **expected,
+  not a bug**, since his Mac doesn't have the Jetson's `llama-server` binary. Ignore both.
+- Click **▶ SIM** and pick any session CSV to enter Sim mode as before — unaffected by any of
+  today's changes.
+- No new setup needed on his end (no model downloads, no env vars) — the voice feature is
+  Jetson-only and inert everywhere else.
+
 ## Git setup
 - Remote: `https://github.com/OrBerebi/Logots_V2.git`
 - Credentials stored in `~/.git-credentials` via `git credential.helper store`
@@ -183,12 +289,41 @@ frame = get_latest_frame()                # adds frame['image']: 640×640×3 uin
 
 ## Critical rules
 1. **Never manually edit `/boot/extlinux/extlinux.conf`** — always use `jetson-io.py`. Manual edits brick the boot.
+   **After any `nvidia-l4t-*` package upgrade, re-check it**: an `apt dist-upgrade` across L4T versions can
+   silently reset `DEFAULT` back to `primary` (losing the custom `JetsonIO` boot entry → camera stops working,
+   `/dev/video0` disappears) even though the actual overlay files in `/boot` are untouched. Fix by rerunning
+   `jetson-io.py` → "Configure for compatible hardware" and reselecting the camera module — this rewrites
+   `extlinux.conf`'s `DEFAULT` correctly without hand-editing it. Confirmed happening on the 2026-08-02
+   r36.4.7→r36.5 upgrade (see Known issues).
 2. **Camera always needs `EGL_PLATFORM=surfaceless`** — DISPLAY=:0 and DISPLAY=:1001.0 both fail for nvarguscamerasrc.
 3. **Don't use system cv2 from conda** — it's compiled for NumPy 1.x and will crash with conda's NumPy 2.x.
 4. **Arduino I2C is always bus 1** — confirmed with `i2cdetect -y -r 1`, shows 0x08.
 5. **Always work in the git repo** — `/home/logots/Desktop/Logots_V2/`. The old `logots/` directory is archived.
+6. **Never play audio via ALSA `default`/no-device under a NoMachine session** — NoMachine runs
+   its own PulseAudio server per session and silently redirects `default` playback to the
+   *client* machine's speakers, not the robot's. Always target the named ALSA PCM `"demixer"`
+   explicitly (see "Voice assistant" below) and `unset PULSE_SERVER` before any manual ALSA
+   testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **Voice assistant done (2026-08-16), diff not yet committed**: wake word → local LLM →
+  spoken action, fully wired into `logots_ui.py` as a background thread — see "Voice assistant"
+  section above for the full write-up (latency fix, TTS, speaker-routing gotcha, the physical
+  wiring fault found, openwakeword's ONNX-backend requirement, Mac/Sim-mode compatibility).
+  `git status` currently shows `src/audio_on_demand.py`, `src/logots_ui.py`, `environment.yml`
+  modified and `PLAN_llamacpp_gpu_offload.md` untracked — review and commit when ready.
+  `PLAN_llamacpp_gpu_offload.md` (repo root) has the detailed before/after latency numbers.
+- **Post-upgrade regressions found and fixed (2026-08-02):** the r36.4.7→r36.5 upgrade reset the boot
+  loader's `DEFAULT` to `primary` (see Critical rules #1) — broke the camera, fixed via `jetson-io.py`.
+  Separately, the mic/speaker went silent (`sd.InputStream` reads exact `0.0` even with real input) —
+  **this one is unrelated to the OS upgrade**: comparing `jetson-io.py`'s live pin config against the
+  reference screenshot at `/home/logots/Desktop/logots/header_pinouts.png` (May 28) showed pins 12/35/38/40
+  (`i2s2_sclk/fs/din/dout`) as `unused`, while the currently-active custom overlay
+  (`/boot/jetson-io-hdr40-user-custom.dtbo`) is dated Jun 4 — one day *after* the last known-good mic
+  recording (`logots/logots_unified_test.wav`, Jun 3). Best guess: a manual pin edit on Jun 4 (likely when
+  adding the Arduino `i2c2` pins) wasn't incremental and dropped the `i2s2` group. Fixed by re-adding
+  `i2s2` via `jetson-io.py` → "Configure header pins manually"; user confirmed all sensors working after.
+  If audio drops out again, check that live config against `header_pinouts.png` first.
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
 - Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. The drive motors are simple **non-feedback** motors (no encoders / no velocity readback) — a feedback-capable drivetrain is planned for the next body iteration.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
