@@ -324,6 +324,18 @@ conda run -n logots python src/logots_ui.py
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **Pan/tilt servo random twitch fixed (2026-09-03, commit `c36d94e`)**: servos made small,
+  seemingly random jumps every ~0.5s even with unchanged target angles. Root cause was in
+  `src/firmware/logots_motor_control/logots_motor_control.ino` — the I2C `onReceive` ISR
+  (`receiveEvent()`) ran `sscanf` and several `Serial.print()` calls directly inside the
+  interrupt. AVR interrupts don't nest by default, so this held Timer1's compare-match
+  interrupt — which the `Servo` library depends on to end each pulse at the correct
+  microsecond — blocked long enough to occasionally stretch a pulse, showing up as a twitch.
+  Fixed by making the ISR only buffer bytes and set a flag; `parseMessage()` (the
+  sscanf/Serial.print work) now runs from `loop()` instead, outside interrupt context. If
+  servo/motor jitter reappears, check first whether new code was added *inside* an ISR —
+  anything slow in an AVR ISR reintroduces this exact class of bug. Requires reflashing from
+  the MacBook (Arduino IDE) to take effect; user confirmed fixed after flashing.
 - **Voice assistant done (2026-08-16), diff not yet committed**: wake word → local LLM →
   spoken action, fully wired into `logots_ui.py` as a background thread — see "Voice assistant"
   section above for the full write-up (latency fix, TTS, speaker-routing gotcha, the physical
