@@ -42,7 +42,9 @@ const int SERVO_SPEED_DELAY = 1;  // ms per 1-degree step
 // ── I2C receive buffer ────────────────────────────────────────────────────
 #define I2C_BUFFER_SIZE 32
 char i2cBuffer[I2C_BUFFER_SIZE + 1];
+char pendingBuffer[I2C_BUFFER_SIZE + 1];
 byte bufferIndex = 0;
+volatile bool messageReady = false;
 
 // ─────────────────────────────────────────────────────────────────────────
 void setup() {
@@ -62,6 +64,10 @@ void setup() {
 }
 
 void loop() {
+  if (messageReady) {
+    parseMessage(pendingBuffer);
+    messageReady = false;
+  }
   controlMotor(motorLeft,  target_left_pwm);
   controlMotor(motorRight, target_right_pwm);
   smoothServoMove();
@@ -82,13 +88,21 @@ void smoothServoMove() {
   tiltServo.write(current_tilt_angle);
 }
 
-// ── I2C ISR: buffer bytes, parse on newline ───────────────────────────────
+// ── I2C ISR: buffer bytes only, hand off on newline ───────────────────────
+// Keep this ISR as short as possible. sscanf()/Serial.print() used to run
+// here directly; that held global interrupts off for long enough to delay
+// Timer1's compare-match interrupt (which Servo uses to end each pulse),
+// occasionally stretching a pan/tilt pulse and showing up as a random
+// twitch even with an unchanged target angle. Parsing now happens in loop().
 void receiveEvent(int bytesReceived) {
   while (Wire.available()) {
     char c = Wire.read();
     if (c == '\n') {
       i2cBuffer[bufferIndex] = '\0';
-      parseMessage(i2cBuffer);
+      if (!messageReady) {
+        strcpy(pendingBuffer, i2cBuffer);
+        messageReady = true;
+      }
       bufferIndex = 0;
     } else {
       if (bufferIndex < I2C_BUFFER_SIZE) {
