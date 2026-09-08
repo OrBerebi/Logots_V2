@@ -7,3 +7,8 @@ __pycache__/
 experiments/staging_to_action/raw/
 experiments/staging_to_action_v2/*.csv
 experiments/audio_on_demand/service.log
+knowledge/**
+!knowledge/
+!knowledge/guidelines.md
+experiments/initiation_e/*.csv
+!knowledge/species_catalog.md
