@@ -82,8 +82,7 @@ during one survey pass; frame captions give the body pose and camera angle at ca
 Identify each DISTINCT plant you can see (the same plant may appear in several frames —
 list it once). For each, give:
 - id: short snake_case name (e.g. "ficus_1")
-- species: choose from the SPECIES CATALOG below — pick the entry whose visual
-  description best matches what you see (use "other" only if nothing fits at all)
+- species: {species_rule}
 - confidence: how sure you are of the species — "low", "medium" or "high"
 - seen_in_frame: the frame number where it is clearest
 - description: one sentence — appearance, pot, surroundings
@@ -290,6 +289,8 @@ def main():
     ap = argparse.ArgumentParser(description="initiation — survey the room, write knowledge/")
     ap.add_argument("--knowledge-dir", default=os.environ.get("KNOWLEDGE_DIR", DEFAULT_KNOWLEDGE))
     ap.add_argument("--survey-s", type=float, default=SURVEY_MAX_S)
+    ap.add_argument("--no-catalog", action="store_true",
+                    help="identify plants without the species catalog (free best-guess mode)")
     args = ap.parse_args()
 
     kdir = args.knowledge_dir
@@ -335,9 +336,17 @@ def main():
         f"frame {n}: body at ({r['pos_x']:.2f}, {r['pos_y']:.2f}) heading {r['heading']:.0f}°, "
         f"camera pan {r['pan_angle']}°" for n, r in enumerate(picked))
     t0 = time.time()
-    prompt = IDENTIFY_PROMPT + "\n\nFrame captions:\n" + captions
     catalog = os.path.join(kdir, "species_catalog.md")
-    if os.path.exists(catalog):
+    use_catalog = os.path.exists(catalog) and not args.no_catalog
+    print(f"[identify] species catalog: {'on' if use_catalog else 'off'}", flush=True)
+    species_rule = (
+        'choose from the SPECIES CATALOG below — pick the entry whose visual\n'
+        '  description best matches what you see (use "other" only if nothing fits at all)'
+        if use_catalog else
+        "your best guess of the common species name from what you see — commit to a\n"
+        '  guess, never answer "unknown"')
+    prompt = IDENTIFY_PROMPT.format(species_rule=species_rule) + "\n\nFrame captions:\n" + captions
+    if use_catalog:
         prompt += "\n\nSPECIES CATALOG:\n" + open(catalog).read()
     images = [Image.fromarray(r["image"]) for r in picked]
     try:
