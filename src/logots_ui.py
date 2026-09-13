@@ -535,6 +535,11 @@ class SimPlayer:
         self.n_skipped = 0
         self._pending    = None   # parsed (frame, decoded, bgr) not yet due
         self._pending_ts = None   # its recorded timestamp (datetime or None)
+        try:                       # one-time line count for the SIM %-progress readout
+            with open(csv_path, 'r', newline='') as f:
+                self.total_rows = max(sum(1 for _ in f) - 1, 0)   # minus header
+        except OSError:
+            self.total_rows = 0
         self._open()
 
     def _open(self):
@@ -544,6 +549,7 @@ class SimPlayer:
         if not set(RecordingManager.CORE_FIELDNAMES) <= set(fields):
             self._file.close()
             raise ValueError('not a Logots recording CSV')
+        self.row_index    = 0     # restart the %-progress readout each pass
         self._wall_start = None   # monotonic time when this pass started
         self._rec_start  = None   # first row's recorded timestamp of this pass
 
@@ -700,9 +706,10 @@ def _lbl(p,txt,fg=C_SUB,font=('Courier',9),bg=C_BG,**kw):
 def _plbl(p,txt,fg=C_SUB,font=('Courier',9),**kw):
     return tk.Label(p,text=txt,bg=C_PANEL,fg=fg,font=font,**kw)
 
-def _vallbl(p,txt,fg=C_BLUE,width=0):
+def _vallbl(p,txt,fg=C_BLUE,width=0,**kw):
+    kw.setdefault('padx',8); kw.setdefault('pady',4)
     return tk.Label(p,text=txt,bg=C_PANEL,fg=fg,font=('Courier',11,'bold'),
-                    padx=8,pady=4,width=width)
+                    width=width,**kw)
 
 def _btn(p,txt,color,cmd,**kw):
     return tk.Button(p,text=txt,bg=color,fg=C_TEXT,relief='flat',
@@ -994,12 +1001,14 @@ class RobotControlGUI:
         self._imu_wgt=self._imu_fig_cv.get_tk_widget()
         self._imu_wgt.configure(bg=C_PANEL,highlightthickness=0)
 
-        # YPR labels (packed after calibration)
+        # YPR labels (packed after calibration) — no manual colon-alignment
+        # padding (they're separate side-by-side chips, not stacked, so it
+        # only wasted width) and tighter internal padx so all three fit.
         self._ypr_frame=tk.Frame(p,bg=C_PANEL)
-        self.lbl_r=_vallbl(self._ypr_frame,'Roll:  +0.0°',fg=C_RED)
-        self.lbl_pi=_vallbl(self._ypr_frame,'Pitch: +0.0°',fg=C_GREEN)
-        self.lbl_y=_vallbl(self._ypr_frame,'Yaw:   +0.0°',fg=C_BLUE)
-        for w in (self.lbl_r,self.lbl_pi,self.lbl_y): w.pack(side='left',padx=2)
+        self.lbl_r=_vallbl(self._ypr_frame,'Roll: +0.0°',fg=C_RED,padx=5)
+        self.lbl_pi=_vallbl(self._ypr_frame,'Pitch: +0.0°',fg=C_GREEN,padx=5)
+        self.lbl_y=_vallbl(self._ypr_frame,'Yaw: +0.0°',fg=C_BLUE,padx=5)
+        for w in (self.lbl_r,self.lbl_pi,self.lbl_y): w.pack(side='left',padx=1)
 
     def _imu_go_live(self):
         self._cal_frame.pack_forget()
@@ -1296,8 +1305,13 @@ class RobotControlGUI:
         self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # inverse of _pwm mixing
         self.joy_x=max(-1.0,min(1.0,(l-r)/510.0))
         self._draw_joy()
-        txt=f'SIM row {self.sim_player.row_index}'
-        if self.sim_player.n_skipped: txt+=f' ({self.sim_player.n_skipped} skipped)'
+        sp=self.sim_player
+        if sp.total_rows:
+            pct=min(100,int(sp.row_index/sp.total_rows*100))
+            txt=f'SIM {pct}%'
+        else:
+            txt=f'SIM row {sp.row_index}'
+        if sp.n_skipped: txt+=f' ({sp.n_skipped} skipped)'
         self.lbl_tx.config(text=txt)
 
     # ── Monitoring widgets (driven by latest_frame snapshot in both modes) ────
@@ -1343,9 +1357,9 @@ class RobotControlGUI:
         if not samples: return                 # nothing new this tick → hold pose
         y,p,r=samples[-1]
         self._imu_redraw(r,p,y)
-        self.lbl_r.config( text=f'Roll:  {r:+6.1f}°')
-        self.lbl_pi.config(text=f'Pitch: {p:+6.1f}°')
-        self.lbl_y.config( text=f'Yaw:   {y:+6.1f}°')
+        self.lbl_r.config( text=f'Roll: {r:+.1f}°')
+        self.lbl_pi.config(text=f'Pitch: {p:+.1f}°')
+        self.lbl_y.config( text=f'Yaw: {y:+.1f}°')
 
     def _update_audio_widgets(self):
         if self.sim_mode:

@@ -1,38 +1,110 @@
-Initiation feature — first live-robot test (2026-09-13)
+Logots — today's findings (2026-09-13)
+========================================
 
-Ran src/initiation.py end-to-end on the actual Jetson for the first time
-(previously only tested against SIM recordings). Two runs, both against a
-real snake plant in frame:
+1. Initiation feature — first real-robot tests
+------------------------------------------------
+Pulled and reviewed src/initiation.py end to end for the first time on the
+Jetson (all previous testing had been SIM-only, off-robot, since Asaph
+doesn't have access to the robot).
 
-1. Catalog mode (default): decide -> survey (91 real frames, ~91s) ->
-   identify -> knowledge write, all succeeded. Identified "sansevieria_1" /
-   "snake plant (sansevieria trifasciata)", confidence high, in 10.2s.
-   roster.md, plants/, species/, room_map.md, journal.md, current_state.md
-   all written correctly, integrity check CONSISTENT.
+Fixed real hardware along the way: the Arduino I2C bus (gen1, /dev/i2c-1)
+was floating/noisy — i2cdetect showed shifting phantom addresses, never
+0x08. Traced to a wiring issue and fixed physically; confirmed stable
+afterward.
 
-2. --no-catalog mode: also succeeded — and notably it did commit to
-   "Sansevieria trifasciata" at high confidence this time, unlike the
-   Sep 8 test note (which saw "unknown/low confidence" without the
-   catalog). Might be that live 640x640 color frames give the model more
-   to work with than the older test recording did.
+Model/framework verified correct: LlamaCppVisionBrain -> Gemma-4-E2B q4_0
+GGUF via llama.cpp, GPU-offloaded — matches audio_on_demand.py's constants,
+untouched by Asaph's initiation.py commits (Sep 7-8), so his changes never
+affected which model runs.
 
-Confirmed working on real hardware: model/framework is correct
-(LlamaCppVisionBrain -> Gemma-4-E2B q4_0 GGUF via llama.cpp, GPU-offloaded,
-matches audio_on_demand.py's constants — untouched since Aug 16, so the
-initiation.py changes never affected it). Frame API, pose/heading data,
-and the real Arduino/I2C path were all live during the test (had to fix a
-loose wiring connection on the Arduino side first — unrelated to the
-initiation code).
+2. --no-catalog reliability testing: 4 successes, 1 failure, cause found
+----------------------------------------------------------------------------
+Ran --no-catalog (species identification without the reference catalog)
+five times total, all against the same snake plant, across different scan
+conditions:
 
-Gaps found, not blockers:
-- No actuator side exists yet to execute the "rotate + pan" survey motion
-  request published on :8788 — had to run the survey statically (or
-  hand-drive). Worth deciding who owns writing that consumer.
-- :8788 collides with the GUI's own voice-assistant ActionServer when both
-  run at once — handled gracefully (falls back to printing the decision),
-  but worth a real fix (e.g. a shared publish target) before this runs
-  unattended alongside the voice assistant.
-- Minor cosmetic bug: write_knowledge()'s species-filename sanitizer only
-  preserves lowercase a-z0-9, so a capital first letter (e.g.
-  "Sansevieria") gets replaced with "_" — species/_ansevieria_trifasciata.md.
-  Harmless today, easy fix later.
+  1. Catalog ON (baseline), static             -> success, high conf, 10.2s
+  2. Catalog OFF, static                        -> success, high conf, 9.4s
+  3. Catalog OFF, static (repeat) + one
+     hand-driven live run                       -> success x2
+  4. Catalog OFF, ~112s recorded DYNAMIC scan
+     (continuous rotation), SIM replay          -> FAILED, 0 plants, 5.2s
+  5. Catalog OFF, ~67s recorded LOW-MOVEMENT
+     scan (camera pan/tilt only, body still),
+     SIM replay                                 -> success, high conf, 11.1s
+
+Root cause of the one failure (#4), found by code inspection, not
+guessing: initiation.py only ever sends SURVEY_FRAMES=8 evenly-time-sampled
+frames out of the whole survey to the vision model (np.linspace over
+however many 1fps frames collect_pass() gathered), with zero
+content-awareness — no check that a sampled frame contains the plant, no
+motion-blur filtering. During continuous rotation, all 8 samples can easily
+land on frames where the plant is at the frame edge or out of view. This is
+NOT a SIM-only artifact — the same code path and 8-frame limit applies to
+live real-robot operation too, so it's a real weakness in how the robot
+would do an actual room survey, not just a testing quirk.
+
+3. The Asaph Mac-vs-Jetson discrepancy — reasoning corrected mid-day
+--------------------------------------------------------------------------
+Background: Asaph reported his own Mac "macbook fix" (an attempt to run the
+identical E2B model via llama.cpp on his Mac) failing the --no-catalog
+task, while a bigger model (E4B, via the existing GemmaBrain/transformers
+path, no fix needed) succeeded on his Mac.
+
+First pass at explaining this leaned on "model size" (E2B borderline, E4B
+more capable) — but that's the wrong comparison: it doesn't explain why the
+SAME E2B model succeeds reliably on the Jetson but failed on his Mac.
+Corrected framing: the real open question is same-model-different-platform,
+and the live candidates are (a) CUDA vs Metal backend non-determinism on a
+borderline decision, (b) an actual difference/bug in how his "macbook fix"
+reproduces the setup (build flags, GPU offload not engaging, mmproj
+mismatch, etc.), or (c) a different, harder test plant than ours.
+
+Point (c) is now ruled out for a controlled retest: after finding and
+understanding the 8-frame issue (section 2), we have a clean recording
+(#5 above) that succeeds confidently and unambiguously here — a good
+candidate to send Asaph for an apples-to-apples test. If his Mac fails on
+this exact recording, that's now a meaningful signal pointing at his
+implementation rather than the model or scan conditions. Plan: send him
+recordings/session_20260913_104159/session_20260913_104159.csv with a
+message asking him to run --no-catalog against it in SIM mode and report
+back.
+
+4. GUI changes made today
+-----------------------------
+- Moved the bottom status bar (motor/servo readouts, POS/SIM/REC/STOP
+  controls, LOOP checkbox, keyboard hint) into a left-hand sidebar column.
+  The four main panels (DRIVE&CAM, IMU, AUDIO, VIDEO) keep their original
+  2x2 grid arrangement and height, unchanged.
+- SIM mode's progress readout changed from an uninformative running row
+  counter (which never reset across loops) to a 0-100% readout of position
+  within the current pass, resetting to 0% on each loop wrap.
+- Fixed a rendering bug: the IMU panel's Yaw label was being cut off by the
+  Pitch label. Cause: unnecessary manual space-padding in the label text
+  (meant to align colons across labels that are placed side-by-side, not
+  stacked, so the alignment served no purpose) plus a fixed 6-character
+  numeric field, pushing the combined row width past the panel's boundary.
+  Fixed by dropping the manual padding, tightening internal label padding,
+  and simplifying the numeric format.
+- Committed and pushed to origin/main (425b1dc): the sidebar layout change,
+  this report, and two unrelated file deletions (Cat Sitter Data
+  Architecture V2.txt, PLAN_llamacpp_gpu_offload.md) confirmed intentional.
+- The IMU-label fix and the SIM %-readout change were made after that
+  commit and are not yet pushed.
+
+5. One incident during testing
+----------------------------------
+The GUI process crashed once, unprompted, mid-session — no Python
+traceback, so likely killed by the OS (segfault or OOM; memory was tight at
+the time, ~99MB free). Last thing in its log was a false wake-word trigger
+that made the voice assistant try to speak a long response through Piper
+TTS. Recovered by restarting; did not reproduce again today. Worth keeping
+an eye on if it recurs.
+
+6. Recommendation for Asaph
+-------------------------------
+Prioritize the SURVEY_FRAMES=8 sampling gap (section 2) — it's a real
+live-operation weakness independent of any platform issue, and it's what
+actually explains today's one failure. The Mac-vs-Jetson question (section
+3) is still open and worth a controlled test with the clean recording, but
+shouldn't be assumed to be a bug in his fix until that's actually tested.
