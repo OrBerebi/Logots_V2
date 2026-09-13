@@ -770,8 +770,6 @@ class RobotControlGUI:
     def _build_ui(self):
         self._hdr(); _hline(self.root)
         self._main_panels()
-        _hline(self.root)
-        self._status_bar()
 
     def _hdr(self):
         f=tk.Frame(self.root,bg=C_BG)
@@ -790,18 +788,22 @@ class RobotControlGUI:
     def _main_panels(self):
         f=tk.Frame(self.root,bg=C_BG)
         f.pack(padx=16,pady=4)
-        # Fixed-size 2×2 grid so all panels align perfectly
-        LW=375; RW=415; TH=310; BH=220; GAP=6
+        # Original 2×2 grid of big blocks, unchanged in size/height — the former
+        # full-width bottom status bar is now a sidebar to its left instead.
+        SW=190; LW=375; RW=415; TH=310; BH=220; GAP=6
+        p_side  = tk.Frame(f,bg=C_BG,   width=SW,height=TH+GAP+BH)
         p_ctrl  = tk.Frame(f,bg=C_PANEL,width=LW,height=TH)
         p_imu   = tk.Frame(f,bg=C_PANEL,width=RW,height=TH)
         p_audio = tk.Frame(f,bg=C_PANEL,width=LW,height=BH)
         p_video = tk.Frame(f,bg=C_PANEL,width=RW,height=BH)
-        for p in (p_ctrl,p_imu,p_audio,p_video):
+        for p in (p_side,p_ctrl,p_imu,p_audio,p_video):
             p.pack_propagate(False)
-        p_ctrl.grid( row=0,column=0,padx=(0,GAP),pady=(0,GAP),sticky='nsew')
-        p_imu.grid(  row=0,column=1,pady=(0,GAP),sticky='nsew')
-        p_audio.grid(row=1,column=0,padx=(0,GAP),sticky='nsew')
-        p_video.grid(row=1,column=1,sticky='nsew')
+        p_side.grid( row=0,column=0,rowspan=2,padx=(0,GAP),sticky='nsew')
+        p_ctrl.grid( row=0,column=1,padx=(0,GAP),pady=(0,GAP),sticky='nsew')
+        p_imu.grid(  row=0,column=2,pady=(0,GAP),sticky='nsew')
+        p_audio.grid(row=1,column=1,padx=(0,GAP),sticky='nsew')
+        p_video.grid(row=1,column=2,sticky='nsew')
+        self._side_panel(p_side)
         self._ctrl_panel(p_ctrl)
         self._audio_panel(p_audio)
         self._imu_panel(p_imu)
@@ -1046,33 +1048,34 @@ class RobotControlGUI:
         self.vid_cv.delete('all')
         self.vid_cv.create_image(0,0,anchor='nw',image=self._photo)
 
-    # ── Status bar ────────────────────────────────────────────────────────────
-    def _status_bar(self):
-        f=tk.Frame(self.root,bg=C_BG); f.pack(fill='x',padx=16,pady=(4,14))
-        self.lbl_lm =_vallbl(f,'L:  +000',fg=C_BLUE,width=8)
-        self.lbl_rm =_vallbl(f,'R:  +000',fg=C_BLUE,width=8)
-        self.lbl_pan=_vallbl(f,'PAN:090°',fg=C_GREEN,width=8)
-        self.lbl_tlt=_vallbl(f,'TLT:090°',fg=C_AMBER,width=8)
-        self.lbl_pos=_vallbl(f,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
-        self.lbl_hdg=_vallbl(f,'HDG:000°',fg=C_GREEN,width=9)
-        self.lbl_lm.pack(side='left',padx=(0,5))
-        self.lbl_rm.pack(side='left',padx=(0,5))
-        self.lbl_pan.pack(side='left',padx=(0,5))
-        self.lbl_tlt.pack(side='left',padx=(0,5))
-        self.lbl_pos.pack(side='left',padx=(0,5))
-        self.lbl_hdg.pack(side='left',padx=(0,5))
-        _btn(f,'⌖  POS',C_SUB,self._reset_pos,width=7).pack(side='left',padx=(0,5))
-        _btn(f,'■  STOP',C_RED,self._estop).pack(side='right')
-        self.btn_rec=_btn(f,'⚫  REC',C_SUB,self._toggle_rec); self.btn_rec.pack(side='right',padx=(0,6))
-        self.btn_sim=_btn(f,'▶  SIM',C_SUB,self._toggle_sim,width=7)
-        self.btn_sim.pack(side='right',padx=(0,6))
+    # ── Side panel (was the bottom status bar; now a left column) ──────────────
+    def _side_panel(self,parent):
+        p=parent
+        def pk(w,pady=3):
+            w.pack(fill='x',padx=10,pady=pady); return w
+        self.lbl_lm =_vallbl(p,'L:  +000',fg=C_BLUE,width=12)
+        self.lbl_rm =_vallbl(p,'R:  +000',fg=C_BLUE,width=12)
+        self.lbl_pan=_vallbl(p,'PAN:090°',fg=C_GREEN,width=12)
+        self.lbl_tlt=_vallbl(p,'TLT:090°',fg=C_AMBER,width=12)
+        self.lbl_pos=_vallbl(p,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
+        self.lbl_hdg=_vallbl(p,'HDG:000°',fg=C_GREEN,width=12)
+        pk(self.lbl_lm,(12,3)); pk(self.lbl_rm); pk(self.lbl_pan); pk(self.lbl_tlt)
+        pk(self.lbl_pos); pk(self.lbl_hdg)
+        pk(_btn(p,'⌖  POS',C_SUB,self._reset_pos),(8,4))
+        _hline(p)
+        self.btn_sim=_btn(p,'▶  SIM',C_SUB,self._toggle_sim); pk(self.btn_sim,(8,4))
         self.sim_loop_var=tk.BooleanVar(value=True)
-        tk.Checkbutton(f,text='LOOP',variable=self.sim_loop_var,bg=C_BG,fg=C_SUB,
-                       font=('Courier',8),selectcolor=C_PANEL,activebackground=C_BG,
-                       activeforeground=C_TEXT,highlightthickness=0).pack(side='right',padx=(0,6))
-        self.lbl_tx=_lbl(f,'',fg=C_SUB,font=('Courier',8),width=26,anchor='e')
-        self.lbl_tx.pack(side='right',padx=10)
-        _lbl(f,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8)).pack(side='left',padx=10)
+        pk(tk.Checkbutton(p,text='LOOP',variable=self.sim_loop_var,bg=C_BG,fg=C_SUB,
+                          font=('Courier',8),selectcolor=C_PANEL,activebackground=C_BG,
+                          activeforeground=C_TEXT,highlightthickness=0),(0,4))
+        self.btn_rec=_btn(p,'⚫  REC',C_SUB,self._toggle_rec); pk(self.btn_rec)
+        _hline(p)
+        pk(_btn(p,'■  STOP',C_RED,self._estop),(8,8))
+        pk(_lbl(p,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8),
+                justify='center',wraplength=150),(4,4))
+        self.lbl_tx=_lbl(p,'',fg=C_SUB,font=('Courier',8),
+                         wraplength=150,justify='left',anchor='w')
+        pk(self.lbl_tx,(8,4))
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
     def _bind_keys(self):

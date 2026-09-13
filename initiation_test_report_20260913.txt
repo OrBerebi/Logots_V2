@@ -1,0 +1,38 @@
+Initiation feature — first live-robot test (2026-09-13)
+
+Ran src/initiation.py end-to-end on the actual Jetson for the first time
+(previously only tested against SIM recordings). Two runs, both against a
+real snake plant in frame:
+
+1. Catalog mode (default): decide -> survey (91 real frames, ~91s) ->
+   identify -> knowledge write, all succeeded. Identified "sansevieria_1" /
+   "snake plant (sansevieria trifasciata)", confidence high, in 10.2s.
+   roster.md, plants/, species/, room_map.md, journal.md, current_state.md
+   all written correctly, integrity check CONSISTENT.
+
+2. --no-catalog mode: also succeeded — and notably it did commit to
+   "Sansevieria trifasciata" at high confidence this time, unlike the
+   Sep 8 test note (which saw "unknown/low confidence" without the
+   catalog). Might be that live 640x640 color frames give the model more
+   to work with than the older test recording did.
+
+Confirmed working on real hardware: model/framework is correct
+(LlamaCppVisionBrain -> Gemma-4-E2B q4_0 GGUF via llama.cpp, GPU-offloaded,
+matches audio_on_demand.py's constants — untouched since Aug 16, so the
+initiation.py changes never affected it). Frame API, pose/heading data,
+and the real Arduino/I2C path were all live during the test (had to fix a
+loose wiring connection on the Arduino side first — unrelated to the
+initiation code).
+
+Gaps found, not blockers:
+- No actuator side exists yet to execute the "rotate + pan" survey motion
+  request published on :8788 — had to run the survey statically (or
+  hand-drive). Worth deciding who owns writing that consumer.
+- :8788 collides with the GUI's own voice-assistant ActionServer when both
+  run at once — handled gracefully (falls back to printing the decision),
+  but worth a real fix (e.g. a shared publish target) before this runs
+  unattended alongside the voice assistant.
+- Minor cosmetic bug: write_knowledge()'s species-filename sanitizer only
+  preserves lowercase a-z0-9, so a capital first letter (e.g.
+  "Sansevieria") gets replaced with "_" — species/_ansevieria_trifasciata.md.
+  Harmless today, easy fix later.
