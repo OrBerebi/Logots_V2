@@ -229,7 +229,7 @@ def write_knowledge(kdir: str, plants: list[dict], sightings: list[dict]) -> lis
 
     for sp in sorted({p["species"] for p in plants}):
         care = next(p["care"] for p in plants if p["species"] == sp)
-        w(f"species/{re.sub(r'[^a-z0-9]+', '_', sp)}.md",
+        w(f"species/{re.sub(r'[^a-z0-9]+', '_', sp.lower())}.md",
           f"# {sp}\n\n- care: {care}\n- source: model knowledge (offline); verify online later\n")
 
     sight = "\n".join(f"| {s['id']} | ({s['pos_x']:.2f}, {s['pos_y']:.2f}) | "
