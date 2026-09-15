@@ -21,6 +21,7 @@ Run (the GUI must be serving :8787):
 
     python src/functions.py                 # trigger check → run what's needed
     python src/functions.py --done-wait 15  # shorter completion timeout (replay tests)
+    python src/functions.py --speak         # speak each step's "thought" out loud
 """
 from __future__ import annotations
 
@@ -38,6 +39,14 @@ import knowledge
 import mrt_experience
 from actions import ACTIONS, ACTION_ARG_SCHEMAS, ACTIONS_MD, open_endpoint
 from mrt_reflective import pick_brain, ask_json
+
+try:
+    # Reuses the exact same Piper/"demixer" TTS path as the voice assistant
+    # (see CLAUDE.md "Voice assistant") — self-contained, not dependent on
+    # logots_ui.py running. Lazily loads the Piper voice on first call.
+    from audio_on_demand import speak as _speak
+except Exception as _e:                     # pragma: no cover - missing audio deps
+    _speak, _speak_import_error = None, _e
 
 RUNS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runs")
 
@@ -137,7 +146,8 @@ def wait_for_done(endpoint, action_id: int, timeout: float = DONE_WAIT_S) -> dic
 def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
                  kdir: str, max_steps: int = MAX_STEPS,
                  finish_args_schema: dict | None = None,
-                 done_wait: float = DONE_WAIT_S):
+                 done_wait: float = DONE_WAIT_S,
+                 speak_thoughts: bool = False):
     """The loop. Returns (finish_decision | None, history, last_view).
     The full prompt chain is written to runs/<name>_<ts>.log for review."""
     os.makedirs(RUNS_DIR, exist_ok=True)
@@ -170,6 +180,9 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
         print(f"[functions] step {step}: {action}({json.dumps(args)})"
               f"\n[functions]   thought: {thought[:100]}", flush=True)
         entry = f'{step} · thought: "{thought}" → {action}'
+
+        if speak_thoughts and thought:
+            _speak(thought)     # blocks until playback finishes — heard before the action runs
 
         if action == "finish":
             return decision, history, view
@@ -212,7 +225,7 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
 
 # ── The functions themselves ──────────────────────────────────────────────────
 def initiation(brain, endpoint, kdir: str, max_steps: int = MAX_STEPS,
-               done_wait: float = DONE_WAIT_S):
+               done_wait: float = DONE_WAIT_S, speak_thoughts: bool = False):
     """Cold start: look around, learn the plants, write all memory docs."""
     goal_block = """MAIN GOAL — you are running the function "initiation": this robot has no
 memory yet. Meet the plant in front of you for the first time: classify it and
@@ -244,7 +257,8 @@ you what each tool does."""
     decision, history, view = run_function("initiation", goal_block, finish_rule,
                                            brain, endpoint, kdir, max_steps,
                                            finish_args_schema=finish_args,
-                                           done_wait=done_wait)
+                                           done_wait=done_wait,
+                                           speak_thoughts=speak_thoughts)
     if decision is None:
         print("[functions] initiation did not finish — nothing written", flush=True)
         return
@@ -279,7 +293,15 @@ def main():
     ap.add_argument("--max-steps", type=int, default=MAX_STEPS)
     ap.add_argument("--done-wait", type=float, default=DONE_WAIT_S,
                     help="seconds to wait for the actuator side's completion signal")
+    ap.add_argument("--speak", action="store_true",
+                    help="speak each step's 'thought' aloud on the robot's speaker "
+                         "(same Piper/\"demixer\" TTS path as the voice assistant)")
     args = ap.parse_args()
+
+    if args.speak and _speak is None:
+        print(f"[functions] --speak requested but audio_on_demand couldn't be imported "
+              f"({_speak_import_error}) — continuing without speech", flush=True)
+        args.speak = False
 
     kdir = args.knowledge_dir
     knowledge.seed(kdir)
@@ -290,7 +312,8 @@ def main():
         print("[functions] roster empty → running initiation", flush=True)
         brain = pick_brain()
         endpoint = open_endpoint()
-        initiation(brain, endpoint, kdir, max_steps=args.max_steps, done_wait=args.done_wait)
+        initiation(brain, endpoint, kdir, max_steps=args.max_steps,
+                  done_wait=args.done_wait, speak_thoughts=args.speak)
     else:
         print("[functions] roster has plants — nothing scheduled "
               "(watering not implemented yet)", flush=True)

@@ -361,6 +361,31 @@ conda run -n logots python src/logots_ui.py
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **`action_id` collision across separate `functions.py` runs skipped actuation silently —
+  FIXED 2026-09-15** (found testing Asaf's `39038cf` "goal-oriented prompt chaining" patch with
+  Or, same session): `ActionsEndpoint._next_id` in `src/actions.py` started at `1` fresh every
+  time `functions.py` was launched as a new process, but `ActionReader` (in `logots_ui.py`)
+  lives inside the long-running GUI process and keeps its `_seen_id` dedup state across every
+  `functions.py` invocation. Reproduced live: first `functions.py` run's `approach_plant` got
+  `action_id=1` and drove fine; a second `functions.py` run (same GUI still up) also started its
+  own counter at `1` for its first actuator action — `ActionReader` saw `action_id=1` again,
+  treated it as already-handled, and silently skipped driving. `wait_for_done()` then correctly
+  waited the full `DONE_WAIT_S=120s`, got nothing, and (per the same patch's new honest-completion
+  behavior) told the LLM the truth ("no completion signal; position unchanged") instead of
+  hanging or faking it — so the *symptom* looked like the script being stuck for 2 minutes, but
+  the loop itself was working correctly; the actuation call underneath it was just silently
+  dropped. Not something Asaf's patch introduced — it was a gap in the actuation wiring from the
+  earlier `51f17fb` commit. **Fix**: `ActionsEndpoint._next_id` (src/actions.py) is now seeded
+  from `int(time.time() * 1000)` instead of `1`, so ids stay unique across process restarts while
+  still monotonically increasing within one run. Verified live immediately after the fix: two
+  back-to-back `functions.py` runs against the same still-running GUI (no restart in between)
+  both drove `approach_plant` cleanly, no timeout.
+- **`functions.py --speak` added 2026-09-15**: each step's `"thought"` is now spoken aloud
+  through the robot's speaker via the same Piper/`"demixer"` TTS path as the voice assistant
+  (`audio_on_demand.speak()`, imported directly — self-contained, doesn't need `logots_ui.py`'s
+  `VoiceAssistant` running). Opt-in flag, off by default so normal/scheduled runs don't pay the
+  Piper load + playback latency per step. Verified live: audible and clear on the robot's
+  speaker during a full initiation run.
 - **Functions-layer actuation (2026-09-15) — live-tested against the real robot today, mixed
   results. Confirmed working, plus two open bugs — one for Or/hardware, one for Asaf/decoding:**
 

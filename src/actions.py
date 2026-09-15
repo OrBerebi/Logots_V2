@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -91,7 +92,13 @@ class ActionsEndpoint:
 
     def __init__(self, port: int = ACTION_PORT):
         self._latest = None
-        self._next_id = 1
+        # Seeded from wall-clock ms, not 1: a long-lived GUI process's
+        # ActionReader keeps its `_seen_id` dedup state across separate
+        # functions.py restarts, so IDs starting at 1 every run collide with
+        # a prior run's id and get silently skipped (found 2026-09-15, see
+        # CLAUDE.md Known issues). This makes ids unique across process
+        # restarts while staying monotonically increasing within one run.
+        self._next_id = int(time.time() * 1000)
         self._done: dict[int, dict] = {}
         self._lock = threading.Lock()
         outer = self
