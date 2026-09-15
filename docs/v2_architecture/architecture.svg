@@ -1,14 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 700" font-family="Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1470 700" font-family="Helvetica, Arial, sans-serif">
   <defs>
     <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#5b6472"/></marker>
     <marker id="arG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2fa84f"/></marker>
     <marker id="arO" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#e08a1e"/></marker>
     <marker id="arB" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2f6fed"/></marker>
     <marker id="arP" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8b5cf6"/></marker>
+    <marker id="arT" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#0e7490"/></marker>
   </defs>
 
   <text x="40" y="42" font-size="23" font-weight="700" fill="#1b1f27">Logots V2 — Architecture</text>
-  <text x="40" y="68" font-size="13" fill="#5b6472">V1's two-tier skeleton, kept. The mart delivers raw visual reality; the ears wake on "Hi Robot"; Gemma + .md do the interpreting.</text>
+  <text x="40" y="68" font-size="13" fill="#5b6472">The mart delivers raw reality; functions run multi-step routines through Gemma, one action at a time; the ears wake on "Hi Robot".</text>
 
   <!-- ===== DARAB sensors ===== -->
   <rect x="40" y="120" width="192" height="180" rx="10" fill="#e0edff" stroke="#2f6fed" stroke-width="1.5"/>
@@ -38,30 +39,62 @@
 
   <line x1="232" y1="205" x2="298" y2="215" stroke="#5b6472" stroke-width="1.6" marker-end="url(#ar)"/>
 
+  <!-- ===== FUNCTIONS = ORCHESTRATION ===== -->
+  <rect x="610" y="120" width="210" height="256" rx="10" fill="#e0f5fa" stroke="#0e7490" stroke-width="1.6"/>
+  <text x="626" y="148" font-size="15" font-weight="700" fill="#155e75">functions</text>
+  <text x="626" y="167" font-size="10.5" font-style="italic" fill="#3a8ea5">ORCHESTRATION — multi-step routines</text>
+  <line x1="624" y1="177" x2="806" y2="177" stroke="#bde3ee"/>
+  <g fill="#155e75">
+    <text x="626" y="200" font-size="11.5" font-weight="700">initiation</text>
+    <text x="626" y="216" font-size="10.5">survey → identify → write docs</text>
+    <text x="626" y="240" font-size="11.5" font-weight="700">watering  <tspan font-weight="400" font-style="italic" font-size="10">(next)</tspan></text>
+    <text x="626" y="256" font-size="10.5">approach → inspect → water</text>
+  </g>
+  <line x1="624" y1="270" x2="806" y2="270" stroke="#bde3ee"/>
+  <g font-size="10.5" fill="#155e75">
+    <text x="626" y="292">loop:  prompt Gemma → Gemma</text>
+    <text x="626" y="309">triggers action → wait for done →</text>
+    <text x="626" y="326">append result → prompt again</text>
+  </g>
+  <text x="626" y="358" font-size="10" font-style="italic" fill="#3a8ea5">the growing prompt is the routine's memory</text>
+
+  <!-- mart -> functions -->
+  <line x1="552" y1="200" x2="608" y2="200" stroke="#5b6472" stroke-width="1.8" marker-end="url(#ar)"/>
+  <text x="580" y="190" font-size="9" fill="#3a3f49" text-anchor="middle">frames + pose</text>
+  <text x="580" y="213" font-size="9" fill="#3a3f49" text-anchor="middle">inspect = last row</text>
+
   <!-- ===== INTERPRETATION container ===== -->
-  <rect x="600" y="118" width="316" height="374" rx="12" fill="none" stroke="#2fa84f" stroke-width="1.3" stroke-dasharray="7 5"/>
-  <text x="616" y="138" font-size="11" font-weight="700" fill="#2fa84f">INTERPRETATION &amp; KNOWLEDGE  (LLM-leaning)</text>
+  <rect x="868" y="118" width="316" height="374" rx="12" fill="none" stroke="#2fa84f" stroke-width="1.3" stroke-dasharray="7 5"/>
+  <text x="884" y="138" font-size="11" font-weight="700" fill="#2fa84f">INTERPRETATION &amp; KNOWLEDGE  (LLM-leaning)</text>
 
   <!-- Gemma -->
-  <rect x="620" y="150" width="278" height="118" rx="10" fill="#e3f7e8" stroke="#2fa84f" stroke-width="1.5"/>
-  <text x="636" y="176" font-size="13" font-weight="700" fill="#14532d">mrt_reflective — Gemma (local)</text>
-  <text x="636" y="197" font-size="11" fill="#256b3a">sees + hears + interprets</text>
-  <text x="636" y="215" font-size="11" fill="#256b3a">on-demand · ~1–2 s</text>
-  <text x="636" y="233" font-size="11" fill="#256b3a">decides + interprets (points at the pot)</text>
+  <rect x="888" y="150" width="278" height="118" rx="10" fill="#e3f7e8" stroke="#2fa84f" stroke-width="1.5"/>
+  <text x="904" y="176" font-size="13" font-weight="700" fill="#14532d">mrt_reflective — Gemma (local)</text>
+  <text x="904" y="197" font-size="11" fill="#256b3a">sees + hears + interprets</text>
+  <text x="904" y="215" font-size="11" fill="#256b3a">on-demand · ~1–2 s</text>
+  <text x="904" y="233" font-size="11" fill="#256b3a">decides one action per step</text>
 
   <!-- md -->
-  <rect x="620" y="296" width="278" height="176" rx="10" fill="#eefaf1" stroke="#2fa84f" stroke-width="1.5"/>
-  <text x="636" y="322" font-size="13" font-weight="700" fill="#14532d">knowledge/ · .md files</text>
-  <text x="636" y="345" font-size="11" fill="#256b3a">guidelines · roster · room_map</text>
-  <text x="636" y="364" font-size="11" fill="#256b3a">species/ · plants/ · journal</text>
-  <line x1="636" y1="378" x2="882" y2="378" stroke="#bfe6ca"/>
-  <text x="636" y="400" font-size="11" font-style="italic" fill="#2fa84f">read + write → continual learning</text>
-  <text x="636" y="419" font-size="10.5" fill="#4a515e">history · learned care · the map</text>
-  <text x="636" y="439" font-size="10" font-style="italic" fill="#7a8494">the robot's memory (V1 had none)</text>
+  <rect x="888" y="296" width="278" height="176" rx="10" fill="#eefaf1" stroke="#2fa84f" stroke-width="1.5"/>
+  <text x="904" y="322" font-size="13" font-weight="700" fill="#14532d">knowledge/ · .md files</text>
+  <text x="904" y="345" font-size="11" fill="#256b3a">guidelines · roster · room_map</text>
+  <text x="904" y="364" font-size="11" fill="#256b3a">species/ · plants/ · journal</text>
+  <line x1="904" y1="378" x2="1150" y2="378" stroke="#bfe6ca"/>
+  <text x="904" y="400" font-size="11" font-style="italic" fill="#2fa84f">read + write → continual learning</text>
+  <text x="904" y="419" font-size="10.5" fill="#4a515e">history · learned care · the map</text>
+  <text x="904" y="439" font-size="10" font-style="italic" fill="#7a8494">the robot's memory (V1 had none)</text>
 
-  <!-- mart -> gemma -->
-  <line x1="552" y1="200" x2="618" y2="200" stroke="#5b6472" stroke-width="1.8" marker-end="url(#ar)"/>
-  <text x="585" y="192" font-size="10" fill="#3a3f49" text-anchor="middle">raw frames + pose</text>
+  <!-- functions -> gemma -->
+  <line x1="820" y1="200" x2="886" y2="200" stroke="#0e7490" stroke-width="1.8" marker-end="url(#arT)"/>
+  <text x="853" y="192" font-size="9" fill="#0e7490" text-anchor="middle">prompt</text>
+
+  <!-- gemma -> actions (Gemma is the trigger) -->
+  <line x1="1166" y1="200" x2="1220" y2="216" stroke="#e08a1e" stroke-width="1.8" marker-end="url(#arO)"/>
+  <text x="1193" y="192" font-size="9" fill="#e08a1e" text-anchor="middle">decision · :8788</text>
+
+  <!-- gemma <-> md -->
+  <line x1="1027" y1="268" x2="1027" y2="296" stroke="#2fa84f" stroke-width="1.6" marker-end="url(#arG)" marker-start="url(#arG)"/>
+  <text x="1037" y="286" font-size="10" fill="#2fa84f">read / write</text>
 
   <!-- ===== audio_on_demand = EARS ===== -->
   <rect x="300" y="420" width="252" height="120" rx="10" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="1.6"/>
@@ -75,30 +108,24 @@
   <!-- mic -> ears -->
   <polyline points="232,228 266,228 266,480 298,480" fill="none" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#arP)"/>
   <!-- ears -> gemma -->
-  <polyline points="552,450 585,450 585,250 618,250" fill="none" stroke="#8b5cf6" stroke-width="1.6" marker-end="url(#arP)"/>
-  <text x="560" y="440" font-size="10" fill="#8b5cf6">utterance</text>
-  <!-- gemma <-> md -->
-  <line x1="759" y1="268" x2="759" y2="296" stroke="#2fa84f" stroke-width="1.6" marker-end="url(#arG)" marker-start="url(#arG)"/>
-  <text x="769" y="286" font-size="10" fill="#2fa84f">read / write</text>
+  <polyline points="552,450 848,450 848,250 886,250" fill="none" stroke="#8b5cf6" stroke-width="1.6" marker-end="url(#arP)"/>
+  <text x="700" y="442" font-size="10" fill="#8b5cf6" text-anchor="middle">utterance</text>
 
   <!-- ===== ACTIONS ===== -->
-  <rect x="954" y="150" width="200" height="342" rx="10" fill="#fff3df" stroke="#e08a1e" stroke-width="1.5"/>
-  <text x="972" y="178" font-size="15" font-weight="700" fill="#7a4a08">ACTIONS</text>
-  <text x="972" y="195" font-size="9.5" font-style="italic" fill="#a3701f">the Or↔Asaf contract</text>
+  <rect x="1222" y="150" width="208" height="360" rx="10" fill="#fff3df" stroke="#e08a1e" stroke-width="1.5"/>
+  <text x="1240" y="178" font-size="15" font-weight="700" fill="#7a4a08">ACTIONS</text>
+  <text x="1240" y="195" font-size="9.5" font-style="italic" fill="#a3701f">the Or↔Asaf contract</text>
   <g font-size="11.5" fill="#5a3a0a">
-    <text x="972" y="222">initiation</text>
-    <text x="972" y="246">scan_room</text>
-    <text x="972" y="270">approach_plant(id)</text>
-    <text x="972" y="294">inspect_plant(id)</text>
-    <text x="972" y="318">capture_photo(subject)</text>
-    <text x="972" y="342">water_plant(id, ml)</text>
-    <text x="972" y="366">flag_issue(sev, …)</text>
-    <text x="972" y="390">speak(text)</text>
-    <text x="972" y="414">daily_summary</text>
-    <text x="972" y="438">return_to_base</text>
-    <text x="972" y="462">wait_until(next)</text>
+    <text x="1240" y="226">approach_plant(id)</text>
+    <text x="1240" y="243" font-size="9.5" fill="#a3701f">actuator side — move closer</text>
+    <text x="1240" y="274">inspect_plant(id)</text>
+    <text x="1240" y="291" font-size="9.5" fill="#a3701f">Asaf side — last mart row</text>
+    <text x="1240" y="322">speak(text)</text>
+    <text x="1240" y="352">finish(summary)</text>
+    <text x="1240" y="369" font-size="9.5" fill="#a3701f">ends the function's loop</text>
   </g>
-  <line x1="898" y1="210" x2="952" y2="228" stroke="#e08a1e" stroke-width="1.6" marker-end="url(#arO)"/>
+  <text x="1240" y="440" font-size="10" font-style="italic" fill="#a3701f">deliberately narrow — grows</text>
+  <text x="1240" y="456" font-size="10" font-style="italic" fill="#a3701f">with the functions that need it</text>
 
   <!-- ===== DARAB actuators ===== -->
   <rect x="40" y="336" width="192" height="96" rx="10" fill="#e0edff" stroke="#2f6fed" stroke-width="1.5"/>
@@ -107,15 +134,20 @@
   <text x="54" y="405" font-size="10" font-style="italic" fill="#7a8494">executes commands</text>
 
   <!-- actions -> actuators loop back -->
-  <polyline points="1054,492 1054,560 136,560 136,432" fill="none" stroke="#2f6fed" stroke-width="1.6" marker-end="url(#arB)"/>
-  <text x="595" y="554" font-size="11" fill="#2f6fed" text-anchor="middle">actuator commands</text>
+  <polyline points="1326,510 1326,600 136,600 136,434" fill="none" stroke="#2f6fed" stroke-width="1.6" marker-end="url(#arB)"/>
+  <text x="720" y="594" font-size="11" fill="#2f6fed" text-anchor="middle">actuator commands — Darab executes</text>
+
+  <!-- actuators -> functions feedback -->
+  <polyline points="232,410 270,410 270,560 715,560 715,378" fill="none" stroke="#e08a1e" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arO)"/>
+  <text x="495" y="553" font-size="10" fill="#e08a1e" text-anchor="middle">feedback: step done (+ result, pos) → appended to the prompt</text>
 
   <!-- legend -->
   <g font-size="11" fill="#3a3f49">
     <rect x="40" y="638" width="15" height="15" rx="3" fill="#e0edff" stroke="#2f6fed"/><text x="62" y="650">Darab — sensors + actuators</text>
-    <rect x="270" y="638" width="15" height="15" rx="3" fill="#eef0f3" stroke="#8a94a6"/><text x="292" y="650">mart — reality (raw)</text>
-    <rect x="470" y="638" width="15" height="15" rx="3" fill="#e3f7e8" stroke="#2fa84f"/><text x="492" y="650">Asaf — Gemma + .md (interpretation)</text>
-    <rect x="770" y="638" width="15" height="15" rx="3" fill="#fff3df" stroke="#e08a1e"/><text x="792" y="650">action schema — the interface</text>
-    <rect x="1000" y="638" width="15" height="15" rx="3" fill="#f3e8ff" stroke="#8b5cf6"/><text x="1022" y="650">ears (event-driven)</text>
+    <rect x="260" y="638" width="15" height="15" rx="3" fill="#eef0f3" stroke="#8a94a6"/><text x="282" y="650">mart — reality (raw)</text>
+    <rect x="440" y="638" width="15" height="15" rx="3" fill="#e0f5fa" stroke="#0e7490"/><text x="462" y="650">functions — orchestration</text>
+    <rect x="660" y="638" width="15" height="15" rx="3" fill="#e3f7e8" stroke="#2fa84f"/><text x="682" y="650">Asaf — Gemma + .md (interpretation)</text>
+    <rect x="960" y="638" width="15" height="15" rx="3" fill="#fff3df" stroke="#e08a1e"/><text x="982" y="650">action schema — the interface</text>
+    <rect x="1200" y="638" width="15" height="15" rx="3" fill="#f3e8ff" stroke="#8b5cf6"/><text x="1222" y="650">ears (event-driven)</text>
   </g>
 </svg>

@@ -10,5 +10,7 @@ experiments/audio_on_demand/service.log
 knowledge/**
 !knowledge/
 !knowledge/guidelines.md
+!knowledge/actions.md
 experiments/initiation_e/*.csv
-!knowledge/species_catalog.md
+experiments/initiation_e_2/*.csv
+runs/
