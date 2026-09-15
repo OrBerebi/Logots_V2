@@ -8,14 +8,33 @@ time, so a decision always carries exactly the values the executor needs.
 
 Arg syntax: `name:type` — `string`, `int(min..max)`, `number(min..max)`;
 a trailing `...` means the action may carry extra free-form result fields.
-
-"executed by": **actuator** = Darab's side (polls GET :8788, drives the motors
-via his Arduino protocol, reports done via POST /action_done) · **data** =
+"executed by": **actuator** = Or's side (`ActionReader` polls GET :8788,
+drives the motors, reports done via POST :8788/action_done) · **data** =
 Asaf's side, served inside the loop.
 
-| action | args | executed by | description |
-|---|---|---|---|
-| approach_plant | id:string, left_pwm:int(-255..255), right_pwm:int(-255..255), duration_s:number(0.1..10) | actuator | drive toward the plant — YOU output the exact motor command: left/right wheel PWM (positive = forward) and how many seconds to run it |
-| inspect_plant | id:string | data | look: fetch a fresh camera view (frame + pose) of where you are now |
-| speak | text:string | actuator | say the text out loud |
-| finish | summary:string, ... | loop | end the running function; args carry its results |
+## inspect
+- executed by: data
+- what: look — fetches the newest data row (camera frame + position) and
+  returns your reading of it (observation, species guess, confidence)
+- when: whenever you want current data — your attached image only updates
+  when you inspect
+
+## approach_plant
+- executed by: actuator
+- args: id:string, left_pwm:int(-255..255), right_pwm:int(-255..255), duration_s:number(0.1..10)
+- what: drive toward the plant — YOU output the exact motor command: left/right
+  wheel PWM (positive = forward, equal values = straight) and seconds to run
+- when: you want a closer or better view than your last look gave you
+
+## speak
+- executed by: actuator
+- args: text:string
+- what: say the text out loud
+- when: the human should hear something right now
+
+## finish
+- executed by: loop
+- args: summary:string, ...
+- what: end the running function and deliver its results
+- when: the goal is achieved (e.g. classified with medium/high confidence) — or
+  continuing clearly leads nowhere; then explain why in the summary
