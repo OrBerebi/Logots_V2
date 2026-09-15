@@ -226,7 +226,21 @@ class LlamaCppBrain:
 
     def _ensure_server(self):
         if self._proc is not None and self._proc.poll() is None:
-            return  # already running
+            return  # this instance already started it
+        # A different process — e.g. logots_ui.py's embedded VoiceAssistant, or
+        # another LlamaCppBrain/LlamaCppVisionBrain instance — may already have
+        # one resident on this host:port. Reuse it rather than spawning a second
+        # GPU-loaded model (the Jetson doesn't have room for two, and the port
+        # would just fail to bind anyway).
+        health_url = f"http://{self.host}:{self.port}/health"
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as r:
+                if r.status == 200:
+                    print(f"[brain] reusing already-running llama-server on "
+                          f"{self.host}:{self.port}", flush=True)
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
         os.makedirs(self.media_dir, exist_ok=True)
         cmd = [
             self.binary,
@@ -377,34 +391,39 @@ def speak(text: str):
 
 # ── Action server (:8788) — the mirror of FrameServer ─────────────────────────
 class ActionServer:
-    def __init__(self, port: int = ACTION_PORT, sim_mode: bool = False):
+    def __init__(self, port: int = ACTION_PORT, sim_mode: bool = False, serve: bool = True):
+        """serve=False: track publish() bookkeeping (action_id/ts) without binding
+        `port` — for embedding inside logots_ui.py, where the functions layer (Asaf's
+        side) needs :8788 for its own ActionServer instance instead."""
         self._latest = None
         self._next_id = 1
         self._lock = threading.Lock()
+        self._httpd = None
         outer = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path != "/latest_action":
-                    self.send_error(404); return
-                with outer._lock:
-                    payload = outer._latest
-                if payload is None:
-                    self.send_error(503, "no action yet"); return
-                body = json.dumps(payload).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+        if serve:
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path != "/latest_action":
+                        self.send_error(404); return
+                    with outer._lock:
+                        payload = outer._latest
+                    if payload is None:
+                        self.send_error(503, "no action yet"); return
+                    body = json.dumps(payload).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
 
-            def log_message(self, *a):  # quiet
-                pass
+                def log_message(self, *a):  # quiet
+                    pass
 
-        self._httpd = ThreadingHTTPServer(("localhost", port), Handler)
-        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+            self._httpd = ThreadingHTTPServer(("localhost", port), Handler)
+            threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+            print(f"[server] GET http://localhost:{port}/latest_action", flush=True)
         self._sim = sim_mode
-        print(f"[server] GET http://localhost:{port}/latest_action", flush=True)
 
     def publish(self, decision: dict) -> dict:
         from datetime import datetime

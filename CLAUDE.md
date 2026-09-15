@@ -75,7 +75,13 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
 ## Arduino firmware protocol
 - I2C slave address: `0x08` on `/dev/i2c-1`
 - Message format sent by GUI: `"{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"`
-  - left/right PWM: -255 to +255
+  - left/right PWM: -255 to +255 (positive = forward — this is the convention `gui.left_pwm`/
+    `right_pwm` hold everywhere in `logots_ui.py`: joystick, keyboard, `ActionReader`/
+    `approach_plant`, `PositionEstimator`, the recording CSV. The hardware itself drives
+    backward for positive PWM, found 2026-09-15 — `_send_motors()` flips the sign only on
+    the two bytes written to the Arduino, so this convention holds everywhere above that one
+    line. If motor direction is ever wrong again, check `_send_motors()`'s sign flip before
+    suspecting the firmware.)
   - pan/tilt angles: 0 to 180 degrees
 - Motor driver: Adafruit Motor Shield (AFMotor.h), channels 3=left, 4=right
 - Pan servo: Arduino pin 10. Tilt servo: Arduino pin 9. Both MG90S.
@@ -178,6 +184,37 @@ The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a 
 from logots_api import get_latest_frame   # src/logots_api.py
 frame = get_latest_frame()                # adds frame['image']: 640×640×3 uint8 RGB numpy
 ```
+
+## Functions-layer actuation (executing Asaf's decisions on :8788)
+
+Asaf's `src/functions.py` (see `docs/v2_architecture/functions_layer_report.md`) runs a
+Gemma decision loop and publishes each chosen action via his `src/actions.py`
+`ActionsEndpoint`, which serves `GET :8788/latest_action` and `POST :8788/action_done` — the
+completion contract `functions.py`'s `wait_for_done()` actually blocks on (up to `DONE_WAIT_S`
+= 120 s). `ActionReader(threading.Thread)` in `logots_ui.py` (added 2026-09-15, addressing
+that report's asks #2/#3) closes the loop from this side:
+
+- **The reader**: polls `GET :8788/latest_action` every 0.2 s, dedupes on `action_id`. When the
+  action is `approach_plant`, it drives the motors exactly the way the joystick does — sets
+  `gui.left_pwm`/`right_pwm` from the action's args (clamped to ±255) for `duration_s` seconds,
+  then zeros them; `_send_motors()`'s normal per-tick I2C send does the rest. Blocked while
+  `sim_mode` is on. Tolerates `:8788` not being up yet (functions.py not running) — just keeps
+  polling silently.
+- **Completion signal**: after driving, `ActionReader` reads the live pose off
+  `gui._pos_est` (`.x`/`.y`/`.heading`) and does `POST :8788/action_done` with
+  `{"action_id", "pos_x", "pos_y", "heading"}` — exactly the shape `actions.py`'s
+  `ActionsEndpoint.do_POST` expects, landing in its `_done` dict that
+  `endpoint.completion(action_id)` reads. This is the real contract (checked directly against
+  `actions.py` before wiring it up) — not the `:8787`-frame-field idea floated earlier, which
+  doesn't satisfy what `functions.py` actually waits on.
+- **Port note**: `ActionReader` is a client only (`urllib.request` against `:8788`) — it doesn't
+  bind a port itself, so `functions.py`'s own `ActionsEndpoint` (which does bind `:8788`) needs
+  that port free, which is why the voice assistant's action server is off by default now (see
+  "Voice assistant" below).
+- **Not yet done**: only `approach_plant` is actuated; other actions (`inspect_plant`, `finish`,
+  `speak`, …) are Asaf's-side or no-ops here by design per the report. Concurrent manual
+  joystick/keyboard driving while `ActionReader` is also driving is unguarded (last write wins)
+  — fine for now since the two aren't expected to run at once, revisit if that changes.
 
 ## Voice assistant ("Hey Jarvis" → local LLM → spoken action)
 
@@ -324,6 +361,62 @@ conda run -n logots python src/logots_ui.py
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **Functions-layer actuation (2026-09-15) — live-tested against the real robot today, mixed
+  results. Confirmed working, plus two open bugs — one for Or/hardware, one for Asaf/decoding:**
+
+  **Confirmed working end-to-end:** `ActionReader` in `logots_ui.py` polls Asaf's
+  `:8788/latest_action`, drives `approach_plant` on the real motors, and reports completion via
+  `POST :8788/action_done` — the real contract implemented in his `src/actions.py`
+  (`ActionsEndpoint`/`wait_for_done()`), not the `:8787`-frame-field idea floated first (checked
+  against `actions.py` and corrected before testing). One full live run drove the robot, posted
+  completion, and `functions.py` received and logged it correctly. Also fixed today:
+  `LlamaCppBrain._ensure_server()` (`audio_on_demand.py`) now detects and reuses an
+  already-running `llama-server` on `:8789` instead of trying to spawn a second GPU-loaded one
+  when `functions.py`'s `LlamaCppVisionBrain` starts — needed since the GUI's embedded voice
+  assistant already has one up.
+
+  **Open bug #1 (hardware/Or's side) — motor direction, UNTESTED at recommended PWM:** the
+  Arduino was found to drive backward for positive PWM; fixed by flipping the sign only on the
+  two bytes written in `_send_motors()` (see "Arduino firmware protocol" above). Retested once
+  at `left_pwm=right_pwm=100`: the robot turned RIGHT instead of driving straight. Hypothesis —
+  PWM 100 may be below stiction threshold for one wheel — is UNCONFIRMED: `functions.py` never
+  issued another `approach_plant` call across 6 subsequent runs (see bug #2), so a retest at a
+  higher PWM (~255) never happened. To test in isolation without depending on `functions.py`:
+  drive both wheel joystick/keyboard commands equal and forward from the GUI directly and watch
+  whether it still turns. If it does turn at 255 too, this points to a real hardware asymmetry
+  (weak motor, wiring, wheel friction) rather than a software/PWM-magnitude issue.
+
+  **Open bug #2 (decoding — for Asaf) — the decision loop gets stuck on `inspect_plant`,
+  reproduced 6/6 times today:** across substantially different conditions — robot far from the
+  plant, robot moved close to the plant, `knowledge/actions.md`'s `approach_plant` wording
+  varied and then reverted to original, GUI freshly relaunched, and even **sim mode** (where
+  each `inspect_plant` call gets a genuinely different replayed camera frame) — `functions.py`
+  reliably calls `inspect_plant` for all 12 steps of its budget and never calls `approach_plant`
+  or `finish`. Since the image content clearly varies across these runs yet the decision doesn't,
+  this looks like a decoding issue rather than a vision/scene issue. Leading theory: both the
+  `llama-server` launch (`--temp 0` in `audio_on_demand.py`) and the per-request payload
+  (`"temperature": 0` in `mrt_reflective.py`'s `ask_json()`) use fully greedy/zero-temperature
+  decoding, deliberately, per an existing comment ("for reproducibility") — small models under
+  greedy decoding are known to fall into repetition loops once a pattern (2+ identical
+  `inspect_plant` steps) appears in their own growing prompt history. The one run that *did*
+  call `approach_plant` did so at step 3, before such a pattern had "set in" — consistent with
+  this theory but not proof. NOT changed — `temp=0` was a deliberate design choice and touches
+  shared decoding config also used by the voice assistant, so this needs Asaf's call, not a
+  unilateral edit from this side. Options worth considering: a small non-zero temperature or a
+  repeat-penalty on `llama-server`; a much larger `--max-steps` to check whether it's a
+  slow-breaking loop rather than a permanent one; or an explicit prompt-side rule (in
+  `knowledge/guidelines.md` or the `STEP_PROMPT` in `functions.py`) against repeating
+  `inspect_plant` without new information.
+
+  **To reproduce today's testing:** GUI running, then
+  `conda run -n logots python src/functions.py --knowledge-dir <fresh-empty-dir>` (a
+  non-empty/default `knowledge/` dir with plants already on the roster makes it skip
+  immediately — see `src/knowledge.py`'s `roster_empty()`). Decision log lands at
+  `runs/initiation_<timestamp>.log` (gitignored).
+
+  `knowledge/actions.md` is back at its original content (gitignored, untracked — not part of
+  this commit). `git status` shows `src/logots_ui.py`, `src/audio_on_demand.py`, `CLAUDE.md`
+  modified — reviewed and committed today.
 - **Pan/tilt servo random twitch fixed (2026-09-03, commit `c36d94e`)**: servos made small,
   seemingly random jumps every ~0.5s even with unchanged target angles. Root cause was in
   `src/firmware/logots_motor_control/logots_motor_control.ino` — the I2C `onReceive` ISR

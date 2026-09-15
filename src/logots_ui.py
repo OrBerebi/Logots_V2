@@ -335,7 +335,15 @@ class VoiceAssistant(threading.Thread):
             else:
                 self.brain = GemmaBrain()
                 self.brain.ensure_ready()
-            action_server = VoiceActionServer(port=VOICE_ACTION_PORT)
+            # :8788 is Asaf's functions-layer ActionServer port by default (see
+            # docs/v2_architecture/functions_layer_report.md) — don't bind it here
+            # unless explicitly asked to run the voice assistant standalone.
+            serve_action_api = os.environ.get('VOICE_ACTION_SERVER', '0') == '1'
+            action_server = VoiceActionServer(port=VOICE_ACTION_PORT, serve=serve_action_api)
+            if not serve_action_api:
+                print(f"[voice] action server on :{VOICE_ACTION_PORT} disabled (port free for "
+                      f"the functions layer) — set VOICE_ACTION_SERVER=1 to serve it here instead",
+                      flush=True)
         except ImportError as e:
             self.stage = 'error'; self.error = str(e)
             print(f"[voice] startup failed: missing dependency ({e}) — GemmaBrain needs "
@@ -369,6 +377,76 @@ class VoiceAssistant(threading.Thread):
             except Exception as e:
                 print(f'[voice] utterance handling failed: {e}', flush=True)
             self.stage = 'asleep'
+
+# ── Action reader (executes functions-layer decisions from :8788) ──────────────
+class ActionReader(threading.Thread):
+    """Ask #3 in docs/v2_architecture/functions_layer_report.md: polls Asaf's
+    functions-layer ActionsEndpoint (GET :8788/latest_action, src/actions.py)
+    and executes approach_plant's left_pwm/right_pwm/duration_s on the motors,
+    the same way the joystick does (sets gui.left_pwm/right_pwm; _send_motors()
+    ticks them out over I2C). Completion (ask #2) is reported back over the
+    real contract actions.py already implements — POST :8788/action_done with
+    {"action_id", "pos_x", "pos_y", "heading"} — which is what functions.py's
+    wait_for_done()/endpoint.completion() actually waits on (NOT the :8787
+    frame API; an earlier version of this reader used a `last_action_id` field
+    there, but that doesn't satisfy the contract actions.py implements)."""
+
+    POLL_S = 0.2
+
+    def __init__(self, gui, host='localhost', port=8788):
+        super().__init__(daemon=True)
+        self.gui   = gui
+        self.host  = host
+        self.port  = port
+        self.get_url  = f'http://{host}:{port}/latest_action'
+        self.post_url = f'http://{host}:{port}/action_done'
+        self._stop_evt = threading.Event()
+        self._seen_id  = None
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        import urllib.request
+        while not self._stop_evt.is_set():
+            time.sleep(self.POLL_S)
+            try:
+                with urllib.request.urlopen(self.get_url, timeout=1.0) as resp:
+                    action = json.loads(resp.read())
+            except Exception:
+                continue  # functions.py not running yet, or no action published yet
+            aid = action.get('action_id')
+            if aid is None or aid == self._seen_id:
+                continue
+            self._seen_id = aid
+            if action.get('action') == 'approach_plant' and not self.gui.sim_mode:
+                self._drive(action)
+
+    def _drive(self, action):
+        import urllib.request
+        args = action.get('args', {})
+        try:
+            l   = max(-255, min(255, int(args['left_pwm'])))
+            r   = max(-255, min(255, int(args['right_pwm'])))
+            dur = max(0.0, float(args['duration_s']))
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"[actions] bad approach_plant args {args}: {e}", flush=True)
+            return
+        aid = action['action_id']
+        print(f"[actions] approach_plant #{aid} L={l} R={r} for {dur}s", flush=True)
+        self.gui.left_pwm, self.gui.right_pwm = l, r
+        time.sleep(dur)
+        self.gui.left_pwm = self.gui.right_pwm = 0
+        pos = self.gui._pos_est
+        report = {'action_id': aid, 'pos_x': pos.x, 'pos_y': pos.y, 'heading': pos.heading}
+        try:
+            req = urllib.request.Request(self.post_url, data=json.dumps(report).encode(),
+                                         headers={'Content-Type': 'application/json'}, method='POST')
+            urllib.request.urlopen(req, timeout=1.0).close()
+            print(f"[actions] approach_plant #{aid} done, reported pos "
+                  f"({pos.x:.2f}, {pos.y:.2f}) heading {pos.heading:.0f}°", flush=True)
+        except Exception as e:
+            print(f"[actions] failed to POST /action_done for #{aid}: {e}", flush=True)
 
 # ── Camera reader ─────────────────────────────────────────────────────────────
 class CameraReader(threading.Thread):
@@ -759,6 +837,7 @@ class RobotControlGUI:
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
         self.voice_assistant=None
+        self.action_reader=None
 
         self._build_ui()
         self._bind_keys()
@@ -771,6 +850,7 @@ class RobotControlGUI:
         # Started after FrameServer: it polls this GUI's own :8787, same as any
         # external client, so the server needs to be up first.
         self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
+        self.action_reader = ActionReader(self); self.action_reader.start()
         self._loop()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
@@ -1197,7 +1277,11 @@ class RobotControlGUI:
         self._update_motor_labels(l,r,pa,ta)
         if not(self.connected and self.i2c):
             self.lbl_tx.config(text='(not sent)'); return
-        msg=f'{l},{r},{pa},{ta}\n'.encode()
+        # Hardware drives backward for positive PWM and vice versa (found 2026-09-15) —
+        # flip sign only on the wire to the Arduino, so left_pwm/right_pwm keep their
+        # documented "positive = forward" meaning everywhere else (joystick, keyboard,
+        # ActionReader/approach_plant, PositionEstimator, recording CSV).
+        msg=f'{-l},{-r},{pa},{ta}\n'.encode()
         try:
             if SMBUS2:
                 for off in range(0,len(msg),32):
