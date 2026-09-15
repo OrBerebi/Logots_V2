@@ -56,10 +56,9 @@ def guidelines(kdir: str) -> str:
     return open(os.path.join(kdir, "guidelines.md")).read()
 
 
-SPECIES_RULE = ('the common species name, from what you actually see. If you '
-                'cannot tell from the current view, do NOT guess — use '
-                'approach_plant and inspect_plant to get a closer look first; '
-                'answer "unknown" only if you still cannot tell up close')
+SPECIES_RULE = ('the common species name, judged only from what you actually '
+                'saw; "unknown" is the honest answer if you never saw it well '
+                'enough to tell')
 
 
 def normalize_plants(plants: list) -> list[dict]:

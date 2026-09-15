@@ -11,8 +11,8 @@ The contract (v2 — proposed to Darab in this refactor):
 Changes to the action set vs v1 (audio_on_demand.ACTIONS, untouched there):
     - `initiation` removed — it is a *function* (a routine in functions.py),
       never a single action.
-    - narrowed to what the current functions need: approach_plant, inspect_plant
-      (served by OUR side: the mart's last row — fresh frame + pose), speak.
+    - narrowed to what the current functions need: inspect (served by OUR
+      side: the mart's last row — fresh frame + pose), approach_plant, speak.
     - `finish` added — the terminal action that ends a function's loop.
 """
 from __future__ import annotations
@@ -51,31 +51,33 @@ def _arg_schema(token: str) -> tuple[str, dict]:
 
 def load_actions() -> tuple[dict, dict, str]:
     """Parse knowledge/actions.md — the single source of truth for the action
-    set. Returns ({name: (arg, ...)}, {name: args JSON schema}, full text).
+    set. One `## name` block per action; its `- args:` line declares the typed
+    args. Returns ({name: (arg, ...)}, {name: args JSON schema}, full text).
     The schema is what makes the contract enforced, not just documented: at
     decoding time the LLM can only generate these actions with these args."""
     text = open(ACTIONS_MD_PATH).read()
-    actions, schemas = {}, {}
+    actions, schemas, name = {}, {}, None
     for line in text.splitlines():
-        if not line.startswith("|") or line.startswith("|--"):
+        m = _re.match(r"##\s+(\w+)\s*$", line)
+        if m:
+            name = m.group(1)
+            actions[name], schemas[name] = (), {"type": "object"}
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) < 4 or cells[0] in ("action", ""):
-            continue
-        name = cells[0].strip("`")
-        tokens = [t.strip() for t in cells[1].split(",") if t.strip()]
-        open_ended = "..." in tokens
-        parsed = [_arg_schema(t) for t in tokens if t != "..."]
-        actions[name] = tuple(n for n, _ in parsed)
-        if open_ended:
-            schemas[name] = {"type": "object"}    # free-form: results ride along
-        else:
-            schemas[name] = {"type": "object",
-                             "properties": {n: s for n, s in parsed},
-                             "required": [n for n, _ in parsed]}
+        m = _re.match(r"-\s*args:\s*(.+)$", line.strip())
+        if m and name:
+            tokens = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            open_ended = "..." in tokens
+            parsed = [_arg_schema(t) for t in tokens if t != "..."]
+            actions[name] = tuple(n for n, _ in parsed)
+            if not open_ended:
+                schemas[name] = {"type": "object",
+                                 "properties": {n: s for n, s in parsed},
+                                 "required": [n for n, _ in parsed]}
     if not actions:
         raise RuntimeError(f"no actions parsed from {ACTIONS_MD_PATH}")
-    return actions, schemas, text
+    # for the prompt: only the ## action blocks — the file header is for humans
+    blocks = text[text.index("## "):]
+    return actions, schemas, blocks
 
 
 # Deliberately narrow: only what the current functions need; grows with the .md.
