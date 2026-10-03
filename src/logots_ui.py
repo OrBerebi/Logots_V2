@@ -19,6 +19,7 @@ import json
 import collections
 import io
 import base64
+import struct
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -71,6 +72,8 @@ except ImportError:
 # ── Hardware constants ────────────────────────────────────────────────────────
 API_PORT      = 8787
 ARDUINO_ADDR  = 0x08
+ENC_PKT_HDR   = 0xE5   # encoder read-back packet: hdr, int32 left, int32 right, sum8
+ENC_PKT_LEN   = 10     # (see requestEvent() in the firmware)
 IMU_I2C_BUS   = 7
 MPU_ADDR      = 0x68
 AUDIO_RATE    = 16000
@@ -689,7 +692,7 @@ class SimPlayer:
             'audio':      arr('audio_samples'),
             'left_pwm':   num('left_pwm', 0),
             'right_pwm':  num('right_pwm', 0),
-            'pan_angle':  num('pan_angle', 90),
+            'pan_angle':  num('pan_angle', 0),
             'tilt_angle': num('tilt_angle', 90),
             'pos_x':      fnum('pos_x', 0.0),   # 0.0 when column absent (old CSVs)
             'pos_y':      fnum('pos_y', 0.0),
@@ -809,8 +812,9 @@ class RobotControlGUI:
         self.joy_dragging=False
         self.keys_held=set()
         self.left_pwm=self.right_pwm=0
-        self.pan_angle=90
+        self.pan_angle=0     # -90…+90, 0 = camera facing front, + = left
         self.tilt_angle=90
+        self.enc_left=self.enc_right=None   # cumulative encoder counts; None = no reading
 
         self._pos_est   = PositionEstimator()
         self._pos_trail = collections.deque(maxlen=400)  # (x,y) points for the mini-map
@@ -949,19 +953,22 @@ class RobotControlGUI:
         self._pwm(); self._draw_joy()
 
     def _cam_sliders(self,parent):
-        for attr,label in [('pan','PAN'),('tilt','TILT')]:
+        # pan: -90…+90 (0 = front, + = left); tilt: 0…180
+        for attr,label,top,bot,init,top_txt,bot_txt in [
+                ('pan', 'PAN', 90, -90,0, 'L 90°','R 90°'),
+                ('tilt','TILT',180,0,  90,'180°', '0°')]:
             f=tk.Frame(parent,bg=C_PANEL); f.pack(side='left',padx=2)
             _plbl(f,label,font=('Courier',8,'bold')).pack(pady=(4,0))
-            _plbl(f,'180°',font=('Courier',7)).pack()
-            var=tk.IntVar(value=90)
+            _plbl(f,top_txt,font=('Courier',7)).pack()
+            var=tk.IntVar(value=init)
             setattr(self,f'{attr}_var',var)
-            tk.Scale(f,from_=180,to=0,variable=var,orient='vertical',
+            tk.Scale(f,from_=top,to=bot,variable=var,orient='vertical',
                      length=120,width=16,bg=C_PANEL,fg=C_TEXT,troughcolor='#16162a',
                      activebackground=C_BLUE_HI,highlightthickness=0,bd=0,
                      sliderrelief='flat',sliderlength=20,showvalue=True,
                      command=lambda v,a=attr:None if self.sim_mode
                              else setattr(self,f'{a}_angle',int(v))).pack()
-            _plbl(f,'0°',font=('Courier',7)).pack(pady=(0,4))
+            _plbl(f,bot_txt,font=('Courier',7)).pack(pady=(0,4))
 
     # ── Position mini-map ─────────────────────────────────────────────────────
     POS_MAP = 118   # canvas size (px) for the top-down trail
@@ -1144,11 +1151,14 @@ class RobotControlGUI:
             w.pack(fill='x',padx=10,pady=pady); return w
         self.lbl_lm =_vallbl(p,'L:  +000',fg=C_BLUE,width=12)
         self.lbl_rm =_vallbl(p,'R:  +000',fg=C_BLUE,width=12)
-        self.lbl_pan=_vallbl(p,'PAN:090°',fg=C_GREEN,width=12)
+        self.lbl_el =_vallbl(p,'EL: ----',fg=C_BLUE,width=13)   # encoder counts
+        self.lbl_er =_vallbl(p,'ER: ----',fg=C_BLUE,width=13)
+        self.lbl_pan=_vallbl(p,'PAN:+00°',fg=C_GREEN,width=12)
         self.lbl_tlt=_vallbl(p,'TLT:090°',fg=C_AMBER,width=12)
         self.lbl_pos=_vallbl(p,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
         self.lbl_hdg=_vallbl(p,'HDG:000°',fg=C_GREEN,width=12)
-        pk(self.lbl_lm,(12,3)); pk(self.lbl_rm); pk(self.lbl_pan); pk(self.lbl_tlt)
+        pk(self.lbl_lm,(12,3)); pk(self.lbl_rm); pk(self.lbl_el); pk(self.lbl_er)
+        pk(self.lbl_pan); pk(self.lbl_tlt)
         pk(self.lbl_pos); pk(self.lbl_hdg)
         pk(_btn(p,'⌖  POS',C_SUB,self._reset_pos),(8,4))
         _hline(p)
@@ -1240,6 +1250,7 @@ class RobotControlGUI:
             self.lbl_tx.config(text=f'SIM load failed: {e}'[:44]); return
         if self._rec_manager.active: self._toggle_rec()
         self._pre_sim_angles=(self.pan_angle,self.tilt_angle)
+        self.enc_left=self.enc_right=None; self._update_enc_labels()   # not replayed
         self.sim_player=player; self.sim_mode=True; self._sim_ended=False
         self._pos_trail.clear()                             # replay draws the recorded path
         self.btn_sim.config(text='⏹  REAL',bg=C_BLUE)
@@ -1268,8 +1279,12 @@ class RobotControlGUI:
     def _update_motor_labels(self,l,r,pa,ta):
         self.lbl_lm.config(text=f'L:  {l:+04d}')
         self.lbl_rm.config(text=f'R:  {r:+04d}')
-        self.lbl_pan.config(text=f'PAN:{pa:03d}°')
+        self.lbl_pan.config(text=f'PAN:{pa:+03d}°')
         self.lbl_tlt.config(text=f'TLT:{ta:03d}°')
+
+    def _update_enc_labels(self):
+        for lbl,name,v in ((self.lbl_el,'EL',self.enc_left),(self.lbl_er,'ER',self.enc_right)):
+            lbl.config(text=f'{name}: ----' if v is None else f'{name}: {v:+08d}')
 
     def _send_motors(self):
         l=self.left_pwm; r=self.right_pwm
@@ -1277,11 +1292,9 @@ class RobotControlGUI:
         self._update_motor_labels(l,r,pa,ta)
         if not(self.connected and self.i2c):
             self.lbl_tx.config(text='(not sent)'); return
-        # Hardware drives backward for positive PWM and vice versa (found 2026-09-15) —
-        # flip sign only on the wire to the Arduino, so left_pwm/right_pwm keep their
-        # documented "positive = forward" meaning everywhere else (joystick, keyboard,
-        # ActionReader/approach_plant, PositionEstimator, recording CSV).
-        msg=f'{-l},{-r},{pa},{ta}\n'.encode()
+        # Positive PWM = forward on the wire too; each wheel's hardware direction is
+        # corrected in the firmware's calibration block (LEFT/RIGHT_MOTOR_DIR).
+        msg=f'{l},{r},{pa},{ta}\n'.encode()
         try:
             if SMBUS2:
                 for off in range(0,len(msg),32):
@@ -1291,6 +1304,23 @@ class RobotControlGUI:
             self.lbl_tx.config(text=f'TX {msg.decode().strip()}')
         except Exception:
             self._disc()
+
+    def _read_encoders(self):
+        # Cumulative wheel-encoder counts read back from the Arduino (smbus2 only).
+        # A failed or bad read only blanks the readout — it never disconnects, so an
+        # encoder problem can't take motor commands down with it.
+        el=er=None
+        if self.connected and self.i2c and SMBUS2:
+            try:
+                rd=i2c_msg.read(ARDUINO_ADDR,ENC_PKT_LEN)
+                self.i2c.i2c_rdwr(rd)
+                pkt=bytes(rd)
+                if pkt[0]==ENC_PKT_HDR and sum(pkt[:-1])&0xFF==pkt[-1]:
+                    el,er=struct.unpack('<ii',pkt[1:9])
+            except Exception:
+                pass
+        self.enc_left,self.enc_right=el,er
+        self._update_enc_labels()
 
     # ── Sensor startup ────────────────────────────────────────────────────────
     def _start_sensors(self):
@@ -1336,6 +1366,7 @@ class RobotControlGUI:
             self._last_reconnect=time.time()
             self._conn()
         self._send_motors()
+        self._read_encoders()
         frame_bgr   = self.camera_reader.get_frame()    if self.camera_reader else None
         imu_samples = self.imu_reader.drain_samples()   if self.imu_reader    else []
         audio_samps = self.audio_reader.drain_samples() if self.audio_reader  else []

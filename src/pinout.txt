@@ -1,6 +1,7 @@
 ================================================
 LOGOTS PROJECT: HARDWARE PINOUT
-Device: Jetson Orin Nano (40-pin Header)
+Jetson Orin Nano (40-pin Header)
++ Arduino Uno motor controller + 12V power
 ================================================
 
 ------------------------------------------------
@@ -41,6 +42,9 @@ NOTE: jetson-io labels these pins as i2c8 but the kernel
 ------------------------------------------------
 4. ARDUINO MOTOR CONTROLLER (I2C via Level Shifter)
 ------------------------------------------------
+Board  : Arduino Uno
+Shield : HW-130 (L293D) — Adafruit Motor Shield v1 clone (AFMotor.h)
+
 *** LEVEL SHIFTER REQUIRED (e.g. BSS138 4-channel bidirectional) ***
 Jetson runs at 3.3V logic; Arduino runs at 5V logic.
 
@@ -61,13 +65,106 @@ Detect              : i2cdetect -y -r 1   (should show 08)
 Firmware            : src/firmware/logots_motor_control/logots_motor_control.ino
 Protocol            : "{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"
 
-  ARDUINO — MOTOR SHIELD (Adafruit Motor Shield v1):
-  Left DC motor  : Channel 3
-  Right DC motor : Channel 4
+  ARDUINO — MOTOR SHIELD:
+  Right motor  : M1 terminal             (see section 5)
+  Left motor   : M4 terminal             (see section 5)
+  Motor power  : EXT_PWR, 12V            (see section 6)
 
   ARDUINO — SERVOS (MG90S):
   Pan servo  (camera rotation)  : Pin 10
   Tilt servo (camera elevation) : Pin 9
+
+  Pan horn is seated so servo 90 = camera facing front. On the wire pan is
+  signed: 0 = front, +90 = left, -90 = right (PAN_CENTER_DEG / PAN_DIR in
+  the firmware calibration block).
+
+------------------------------------------------
+5. DRIVE MOTORS + ENCODERS (2x JGA25-370)
+------------------------------------------------
+Each motor has a 6-pin JST-PH plug (2.0mm pitch).
+
+  MOTOR POWER (motor wire --> shield):
+  Right motor +  (Green)  --> M1 terminal (+)
+  Right motor -  (Black)  --> M1 terminal (-)
+  Left motor  +  (Green)  --> M4 terminal (+)
+  Left motor  -  (Black)  --> M4 terminal (-)
+  M2, M3 terminals: unused
+
+  Firmware: motorRight = AF_DCMotor(1), motorLeft = AF_DCMotor(4).
+  If a wheel spins the wrong way, flip its LEFT/RIGHT_MOTOR_DIR in the
+  firmware's calibration block and reflash (don't swap the wires).
+
+  ENCODERS (encoder wire --> Arduino):
+  Right motor signal A  (Yellow) --> A0
+  Right motor signal B  (White)  --> A1
+  Left motor  signal A  (Yellow) --> A2
+  Left motor  signal B  (White)  --> A3
+  Encoder VCC, both  (Red)    --> Arduino 5V   [shared]
+  Encoder GND, both  (Orange) --> Arduino GND  [shared]
+
+  A0-A3 have no external interrupt (INT0/INT1) on the Uno. The firmware
+  decodes them with pin-change interrupts (PCINT8-11, full 4x quadrature)
+  and the Jetson reads the cumulative counts back over I2C: a 10-byte read
+  from 0x08 = [0xE5][int32 left][int32 right][sum8], little-endian.
+  Count direction: LEFT/RIGHT_ENC_DIR in the firmware calibration block.
+
+  WIRE COLOR MAP (motor's original leads --> new connector):
+  Role               Old      New
+  Motor +            Red      Green
+  Motor -            White    Black
+  Encoder signal A   Yellow   Yellow
+  Encoder signal B   Green    White
+  Encoder VCC (+)    Blue     Red
+  Encoder GND (-)    Black    Orange
+
+  CAREFUL: in the new colors RED is encoder 5V, not motor power.
+
+------------------------------------------------
+6. POWER (12V battery pack)
+------------------------------------------------
+Battery (+) --> Switch (in)
+Switch (out) splits into two branches:
+  Branch 1 --> Shield EXT_PWR (+)        [straight 12V, motors]
+  Branch 2 --> Buck converter IN+        [mini560 PRO, fixed 9V out]
+               Buck OUT+ --> barrel plug red wire --> Arduino barrel jack
+
+Battery (-) = common ground rail. Ties together ALL of:
+  - Shield EXT_PWR (-)
+  - Buck converter IN-
+  - Buck converter OUT-
+  - Barrel plug black wire --> Arduino barrel jack sleeve
+
+The switch is on battery (+) only, before the split: one switch cuts
+power to both the shield and the Arduino. Battery (-) is never switched.
+
+*** REMOVE THE PWR JUMPER ON THE MOTOR SHIELD. With the jumper on,
+    EXT_PWR (12V) is tied to the Arduino's VIN, which connects the
+    12V and 9V branches. ***
+
+* The 12V and 9V branches must not touch anywhere except the shared
+  ground rail. A short between them puts 12V into the Arduino.
+* The buck converter is fixed 9V (no trimpot), but check OUT+/OUT-
+  with a multimeter once before first connecting it to the Arduino.
+
+------------------------------------------------
+7. ARDUINO UNO PIN USAGE
+------------------------------------------------
+D0, D1    Serial (USB debug output, 9600 baud)
+D2        FREE   (the only free external-interrupt pin, INT0)
+D3        Shield: M2 PWM  (channel unused)
+D4        Shield: 74HC595 shift register
+D5        Shield: M3 PWM  (channel unused)
+D6        Shield: M4 PWM  (left motor)
+D7, D8    Shield: 74HC595 shift register
+D9        Tilt servo
+D10       Pan servo
+D11       Shield: M1 PWM  (right motor)
+D12       Shield: 74HC595 shift register
+D13       FREE   (onboard LED)
+A0-A3     Motor encoders                       (section 5)
+A4, A5    I2C SDA/SCL to Jetson, via level shifter (section 4)
+5V, GND   Level shifter HV side + both encoders
+Barrel    9V from buck converter               (section 6)
 
 ------------------------------------------------
 HOW TO VIEW CURRENT JETSON HEADER STATE:

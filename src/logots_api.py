@@ -29,7 +29,8 @@ def get_latest_frame(host='localhost', port=DEFAULT_PORT, decode_image=True, tim
       frame_id (int), timestamp (ISO 8601 str), frame_data (base64 JPEG str),
       yaw / pitch / roll (lists of degrees sampled since the previous frame),
       audio_samples (list of floats), left_pwm, right_pwm (−255…+255),
-      pan_angle, tilt_angle (0…180°), sim_mode (bool), and — when
+      pan_angle (−90…+90°, 0 = camera facing front, + = left),
+      tilt_angle (0…180°), sim_mode (bool), and — when
       decode_image is True — image: an H×W×3 uint8 RGB numpy array,
       or None if no camera frame was available.
 

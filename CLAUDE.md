@@ -75,18 +75,30 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
 ## Arduino firmware protocol
 - I2C slave address: `0x08` on `/dev/i2c-1`
 - Message format sent by GUI: `"{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"`
-  - left/right PWM: -255 to +255 (positive = forward — this is the convention `gui.left_pwm`/
-    `right_pwm` hold everywhere in `logots_ui.py`: joystick, keyboard, `ActionReader`/
-    `approach_plant`, `PositionEstimator`, the recording CSV. The hardware itself drives
-    backward for positive PWM, found 2026-09-15 — `_send_motors()` flips the sign only on
-    the two bytes written to the Arduino, so this convention holds everywhere above that one
-    line. If motor direction is ever wrong again, check `_send_motors()`'s sign flip before
-    suspecting the firmware.)
-  - pan/tilt angles: 0 to 180 degrees
-- Motor driver: Adafruit Motor Shield (AFMotor.h), channels 3=left, 4=right
+  - left/right PWM: -255 to +255, positive = forward — on the wire too, and everywhere in
+    `logots_ui.py` (joystick, keyboard, `ActionReader`/`approach_plant`, `PositionEstimator`,
+    the recording CSV). Each wheel's hardware direction is corrected in the firmware's
+    **calibration block** (`LEFT_MOTOR_DIR`/`RIGHT_MOTOR_DIR`), per motor. (Until 2026-10-03
+    `_send_motors()` flipped both signs globally; that was removed when the motors were rewired
+    to M1/M4, since one wheel can be reversed relative to the other.) If a wheel spins the wrong
+    way, flip its `*_MOTOR_DIR` and reflash.
+  - pan: -90 to +90 degrees, **0 = camera facing front, + = left** (since 2026-10-03; the horn
+    was re-seated so servo 90 = front). The firmware maps it to a servo angle with
+    `PAN_CENTER_DEG`/`PAN_DIR` from its calibration block and starts at front on power-up.
+  - tilt: 0 to 180 degrees
+- **Encoder read-back**: a 10-byte I2C read from `0x08` returns `[0xE5][int32 left][int32 right]
+  [sum8 of bytes 0..8]`, little-endian, read by `_read_encoders()` each real tick and shown as
+  `EL`/`ER` in the side panel (`----` = no reading). Counts are cumulative 4x-quadrature ticks,
+  positive = forward (`LEFT_ENC_DIR`/`RIGHT_ENC_DIR`). Decoded by a pin-change ISR on A0–A3 in
+  the firmware. Display only for now; not in the CSV or frame API, and `PositionEstimator`
+  doesn't use them yet. A failed or bad read blanks the readout but never disconnects.
+- Motor driver: HW-130 (L293D, Adafruit Motor Shield v1 clone, AFMotor.h), M1=right, M4=left
+- Encoders: JGA25-370 Hall encoders, right on A0/A1, left on A2/A3 (full wiring: `src/pinout.txt`)
 - Pan servo: Arduino pin 10. Tilt servo: Arduino pin 9. Both MG90S.
-- Serial debug at 9600 baud: prints `OK  L=X R=X PAN=X TILT=X` per command
-- Flash from MacBook with Arduino IDE (no Linux ARM64 build exists for IDE 2.x)
+- Serial debug at 9600 baud: prints `OK  L=X R=X PAN=X TILT=X` per command, plus
+  `ENC L=X R=X` every 500 ms while the counts are changing
+- Flash from MacBook with Arduino IDE (no Linux ARM64 build exists for IDE 2.x). Compile check
+  from the terminal: `"/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli" compile --fqbn arduino:avr:uno --libraries ~/Library/Arduino15/libraries src/firmware/logots_motor_control`
 
 ## Camera pipeline
 Always requires `EGL_PLATFORM=surfaceless` for headless/NoMachine use:
@@ -115,7 +127,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 │  ACTION (last voice │                     │
 │  command decided)   │                     │
 └─────────────────────┴─────────────────────┘
-  L +000  R +000  PAN:090°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP
+  L +000  R +000  EL ----  ER ----  PAN:+00°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP
 ```
 - Position mini-map (bottom of DRIVE & CAM): top-down trail of the dead-reckoned body
   position with a heading arrow; `⌖ POS` in the status bar zeros the estimate (origin = here).
@@ -146,7 +158,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `audio_samples` | JSON array | all mic samples since last frame (~1600 floats at 10 FPS) |
 | `left_pwm` | int | left motor command, –255…+255 |
 | `right_pwm` | int | right motor command, –255…+255 |
-| `pan_angle` | int | pan servo, 0…180° |
+| `pan_angle` | int | camera pan, –90…+90° (0 = front, + = left). Recordings made before 2026-10-03 hold raw servo degrees 0…180 from the old horn position; sim replays them as-is, without converting |
 | `tilt_angle` | int | tilt servo, 0…180° |
 | `pos_x` | float | estimated body X position (m), origin = recording start; see position note |
 | `pos_y` | float | estimated body Y position (m), origin = recording start |
@@ -400,7 +412,11 @@ conda run -n logots python src/logots_ui.py
   when `functions.py`'s `LlamaCppVisionBrain` starts — needed since the GUI's embedded voice
   assistant already has one up.
 
-  **Open bug #1 (hardware/Or's side) — motor direction, UNTESTED at recommended PWM:** the
+  **Open bug #1 (hardware/Or's side) — motor direction, UNTESTED at recommended PWM:**
+  *(2026-10-03: motors rewired to M1=right / M4=left, and direction moved into the firmware's
+  per-motor `*_MOTOR_DIR` constants, which replace the `_send_motors()` sign flip described
+  next. Retest this after the bench calibration. A reversed or mixed-up wheel on the old wiring
+  may have been the cause.)* The
   Arduino was found to drive backward for positive PWM; fixed by flipping the sign only on the
   two bytes written in `_send_motors()` (see "Arduino firmware protocol" above). Retested once
   at `left_pwm=right_pwm=100`: the robot turned RIGHT instead of driving straight. Hypothesis —
@@ -473,7 +489,14 @@ conda run -n logots python src/logots_ui.py
   `i2s2` via `jetson-io.py` → "Configure header pins manually"; user confirmed all sensors working after.
   If audio drops out again, check that live config against `header_pinouts.png` first.
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
-- Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. The drive motors are simple **non-feedback** motors (no encoders / no velocity readback) — a feedback-capable drivetrain is planned for the next body iteration.
+- Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. **2026-10-03**: the drive motors' built-in JGA25-370 encoders are now wired up, and the motors were rewired to M1=right, M4=left. The right motor is noticeably stiffer to turn by hand, a likely cause of Open bug #1's drift to the right. The Arduino is now powered from the 12V battery through a 9V buck converter, and the shield takes 12V on EXT_PWR (see `src/pinout.txt` §6; the shield's PWR jumper must be off). Encoder counts are read back to the GUI (see "Arduino firmware protocol"). **Next (task 2)**: use them in `PositionEstimator` in place of the PWM speed model.
+- **Bench calibration pending after the 2026-10-03 firmware flash**: in the firmware's calibration block, check
+  - pan: 0 = front and +45 turns left; otherwise set `PAN_DIR = -1`, and trim `PAN_CENTER_DEG`
+  - wheels raised, W: does each wheel spin forward? otherwise flip that wheel's `*_MOTOR_DIR`
+  - encoder signs: done by a hand-turn test, `LEFT_ENC_DIR = +1`, `RIGHT_ENC_DIR = -1`
+    (mirror-mounted motor)
+
+  Then reflash once with the corrected values. The other four still default to `90`/`+1`.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The capture loop is **drift-compensated**: it waits `PERIOD_MS` minus the time the tick's work took, so the actual rate tracks `TARGET_FPS` (default **10 Hz**, set in `logots_ui.py`) as long as the per-tick work fits inside the period. The header shows a live `FPS:actual/target` readout (green within 10% of target, amber below) — run on the Jetson and, if it can't hold green, set `TARGET_FPS` just under the sustained value. The camera runs at `CAMERA_FPS` (default 15, down from the sensor's 30) since the loop only keeps the latest frame; if `nvarguscamerasrc` rejects that framerate for its sensor mode, raise it or drop frames downstream with a `videorate` element. Recordings are timestamped, so sim playback is unaffected by the exact rate.
