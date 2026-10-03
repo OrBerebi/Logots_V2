@@ -245,6 +245,42 @@ that report's asks #2/#3) closes the loop from this side:
   joystick/keyboard driving while `ActionReader` is also driving is unguarded (last write wins)
   — fine for now since the two aren't expected to run at once, revisit if that changes.
 
+## Note for Asaph — 2026-10-03 changes relevant to the LLM/functions layer
+
+Nothing in the `:8787`/`:8788` API *shapes* changed — `pos_x`/`pos_y`/`heading` are still the
+same fields, same units. What changed is how trustworthy they are, plus two numbers worth
+baking into `approach_plant` reasoning if you ever have the LLM pick `left_pwm`/`right_pwm`/
+`duration_s` to hit a target distance:
+
+- **`pos_x`/`pos_y` are now real metric distance, not a rough guess.** Previously
+  `PositionEstimator` modelled forward speed from commanded PWM only (`ROBOT_MAX_SPEED_MPS` was
+  an uncalibrated placeholder) — explicitly *not* something to trust for a real distance
+  threshold. As of today it integrates actual wheel-encoder counts (bench-measured
+  counts/rev + wheel diameter), and was live-validated against a physical tape measurement:
+  **~2% accuracy** on a ~1m drive. If `inspect_plant`'s data-side reasoning (or any future
+  action) wants to use "how far have I moved since my last observation" as a real signal —
+  e.g. "I drove 0.4m and the plant still isn't centered, something's wrong" — that number is
+  now actually meaningful, where before it wasn't.
+- **Reference numbers for duration_s math**, from live floor tests (not the no-load bench
+  numbers — those overstate real-world speed): at **PWM 150, forward speed ≈ 0.16-0.17 m/s**
+  under real floor load. **Minimum PWM to move at all is ≈65** — anything below that and the
+  wheels don't turn (stiction), so a chosen `left_pwm`/`right_pwm` below ~65 will silently do
+  nothing for the commanded `duration_s`. If you ever want the LLM (or a wrapper around it) to
+  convert "move roughly N metres" into a PWM+duration pair, `duration_s ≈ N / 0.165` at
+  PWM≈150 is a reasonable starting point — not precise (floor friction varies), but much
+  better than guessing.
+- **Equal `left_pwm`=`right_pwm` now actually drives straight**, or close to it. Found today
+  that even matched PWM was curving 30-40° over a ~6s drive under real floor load (a real
+  motor/floor asymmetry, not a decoding issue) — added a gyro-assisted correction
+  (`_straight_trim()` in `logots_ui.py`, transparent to any caller) that cuts that to roughly
+  1-1.4°/s residual. `knowledge/actions.md`'s `approach_plant` doc already says "equal values =
+  straight" — that description is now much closer to physically true than it was before today.
+- **No action needed on your side unless you want to use the above** — this is a
+  heads-up, not a breaking change. The `:8787` frame API and `:8788` action contract are
+  unchanged; existing `functions.py`/`mrt_reflective.py` code keeps working exactly as before.
+- Unrelated to today, still open and still yours: **Open bug #2** (`inspect_plant` decoding
+  loop, see "Known issues" below) — not touched this session.
+
 ## Voice assistant ("Hey Jarvis" → local LLM → spoken action)
 
 `src/audio_on_demand.py` (wake word → `Ears` → `LlamaCppBrain` → action → `speak`) now runs
