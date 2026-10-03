@@ -127,10 +127,21 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 │  ACTION (last voice │                     │
 │  command decided)   │                     │
 └─────────────────────┴─────────────────────┘
-  L +000  R +000  EL ----  ER ----  PAN:+00°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP
+  L +000  R +000  PAN:+00°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  OFF
 ```
-- Position mini-map (bottom of DRIVE & CAM): top-down trail of the dead-reckoned body
-  position with a heading arrow; `⌖ POS` in the status bar zeros the estimate (origin = here).
+- Position mini-map (bottom of DRIVE & CAM, redesigned 2026-10-03, 200×200px): **robot-centered**
+  — the heading arrow stays fixed at the canvas center, and the background (1m gridlines +
+  trail) pans underneath it as the robot moves, like a radar display, instead of the old
+  auto-zoom-to-fit-the-whole-trail behavior. Fixed scale (`POS_MAP_PX_PER_M`=28, ~±3.6m visible
+  each direction) so the gridlines are meaningful, labeled distance marks from the session/
+  recording origin (brighter axis line + a small circle marker when the origin is in view) —
+  older trail points scroll off-canvas as the robot moves on, which is expected for this
+  local-area style. `⌖ POS` in the status bar zeros the estimate (origin = here).
+- **Encoder counts (`EL`/`ER`) are read internally (feed `PositionEstimator`) but are no
+  longer shown in the GUI** (removed 2026-10-03, once the position feature built on them was
+  validated) — internal/debug data, not something the user needs to see.
+- **`OFF` button (2026-10-03)**: closes the GUI application only — does **not** shut down the
+  Jetson. Confirms first, flushes any active recording, sends a final motor-stop, then exits.
 - Header `⬤ MIC:`/`⬤ LLM:` indicators and the AUDIO INPUT panel's `ACTION` row are the voice
   assistant's status — see "Voice assistant" below. All status glyphs use the same plain `⬤`
   dingbat as the connection indicator (not emoji — the deployed GUI's font has no color-emoji
@@ -164,11 +175,17 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `pos_y` | float | estimated body Y position (m), origin = recording start |
 | `heading` | float | body heading (°) used for the estimate = IMU yaw at that tick |
 
-> **Position is a dead-reckoning estimate, not measured odometry.** There are no wheel
-> encoders, so `PositionEstimator` models forward speed as `K_V·(left_pwm+right_pwm)/2`
-> with direction from the IMU yaw, integrated per tick. Accuracy depends on the
-> `ROBOT_MAX_SPEED_MPS` constant (currently a guess — calibrate on the robot). Columns are
-> optional: recordings made before this feature lack them and still replay (origin/0.0).
+> **Position is dead-reckoned from wheel encoders + IMU heading (2026-10-03), not measured
+> odometry.** `PositionEstimator` computes each tick's forward distance from the two wheels'
+> encoder count deltas (`LEFT_COUNTS_PER_REV`=3286, `RIGHT_COUNTS_PER_REV`=3208, wheel
+> diameter 2.78in — all bench-measured) averaged together, with direction from the IMU yaw
+> (not from the encoders — the two wheels' counts-per-rev already differ by ~2%, not precise
+> enough for differential heading on top of the IMU). It falls back to the old
+> `K_V·(left_pwm+right_pwm)/2` PWM model (`ROBOT_MAX_SPEED_MPS`, still an uncalibrated guess)
+> only on a tick where the encoder read-back fails. Real distance accuracy now depends on the
+> bench measurements above and on the drivetrain not slipping, rather than on PWM calibration.
+> Columns are optional: recordings made before this feature lack them and still replay
+> (origin/0.0); recordings made before 2026-10-03 hold PWM-model positions, not encoder-based.
 
 ### Architecture notes
 - Each capture tick builds a snapshot trio under `self._frame_lock`: `latest_frame` (CSV-shaped dict), `latest_frame_bgr` (BGR numpy image or None), and `latest_decoded` (parsed IMU tuples + audio floats for the widgets). All GUI monitoring widgets render from this snapshot in both Real and Sim modes.
@@ -412,20 +429,17 @@ conda run -n logots python src/logots_ui.py
   when `functions.py`'s `LlamaCppVisionBrain` starts — needed since the GUI's embedded voice
   assistant already has one up.
 
-  **Open bug #1 (hardware/Or's side) — motor direction, UNTESTED at recommended PWM:**
-  *(2026-10-03: motors rewired to M1=right / M4=left, and direction moved into the firmware's
-  per-motor `*_MOTOR_DIR` constants, which replace the `_send_motors()` sign flip described
-  next. Retest this after the bench calibration. A reversed or mixed-up wheel on the old wiring
-  may have been the cause.)* The
-  Arduino was found to drive backward for positive PWM; fixed by flipping the sign only on the
-  two bytes written in `_send_motors()` (see "Arduino firmware protocol" above). Retested once
-  at `left_pwm=right_pwm=100`: the robot turned RIGHT instead of driving straight. Hypothesis —
-  PWM 100 may be below stiction threshold for one wheel — is UNCONFIRMED: `functions.py` never
-  issued another `approach_plant` call across 6 subsequent runs (see bug #2), so a retest at a
-  higher PWM (~255) never happened. To test in isolation without depending on `functions.py`:
-  drive both wheel joystick/keyboard commands equal and forward from the GUI directly and watch
-  whether it still turns. If it does turn at 255 too, this points to a real hardware asymmetry
-  (weak motor, wiring, wheel friction) rather than a software/PWM-magnitude issue.
+  **Open bug #1 (hardware/Or's side) — motor direction, CLOSED 2026-10-03:** motors rewired to
+  M1=right/M4=left; the right wheel came up reversed on the new wiring (bench W-test: left
+  encoder climbed, right fell). Fixed at the hardware layer by swapping the two leads on the
+  right motor's connector, not firmware or software — kept `+PWM = forward` true at every layer
+  instead of adding an asymmetric correction in code (see the bench-calibration entry below for
+  the full reasoning and the considered-then-reverted `_send_motors()` approach). Retested: both
+  `EL`/`ER` climb positive on W. The old PWM-100-turns-right symptom and the original
+  `_send_motors()` global sign flip (from the pre-rewiring single-M1/M4 era) are both
+  historical at this point — see the "Stiff right motor" entry below for the follow-up bench
+  test that found the turning behavior was near-PWM-threshold stiction, not a hardware
+  asymmetry at running speed.
 
   **Open bug #2 (decoding — for Asaf) — the decision loop gets stuck on `inspect_plant`,
   reproduced 6/6 times today:** across substantially different conditions — robot far from the
@@ -489,31 +503,156 @@ conda run -n logots python src/logots_ui.py
   `i2s2` via `jetson-io.py` → "Configure header pins manually"; user confirmed all sensors working after.
   If audio drops out again, check that live config against `header_pinouts.png` first.
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
-- Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. **2026-10-03**: the drive motors' built-in JGA25-370 encoders are now wired up, and the motors were rewired to M1=right, M4=left. The right motor is noticeably stiffer to turn by hand, a likely cause of Open bug #1's drift to the right. The Arduino is now powered from the 12V battery through a 9V buck converter, and the shield takes 12V on EXT_PWR (see `src/pinout.txt` §6; the shield's PWR jumper must be off). Encoder counts are read back to the GUI (see "Arduino firmware protocol"). **Next (task 2)**: use them in `PositionEstimator` in place of the PWM speed model.
-- **Bench calibration in progress (2026-10-03)**: the firmware from commit `fd843bb` is flashed.
-  Values in its calibration block:
+- Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. **2026-10-03**: the drive motors' built-in JGA25-370 encoders are now wired up, and the motors were rewired to M1=right, M4=left. The right motor is noticeably stiffer to turn by hand, a likely cause of Open bug #1's drift to the right. The Arduino is now powered from the 12V battery through a 9V buck converter, and the shield takes 12V on EXT_PWR (see `src/pinout.txt` §6; the shield's PWR jumper must be off). Encoder counts are read back to the GUI (see "Arduino firmware protocol"). **Task 2 done 2026-10-03**: `PositionEstimator` now uses them in place of the PWM speed model (see "Recording feature" position note above).
+- **Bench calibration (2026-10-03), done on the Jetson**: the firmware from commit `fd843bb` is
+  flashed, calibration block still at its defaults (`LEFT_MOTOR_DIR=+1`, `RIGHT_MOTOR_DIR=+1`,
+  `PAN_DIR=+1`, `PAN_CENTER_DEG=90`) — no reflash was needed:
   - **encoder signs: DONE.** `LEFT_ENC_DIR = +1`, `RIGHT_ENC_DIR = -1` (mirror-mounted motor).
     Confirmed after reflash: both wheels count up when turned forward by hand (Serial Monitor).
-  - **motor directions: TODO, next on the Jetson.** Wheels raised, run the GUI, tap W, then
-    watch `EL`/`ER`. Each one that climbs is a wheel spinning forward; one that falls is
-    reversed, so flip that wheel's `*_MOTOR_DIR`. Expect one wheel to be reversed, since the
-    motors are mirror-mounted and wired identically.
-  - **pan: TODO.** Slider 0 should face front and +45 turn left; otherwise set `PAN_DIR = -1`.
-    Trim `PAN_CENTER_DEG` if front is slightly off.
-
-  Edit the values on whichever machine, but **flashing is Mac-only** (Arduino IDE). The
-  Jetson session should commit the new values; Or then flashes from the Mac.
-- **Stiff right motor, to quantify**: the right motor is noticeably harder to turn by hand.
-  - Hold W with the wheels raised and compare how fast `EL` and `ER` climb.
-  - Find each wheel's minimum starting PWM.
-  - Take the wheels off and compare the bare output shafts: still stiffer means the gearbox;
-    equal means binding in the mount or wheel.
-  - Watch for L293D overheating or cut-outs (about 0.6 A per channel continuous).
-  - If the speeds differ a lot, add encoder-based speed matching between the wheels later.
-- **Counts per wheel revolution: not measured yet** (needed for task 2). Turn a wheel 5 full
-  turns by hand, tape mark to mark, and divide that side's count change by 5. Do both wheels.
-  Half-turn tests gave several hundred counts, so expect the low thousands per turn.
+  - **motor directions: DONE, fixed in hardware not firmware.** Wheels-raised W test showed left
+    climbing (+9523) and right falling (−7419) — right wheel reversed. Rather than flip
+    `RIGHT_MOTOR_DIR` (which would've meant a Mac reflash), the two leads on the right motor's
+    connector were swapped by hand. Retested: both `EL`/`ER` climb positive on W. Firmware
+    `*_MOTOR_DIR` constants and `_send_motors()` are both untouched/symmetric — considered,
+    then reverted, a software-side flip in `_send_motors()` in favor of this hardware fix, since
+    it keeps `+PWM = forward` true at every layer instead of carrying an asymmetric correction
+    in code. Note the encoder's `RIGHT_ENC_DIR=-1` mirror-mount correction is unaffected — it's
+    on the separate Hall-sensor signal path, not the motor power leads.
+  - **pan: DONE, no change needed.** GUI slider 0 = front, +45 = left — confirmed correct
+    against `PAN_DIR=+1`/`PAN_CENTER_DEG=90` defaults.
+  - **Coast-down asymmetry observed (expected, not a bug)**: releasing W, the left wheel coasts
+    briefly before stopping while the right stops dead. Firmware's `controlMotor()` calls
+    identical `RELEASE` on both motors (L293D has no active brake, just floats the terminals) —
+    confirmed symmetric in code. The difference is mechanical: the stiff right motor (below)
+    has enough friction to stop immediately; the looser left motor coasts on momentum.
+- **Pan GUI-limited to ±45° (2026-10-03, `src/logots_ui.py` `_cam_sliders()`)**: slider range
+  narrowed from the firmware's full ±90° to ±45° for now (labels `L 45°`/`R 45°`). Firmware
+  `PAN_DIR`/`PAN_CENTER_DEG` still accept the full range — this is a GUI-only cap, no
+  calibration-block change, revert by widening the slider's `top`/`bot` back to 90.
+- **Counts per wheel revolution: MEASURED 2026-10-03** (hand-turn test, 5 full turns each,
+  wheels on the ground): left 27907→44337 (Δ16430 / 5 = **3286 counts/rev**), right
+  21805→37847 (Δ16042 / 5 = **3208 counts/rev**) — the two wheels agree within ~2.4%, consistent
+  with the earlier half-turn tests' "low thousands" estimate. `encLeft`/`encRight` are
+  `volatile int32_t` in RAM (no EEPROM) — they reset on any Arduino power-cycle/reset/reflash,
+  *not* on GUI reconnect or Sim-mode toggling; at ~3.2k counts/rev, `int32_t` wraps only after
+  roughly 670,000 wheel revolutions, not a practical concern. **Task 2 done 2026-10-03**: fed
+  into `PositionEstimator` (with wheel diameter 2.78in, bench-measured) in place of the PWM
+  speed model — see "Recording feature" position note and `src/logots_ui.py`'s
+  `PositionEstimator`.
+- **Encoder-based `PositionEstimator` validated live on the floor (2026-10-03)**: drove the
+  robot via the real `ActionReader`/`:8788` `approach_plant` path (not a side-channel — the
+  same contract `functions.py` uses) for two ~1m straight-PWM (150/150) runs. Model's computed
+  straight-line start→end displacement vs. a physical tape measurement: run 1 wasn't measured
+  (no start mark); run 2 — model said **108.3 cm**, measured (average of the two wheels'
+  tracks, left 101cm/right 111cm, since the path curved — see below) **106 cm** — **~2%
+  high**, a good match given the hand-measured wheel diameter. No constant changes made; this
+  is validation, not recalibration.
+  - **New finding — floor-load curving, not seen on the raised-wheel bench test**: both runs,
+    at equal L=R=150 PWM the whole time, curved substantially instead of driving straight
+    (heading drifted ~33-40° over ~6s). The bench test (wheels raised, no load) found the two
+    motors roughly speed-matched (ratio 0.958) — this says there's a real asymmetry that only
+    shows up under the wheels' actual floor load (weight distribution, tire contact, or the
+    stiff right motor behaving differently loaded vs. free-spinning). The position *model*
+    handled this correctly regardless (it integrates heading every tick, so a curved path is
+    still tracked accurately — confirmed by the measurement match above) but the robot itself
+    doesn't drive straight on an equal-PWM command. Worth a future closed-loop straight-drive
+    fix (e.g. trim one side's PWM, or steer off the gyro) if driving straight matters for a
+    task — not done here, out of scope for this session.
+- **Gyro-assisted straight-line trim, added 2026-10-03** (`src/logots_ui.py`,
+  `_straight_trim()`/`STRAIGHT_KP`/`STRAIGHT_KI`/`STRAIGHT_I_MAX`/`STRAIGHT_MAX_TRIM`): fixes
+  the curving above in software rather than chasing the mechanical cause. Called from
+  `_send_motors()` — the single choke point every drive command passes through (joystick,
+  keyboard, and `ActionReader`'s autonomous `approach_plant`) — so it applies automatically
+  everywhere, with no caller changes. Whenever the commanded PWM is equal and nonzero (a
+  "drive straight" command), it locks the IMU yaw at that moment and each tick applies a PI
+  correction (P on the current heading error, I on the error accumulated over time, to kill
+  the P-only controller's steady-state residual) by trimming one wheel down and the other up
+  — **only on the bytes actually sent over I2C**; `self.left_pwm`/`right_pwm` (what
+  `PositionEstimator`'s PWM fallback, the CSV, the frame API and `ActionReader` all see) stay
+  exactly as commanded. Any turn (unequal PWM) or stop passes through untouched and drops the
+  lock, so a fresh straight segment always starts clean.
+  - **Live-tuned on the floor, 2026-10-03**: uncorrected drift was ~5.6°/s (see the curving
+    finding above). First sign guess for which wheel to trim was backwards (positive feedback
+    — a 4s drive swung heading +83° instead of holding it); flipped, `STRAIGHT_KP=3.0`
+    (P-only) then held drift to ~1.4°/s, reproduced twice (+5.6°, +5.45° over separate 4s
+    runs). Tried doubling to `KP=6.0` to tighten further — went unstable instead (+133° in 4s,
+    worse than uncorrected) — reverted. Added a small integral term instead
+    (`STRAIGHT_KI=0.4`, anti-windup clamped at `STRAIGHT_I_MAX=40`) without touching `KP`,
+    which got a 4s run down to +3.87° without instability; the integral needs more time to
+    fully wind up, so longer drives should tighten it further. Current settings are a
+    deliberate compromise (user confirmed "good as it is") — **don't raise `STRAIGHT_KP`
+    without adding tick-by-tick error/trim logging first**, since the instability may be
+    partly the IMU being noisier while actually driving (motor electrical
+    noise/vibration) than at rest — confirmed rock-solid stationary (0.04° drift over 7s) —
+    which a higher P gain would amplify.
+  - This does not make driving perfectly straight (small residual lean remains, visually
+    confirmed — "right wheel slightly in front of the left") but is a 4-5x+ improvement over
+    uncorrected, and works transparently for autonomous `approach_plant` calls exactly as it
+    does for manual joystick/keyboard driving.
+- **Encoder-based `PositionEstimator` + straight-line trim validated together on real
+  autonomous drives, 2026-10-03**: drove the robot via the actual `ActionReader`/`:8788`
+  `approach_plant` contract (not a side-channel), with camera frames pulled before each drive
+  purely as a safety check (never for distance measurement — physical tape/tile measurements
+  were used for that, per the user's instruction). One ~1m run: model computed 108.3cm
+  straight-line displacement; physical measurement (average of the two wheels' tracks, which
+  differed — 101cm/111cm — since the path curved) was 106cm, a **~2% match**. Confirms the
+  bench-measured wheel diameter/counts-per-rev are accurate enough for this model, and that
+  the position math correctly integrates a curved (not just straight) path.
+- **GUI FPS regression found and fixed, 2026-10-03** — the position map redesign (above)
+  initially dropped the live FPS readout from its normal ~10/10 to ~5/10, then ~7.8/10 after a
+  partial fix, confirmed fully fixed (~9.7/10) after the real cause was found. In order:
+  1. `IMUReader`'s sampling loop (`src/logots_ui.py`) had **no rate limit at all** — no
+     `time.sleep()` anywhere in its `while` loop — so it span as fast as the I2C bus allowed
+     (likely 1000s of Hz), continuously pegging a CPU core. Capped to ~200Hz
+     (`time.sleep(0.005)`), still far faster than the Madgwick filter or the 10Hz capture tick
+     need. This alone only took FPS from ~5.3 to ~7.8 — a real fix (this loop looks
+     pre-existing, not new today) but not the dominant cause of today's specific regression.
+  2. **The actual dominant cause**: `_draw_pos_map()` called `cv.delete('all')` then rebuilt
+     every grid line/label/trail/arrow from scratch each call — and this runs inside `_loop()`,
+     the same function the FPS readout times. Benchmarked in isolation: `canvas.create_text()`
+     specifically cost ~4ms *per call* on this system (not line or polyline items — those were
+     cheap, ~0.3-2ms for the same count) — 16 grid labels recreated every tick cost ~65ms,
+     nearly the entire 100ms/tick budget, on its own explaining almost all of the FPS drop.
+     **Fixed** by rewriting `_position_map()`/`_draw_pos_map()` to pre-create a fixed pool of
+     canvas items once (10 gridlines + 10 labels per axis, trail, arrow, dot, origin marker)
+     and update them in place each redraw via `coords()`/`itemconfig()` (toggling `state`
+     'normal'/'hidden' for the currently-unused pool slots) instead of delete+recreate —
+     benchmarked at ~0.3ms for the same 16-label update, a ~200x improvement. No functional
+     change to what's drawn, confirmed via screenshot (grid, trail, and arrow all render
+     identically to the delete/recreate version, just far cheaper).
+  - **Lesson if this class of bug shows up again**: on this system, `tkinter.Canvas`
+    `create_*` calls (especially `create_text`) are fine for one-time setup but far too slow
+    to call repeatedly inside a hot per-tick loop — always pre-create canvas items once and
+    update them via `coords()`/`itemconfig()`/`state` instead.
+- **Position map layout bugs found while diagnosing the above, both fixed, 2026-10-03**: the
+  200px map (enlarged from 118px — see the map redesign entry above) was being **clipped**, not
+  failing to draw — found via `gnome-screenshot` on the Jetson's `:1001.0` display (raising the
+  right window first with a small `python-xlib` snippet, since multiple windows can occupy that
+  display under NoMachine). `p_ctrl` (the DRIVE & CAM panel, `_main_panels()`) has a
+  hard-coded `width=LW,height=TH` with `pack_propagate(False)`, so its content doesn't auto-grow
+  the panel — it just silently overflows past the fixed boundary and gets cut off. The map's
+  column (pan/tilt sliders + the enlarged map, beside the 244px-wide joystick) needed both more
+  height and more width than the old `TH=310`/`LW=375` had. Grown to `TH=430`/`LW=480` (confirmed
+  by screenshot: full grid -3..3 both axes, origin crosshair, and the heading arrow all visible).
+  `p_audio` shares `LW` and `p_imu` shares `TH` for grid symmetry, so they're a little roomier
+  now too — cosmetic only, no functional change there. Also enlarged the heading arrow itself
+  (14px/width 2 → 24px/width 3, `arrowshape=(10,12,5)`) since it was hard to spot against the
+  bigger canvas even once it was actually visible.
+- **Stiff right motor — quantified and closed out (2026-10-03)**: ran a direct I2C bench script
+  (bypassing the GUI, same protocol as `_send_motors()`/`_read_encoders()`) to ramp PWM per
+  wheel and time encoder counts, wheels raised:
+  - **Minimum starting PWM: 65 for both wheels** (right showed a little creep — 4-7 counts — at
+    PWM 35-55 before properly turning at 65; left jumped cleanly straight to 65).
+  - **Speed at PWM 150, both wheels, 2s**: left 2847 counts/s, right 2973 counts/s — ratio 0.958
+    (right if anything slightly *faster*, roughly matched within ~4%).
+  - **Conclusion**: no real sustained speed/torque asymmetry between the wheels at running
+    PWM. The earlier PWM-100 right-turn drift and the coast-down asymmetry (left coasts, right
+    stops dead) are both more likely a near-threshold stiction effect (PWM 100 is close to the
+    65 minimum, where small per-wheel differences in exactly when static friction breaks can
+    swing the heading) than a hardware defect. **Next**, now that direction is fixed in
+    hardware too: retest straight-line driving at a higher PWM (200+) — if it still drifts
+    there, look at alignment/weight distribution instead of the motors.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The capture loop is **drift-compensated**: it waits `PERIOD_MS` minus the time the tick's work took, so the actual rate tracks `TARGET_FPS` (default **10 Hz**, set in `logots_ui.py`) as long as the per-tick work fits inside the period. The header shows a live `FPS:actual/target` readout (green within 10% of target, amber below) — run on the Jetson and, if it can't hold green, set `TARGET_FPS` just under the sustained value. The camera runs at `CAMERA_FPS` (default 15, down from the sensor's 30) since the loop only keeps the latest frame; if `nvarguscamerasrc` rejects that framerate for its sensor mode, raise it or drop frames downstream with a `videorate` element. Recordings are timestamped, so sim playback is unaffected by the exact rate.
-- **Calibrate `ROBOT_MAX_SPEED_MPS`** (in `logots_ui.py`) on the robot (motors are now connected): drive a known distance at full PWM for a known time and set the constant to `distance/time`. Until then `pos_x`/`pos_y` are directionally right (heading is real IMU data) but not metrically accurate, and they assume motors track commands (no encoder feedback). Position also drifts with IMU yaw drift over long sessions.
+- **`ROBOT_MAX_SPEED_MPS` is now a fallback-only constant (2026-10-03)**: `PositionEstimator`'s primary model uses encoder counts for distance (see "Recording feature" position note), so this PWM-speed guess only matters on the rare tick where the encoder read-back fails. Calibrating it is no longer a blocker for `pos_x`/`pos_y` accuracy — if it's ever worth tightening, drive a known distance at full PWM for a known time and set the constant to `distance/time`. Position still assumes no wheel slip and drifts with IMU yaw drift over long sessions.

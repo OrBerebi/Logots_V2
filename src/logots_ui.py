@@ -5,7 +5,7 @@ Panels: Drive + Arm  |  IMU orientation  |  Audio waveform  |  Video feed
 """
 
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import math
 import sys
 import time
@@ -100,12 +100,49 @@ ACCEL_OUT  = 0x3B;  GYRO_OUT   = 0x43
 ACCEL_SCALE = 16384.0;  GYRO_SCALE = 131.0
 
 # ── Position estimation ───────────────────────────────────────────────────────
-# PWM dead-reckoning: forward speed is modelled as proportional to the commanded
-# average PWM, direction taken from the IMU yaw. This is a MODEL, not measured
-# odometry (no wheel encoders) — accuracy depends on calibrating ROBOT_MAX_SPEED_MPS
-# on the real robot with the motors connected.
+# Primary model (2026-10-03): per-tick forward distance comes from real encoder counts
+# (JGA25-370 Hall encoders), not a PWM model — see PositionEstimator below. Direction still
+# comes from the IMU yaw (no encoder-based heading — the two wheels' counts-per-rev already
+# differ by ~2%, not reliable enough for differential heading on top of the IMU we already
+# have). counts-per-rev and wheel diameter are from the 2026-10-03 bench test (5 hand-turns
+# per wheel; wheel diameter measured at 2.78in outer).
+LEFT_COUNTS_PER_REV  = 3286
+RIGHT_COUNTS_PER_REV = 3208
+WHEEL_DIAMETER_M      = 2.78 * 0.0254   # = 0.0706 m
+WHEEL_CIRCUMFERENCE_M = math.pi * WHEEL_DIAMETER_M
+
+# Fallback model, used only on a tick where the encoder read-back fails (see
+# PositionEstimator.update()) — forward speed modelled as proportional to commanded average
+# PWM. ROBOT_MAX_SPEED_MPS is still an uncalibrated GUESS; fine for the rare fallback tick,
+# not a substitute for the encoder path above.
 ROBOT_MAX_SPEED_MPS = 0.30            # forward speed at |PWM|=255 — GUESS, calibrate
 K_V = ROBOT_MAX_SPEED_MPS / 255.0     # m/s per PWM unit
+
+# Gyro-assisted straight-line trim (2026-10-03): live floor tests found the robot curves
+# ~5-6°/s even at equal left_pwm=right_pwm, despite the two motors measuring roughly
+# speed-matched on the (unloaded, wheels-raised) bench test — a real floor-load asymmetry.
+# _send_motors() corrects this in software: whenever the commanded PWM is equal and
+# nonzero, it locks the IMU yaw at that moment and trims one wheel proportionally to the
+# yaw error each tick, on the wire only (self.left_pwm/right_pwm — the commanded intent used
+# by PositionEstimator's PWM fallback, the CSV and the frame API — are untouched). The sign
+# below (left wheel reduced / right increased for positive error) is a first guess from the
+# 2026-10-03 curving direction (right wheel's path measured longer than left's — see
+# CLAUDE.md) — if a straight-drive test still curves, or curves the other way, flip the sign
+# in _straight_trim().
+STRAIGHT_KP       = 3.0   # PWM counts of trim per degree of yaw error. Live-tested 2026-10-03:
+                           # KP=3 cut drift from ~5.6°/s (uncorrected) to ~1.4°/s, reproduced
+                           # twice. KP=6 was tried to tighten it further and instead went
+                           # unstable (133° drift in 4s, worse than uncorrected) — reverted.
+                           # Don't raise this without adding tick-by-tick error/trim logging
+                           # first to see the oscillation (the IMU may also be noisier while
+                           # actually driving — motor electrical noise/vibration — than at rest,
+                           # which a higher P gain would amplify).
+STRAIGHT_KI       = 0.4   # PWM counts of trim per (degree·second) of accumulated error —
+                           # added 2026-10-03 to kill the P-only controller's steady-state
+                           # residual (observed: robot visibly not quite straight, right wheel
+                           # slightly ahead) without raising KP again.
+STRAIGHT_I_MAX    = 40     # anti-windup clamp on the accumulated integral's contribution
+STRAIGHT_MAX_TRIM = 60    # clamp, so a large transient error can't stall/reverse a wheel
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C_BG      = '#1e1e2e'
@@ -197,6 +234,13 @@ class IMUReader(threading.Thread):
                 self.yaw=yaw; self.pitch=pitch; self.roll=roll
                 with self._sample_lock:
                     self._sample_buf.append((yaw, pitch, roll))
+                time.sleep(0.005)   # cap ~200Hz (2026-10-03) — this loop had no rate limit at
+                # all, spinning as fast as the I2C bus allowed (likely 1000s of Hz) and
+                # pegging a CPU core continuously; under the GIL that starves the main GUI
+                # thread of scheduling time, which is why the capture tick's actual FPS was
+                # sitting well under its 10Hz target even at rest. 200Hz is still far faster
+                # than anything downstream needs (the 10Hz capture tick just drains whatever
+                # accumulated; the Madgwick filter integrates fine at this rate).
         except Exception as e:
             self.status=f'error: {e}'
 
@@ -246,30 +290,58 @@ class IMUReader(threading.Thread):
 
 # ── Position estimator ────────────────────────────────────────────────────────
 class PositionEstimator:
-    """Dead-reckons body (x, y) in metres from commanded PWM + IMU heading.
+    """Dead-reckons body (x, y) in metres from wheel encoders + IMU heading.
 
-    Forward speed v = k_v · (left_pwm + right_pwm)/2; heading θ from IMU yaw.
-    Integrated each tick: x += v·cosθ·dt, y += v·sinθ·dt. Pure spins (L=+, R=−)
-    average to ~0 forward speed, so heading changes without translation."""
+    Forward distance per tick is the average of each wheel's measured displacement
+    (encoder count delta / that wheel's counts-per-rev · wheel circumference); heading θ
+    comes from the IMU yaw, not the encoders (the two wheels' counts-per-rev already differ
+    by ~2%, not precise enough for differential heading on top of the IMU we already have).
+    Integrated each tick: x += d·cosθ, y += d·sinθ. Pure spins (L=+, R=−) average to ~0 net
+    wheel displacement, so heading changes without translation.
 
-    def __init__(self, k_v=K_V):
+    Falls back to the old PWM-speed model (v = k_v·(left_pwm+right_pwm)/2, integrated over
+    dt) for any tick where the encoder read-back fails (enc_left/enc_right is None) — e.g. a
+    bad I2C read. Once readings resume, the encoder delta is computed against the last good
+    count, so no distance is lost across a brief gap; only that one tick's distance comes
+    from the (less accurate) PWM model instead of being skipped outright."""
+
+    def __init__(self, k_v=K_V,
+                 left_counts_per_rev=LEFT_COUNTS_PER_REV,
+                 right_counts_per_rev=RIGHT_COUNTS_PER_REV,
+                 wheel_circumference_m=WHEEL_CIRCUMFERENCE_M):
         self.k_v = k_v
+        self.left_counts_per_rev    = left_counts_per_rev
+        self.right_counts_per_rev   = right_counts_per_rev
+        self.wheel_circumference_m  = wheel_circumference_m
         self.reset()
 
     def reset(self):
         self.x = self.y = self.heading = 0.0
         self._t = None
+        self._last_enc_left = self._last_enc_right = None
 
-    def update(self, left_pwm, right_pwm, yaw_deg, now=None):
+    def update(self, enc_left, enc_right, left_pwm, right_pwm, yaw_deg, now=None):
         now = now if now is not None else time.monotonic()
+        have_enc = enc_left is not None and enc_right is not None
         if self._t is None:                 # first sample: seed time + heading only
-            self._t = now; self.heading = yaw_deg; return
+            self._t = now; self.heading = yaw_deg
+            if have_enc: self._last_enc_left, self._last_enc_right = enc_left, enc_right
+            return
         dt = now - self._t; self._t = now
         if dt <= 0 or dt > 0.5: return      # guard stalls / first big gap
-        v  = self.k_v * (left_pwm + right_pwm) / 2.0
+        if have_enc and self._last_enc_left is not None:
+            dist_l = ((enc_left  - self._last_enc_left)  / self.left_counts_per_rev
+                       * self.wheel_circumference_m)
+            dist_r = ((enc_right - self._last_enc_right) / self.right_counts_per_rev
+                       * self.wheel_circumference_m)
+            forward = (dist_l + dist_r) / 2.0
+        else:                                # encoder read failed this tick: PWM fallback
+            forward = self.k_v * (left_pwm + right_pwm) / 2.0 * dt
+        if have_enc:
+            self._last_enc_left, self._last_enc_right = enc_left, enc_right
         th = math.radians(yaw_deg)
-        self.x += v * math.cos(th) * dt
-        self.y += v * math.sin(th) * dt
+        self.x += forward * math.cos(th)
+        self.y += forward * math.sin(th)
         self.heading = yaw_deg
 
 # ── Audio reader ──────────────────────────────────────────────────────────────
@@ -815,6 +887,9 @@ class RobotControlGUI:
         self.pan_angle=0     # -90…+90, 0 = camera facing front, + = left
         self.tilt_angle=90
         self.enc_left=self.enc_right=None   # cumulative encoder counts; None = no reading
+        self._straight_target=None   # locked IMU yaw for the gyro straight-line trim, see _straight_trim()
+        self._straight_integral=0.0  # accumulated yaw error for the trim's integral term
+        self._straight_t=None        # time.monotonic() of the last _straight_trim() call
 
         self._pos_est   = PositionEstimator()
         self._pos_trail = collections.deque(maxlen=400)  # (x,y) points for the mini-map
@@ -881,7 +956,13 @@ class RobotControlGUI:
         f.pack(padx=16,pady=4)
         # Original 2×2 grid of big blocks, unchanged in size/height — the former
         # full-width bottom status bar is now a sidebar to its left instead.
-        SW=190; LW=375; RW=415; TH=310; BH=220; GAP=6
+        SW=190; LW=480; RW=415; TH=430; BH=220; GAP=6  # LW/TH grown 2026-10-03 (were 375/310):
+        # the enlarged 200px position map (was 118px) sits in a column beside the 244px-wide
+        # joystick, and together with the pan/tilt sliders above it, that column no longer fit
+        # in the old fixed width *or* height — p_ctrl's content was silently being clipped by
+        # pack_propagate(False) on both axes, not failing to draw (p_audio shares LW and
+        # p_imu shares TH for grid symmetry, so they grow a little too and just get more
+        # padding — no layout change needed there)
         p_side  = tk.Frame(f,bg=C_BG,   width=SW,height=TH+GAP+BH)
         p_ctrl  = tk.Frame(f,bg=C_PANEL,width=LW,height=TH)
         p_imu   = tk.Frame(f,bg=C_PANEL,width=RW,height=TH)
@@ -953,9 +1034,10 @@ class RobotControlGUI:
         self._pwm(); self._draw_joy()
 
     def _cam_sliders(self,parent):
-        # pan: -90…+90 (0 = front, + = left); tilt: 0…180
+        # pan: -45…+45 (GUI-limited, 2026-10-03; firmware still accepts -90…+90) (0 = front,
+        # + = left); tilt: 0…180
         for attr,label,top,bot,init,top_txt,bot_txt in [
-                ('pan', 'PAN', 90, -90,0, 'L 90°','R 90°'),
+                ('pan', 'PAN', 45, -45,0, 'L 45°','R 45°'),
                 ('tilt','TILT',180,0,  90,'180°', '0°')]:
             f=tk.Frame(parent,bg=C_PANEL); f.pack(side='left',padx=2)
             _plbl(f,label,font=('Courier',8,'bold')).pack(pady=(4,0))
@@ -971,49 +1053,99 @@ class RobotControlGUI:
             _plbl(f,bot_txt,font=('Courier',7)).pack(pady=(0,4))
 
     # ── Position mini-map ─────────────────────────────────────────────────────
-    POS_MAP = 118   # canvas size (px) for the top-down trail
+    POS_MAP        = 200   # canvas size (px), enlarged 2026-10-03 (was 118, "too small")
+    POS_MAP_PX_PER_M = 28  # fixed scale — ~±3.6m visible each direction from the robot
+
+    POS_MAP_N_GRID = 10   # pool size per axis — more than the ~9 gridlines ever visible at once
 
     def _position_map(self,parent):
         _plbl(parent,'POSITION (m)',font=('Courier',7,'bold')).pack(pady=(2,0))
-        self.pos_cv=tk.Canvas(parent,width=self.POS_MAP,height=self.POS_MAP,
-                              bg='#16162a',highlightthickness=1,
-                              highlightbackground=C_BORDER)
-        self.pos_cv.pack(pady=(1,0))
+        cv=tk.Canvas(parent,width=self.POS_MAP,height=self.POS_MAP,
+                     bg='#16162a',highlightthickness=1,highlightbackground=C_BORDER)
+        cv.pack(pady=(1,0))
+        self.pos_cv=cv
+        # Pre-create a fixed pool of canvas items, updated in place every redraw via
+        # coords()/itemconfig() instead of delete()+create() — found 2026-10-03 that
+        # recreating ~16 canvas text items cost ~65ms total on this system (each
+        # create_text() ~4ms), blowing most of the capture tick's 100ms budget and dragging
+        # FPS from 10 down to ~5. Updating pre-existing items costs ~0.02ms each instead.
+        # Creation order here also fixes the stacking order permanently (grid under trail
+        # under arrow/dot), so it never needs re-asserting on redraw.
+        N=self.POS_MAP_N_GRID
+        self._map_vlines =[cv.create_line(0,0,0,self.POS_MAP,fill='#25253a') for _ in range(N)]
+        self._map_hlines =[cv.create_line(0,0,self.POS_MAP,0,fill='#25253a') for _ in range(N)]
+        self._map_vlabels=[cv.create_text(0,0,text='',fill=C_SUB,font=('Courier',6),anchor='nw') for _ in range(N)]
+        self._map_hlabels=[cv.create_text(0,0,text='',fill=C_SUB,font=('Courier',6),anchor='nw') for _ in range(N)]
+        self._map_origin = cv.create_oval(0,0,0,0,outline=C_SUB,fill='',state='hidden')
+        self._map_trail  = cv.create_line(0,0,0,0,fill=C_BLUE,width=1,state='hidden')
+        self._map_arrow  = cv.create_line(0,0,0,0,fill=C_GREEN,width=3,arrow='last',arrowshape=(10,12,5))
+        self._map_dot    = cv.create_oval(0,0,0,0,fill=C_BLUE_HI,outline='')
         self._draw_pos_map()
 
     def _draw_pos_map(self):
-        """Auto-scaled top-down view of the trail; +X right, +Y up, heading arrow."""
-        cv=self.pos_cv; S=self.POS_MAP; cv.delete('all')
+        """Robot-centered top-down map (2026-10-03 redesign): the heading arrow stays fixed
+        at the canvas center; the background (metre gridlines + trail) pans under it as the
+        robot moves, like a radar/mini-map display, instead of the whole trail being
+        auto-zoomed to fit. Fixed scale (POS_MAP_PX_PER_M) so the gridlines are always
+        meaningful distance marks, not a shrinking/growing scale. +X right, +Y up on screen.
+        Updates the item pool created in _position_map() in place — see that method's
+        comment for why (performance)."""
+        cv=self.pos_cv; S=self.POS_MAP; PPM=self.POS_MAP_PX_PER_M
         pts=list(self._pos_trail)
-        # world bounds (always include origin), with a minimum span so a still
-        # robot doesn't zoom to infinity
-        xs=[p[0] for p in pts]+[0.0]; ys=[p[1] for p in pts]+[0.0]
-        xmin,xmax=min(xs),max(xs); ymin,ymax=min(ys),max(ys)
-        span=max(xmax-xmin, ymax-ymin, 0.5); pad=span*0.15+1e-6
-        cx=(xmin+xmax)/2; cy=(ymin+ymax)/2
-        half=span/2+pad
+        rx,ry = pts[-1] if pts else (0.0,0.0)   # robot's current world position
+        heading = self.latest_frame.get('heading',0.0) if self.latest_frame else 0.0
+        cxp=cyp=S/2   # the robot is always drawn here — canvas center never moves
         def to_px(wx,wy):
-            px=(wx-cx)/(2*half)*(S-8)+S/2
-            py=S/2-(wy-cy)/(2*half)*(S-8)   # +Y up
-            return px,py
-        # grid crosshair through origin
+            return cxp+(wx-rx)*PPM, cyp-(wy-ry)*PPM   # world -> screen, robot-centered
+        # metre gridlines, panning with the robot — origin's axis line drawn brighter so you
+        # can always tell which way back to the start (session/recording origin) is
+        half_m = (S/2)/PPM
+        xs = list(range(math.floor(rx-half_m), math.ceil(rx+half_m)+1))
+        ys = list(range(math.floor(ry-half_m), math.ceil(ry+half_m)+1))
+        for i,item in enumerate(self._map_vlines):
+            if i<len(xs):
+                gx=xs[i]; px,_=to_px(gx,ry)
+                cv.coords(item,px,0,px,S); cv.itemconfig(item,fill=(C_SUB if gx==0 else '#25253a'),state='normal')
+            else:
+                cv.itemconfig(item,state='hidden')
+        for i,item in enumerate(self._map_vlabels):
+            if i<len(xs) and xs[i]!=0:
+                px,_=to_px(xs[i],ry)
+                cv.coords(item,px+2,2); cv.itemconfig(item,text=str(xs[i]),state='normal')
+            else:
+                cv.itemconfig(item,state='hidden')
+        for i,item in enumerate(self._map_hlines):
+            if i<len(ys):
+                gy=ys[i]; _,py=to_px(rx,gy)
+                cv.coords(item,0,py,S,py); cv.itemconfig(item,fill=(C_SUB if gy==0 else '#25253a'),state='normal')
+            else:
+                cv.itemconfig(item,state='hidden')
+        for i,item in enumerate(self._map_hlabels):
+            if i<len(ys) and ys[i]!=0:
+                _,py=to_px(rx,ys[i])
+                cv.coords(item,2,py+2); cv.itemconfig(item,text=str(ys[i]),state='normal')
+            else:
+                cv.itemconfig(item,state='hidden')
+        # origin marker (session/recording start), only shown while it's in view
         ox,oy=to_px(0.0,0.0)
-        cv.create_line(0,oy,S,oy,fill='#25253a')
-        cv.create_line(ox,0,ox,S,fill='#25253a')
-        cv.create_oval(ox-2,oy-2,ox+2,oy+2,outline=C_SUB,fill='')  # origin marker
-        # trail polyline
+        if 0<=ox<=S and 0<=oy<=S:
+            cv.coords(self._map_origin,ox-3,oy-3,ox+3,oy+3); cv.itemconfig(self._map_origin,state='normal')
+        else:
+            cv.itemconfig(self._map_origin,state='hidden')
+        # trail polyline, in the same panning frame — older points scroll off-canvas
+        # naturally as the robot moves on, newest end always meets the center arrow
         if len(pts)>=2:
             flat=[]
             for wx,wy in pts:
                 px,py=to_px(wx,wy); flat+=[px,py]
-            cv.create_line(*flat,fill=C_BLUE,width=1)
-        # current position + heading arrow
-        if pts:
-            wx,wy=pts[-1]; px,py=to_px(wx,wy)
-            th=math.radians(self.latest_frame.get('heading',0.0) if self.latest_frame else 0.0)
-            ax=px+10*math.cos(th); ay=py-10*math.sin(th)
-            cv.create_line(px,py,ax,ay,fill=C_GREEN,width=2,arrow='last')
-            cv.create_oval(px-3,py-3,px+3,py+3,fill=C_BLUE_HI,outline='')
+            cv.coords(self._map_trail,*flat); cv.itemconfig(self._map_trail,state='normal')
+        else:
+            cv.itemconfig(self._map_trail,state='hidden')
+        # heading arrow — always at the fixed canvas center
+        th=math.radians(heading)
+        ax=cxp+24*math.cos(th); ay=cyp-24*math.sin(th)
+        cv.coords(self._map_arrow,cxp,cyp,ax,ay)
+        cv.coords(self._map_dot,cxp-4,cyp-4,cxp+4,cyp+4)
 
     # ── Audio panel ───────────────────────────────────────────────────────────
     def _audio_panel(self,parent):
@@ -1151,13 +1283,15 @@ class RobotControlGUI:
             w.pack(fill='x',padx=10,pady=pady); return w
         self.lbl_lm =_vallbl(p,'L:  +000',fg=C_BLUE,width=12)
         self.lbl_rm =_vallbl(p,'R:  +000',fg=C_BLUE,width=12)
-        self.lbl_el =_vallbl(p,'EL: ----',fg=C_BLUE,width=13)   # encoder counts
-        self.lbl_er =_vallbl(p,'ER: ----',fg=C_BLUE,width=13)
+        # Encoder counts (EL/ER) are read each tick and feed PositionEstimator (see
+        # "Arduino firmware protocol"/_read_encoders()) but are no longer shown in the GUI —
+        # internal/debug data the user doesn't need to see (removed 2026-10-03 once the
+        # position feature built on them was validated).
         self.lbl_pan=_vallbl(p,'PAN:+00°',fg=C_GREEN,width=12)
         self.lbl_tlt=_vallbl(p,'TLT:090°',fg=C_AMBER,width=12)
         self.lbl_pos=_vallbl(p,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
         self.lbl_hdg=_vallbl(p,'HDG:000°',fg=C_GREEN,width=12)
-        pk(self.lbl_lm,(12,3)); pk(self.lbl_rm); pk(self.lbl_el); pk(self.lbl_er)
+        pk(self.lbl_lm,(12,3)); pk(self.lbl_rm)
         pk(self.lbl_pan); pk(self.lbl_tlt)
         pk(self.lbl_pos); pk(self.lbl_hdg)
         pk(_btn(p,'⌖  POS',C_SUB,self._reset_pos),(8,4))
@@ -1170,6 +1304,8 @@ class RobotControlGUI:
         self.btn_rec=_btn(p,'⚫  REC',C_SUB,self._toggle_rec); pk(self.btn_rec)
         _hline(p)
         pk(_btn(p,'■  STOP',C_RED,self._estop),(8,8))
+        _hline(p)
+        pk(_btn(p,'OFF',C_RED,self._off),(8,8))
         pk(_lbl(p,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8),
                 justify='center',wraplength=150),(4,4))
         self.lbl_tx=_lbl(p,'',fg=C_SUB,font=('Courier',8),
@@ -1204,6 +1340,19 @@ class RobotControlGUI:
 
     def _estop(self):
         self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0; self._draw_joy()
+
+    def _off(self):
+        """Closes the GUI app only — does NOT shut down the Jetson itself. Confirms first
+        (closing stops the voice assistant / frame API / actuation endpoint too), zeros and
+        sends a final motor-stop, flushes any active recording, then exits the process."""
+        if not messagebox.askyesno('Close GUI', 'Close the robot control GUI?'):
+            return
+        if self._rec_manager.active:
+            self._rec_manager.stop()
+        self.left_pwm = self.right_pwm = 0
+        self._send_motors()
+        self.root.destroy()
+        sys.exit(0)
 
     def _reset_pos(self):
         """Zero the position estimate (origin = here). Blocked during sim."""
@@ -1250,7 +1399,7 @@ class RobotControlGUI:
             self.lbl_tx.config(text=f'SIM load failed: {e}'[:44]); return
         if self._rec_manager.active: self._toggle_rec()
         self._pre_sim_angles=(self.pan_angle,self.tilt_angle)
-        self.enc_left=self.enc_right=None; self._update_enc_labels()   # not replayed
+        self.enc_left=self.enc_right=None   # not replayed
         self.sim_player=player; self.sim_mode=True; self._sim_ended=False
         self._pos_trail.clear()                             # replay draws the recorded path
         self.btn_sim.config(text='⏹  REAL',bg=C_BLUE)
@@ -1282,9 +1431,37 @@ class RobotControlGUI:
         self.lbl_pan.config(text=f'PAN:{pa:+03d}°')
         self.lbl_tlt.config(text=f'TLT:{ta:03d}°')
 
-    def _update_enc_labels(self):
-        for lbl,name,v in ((self.lbl_el,'EL',self.enc_left),(self.lbl_er,'ER',self.enc_right)):
-            lbl.config(text=f'{name}: ----' if v is None else f'{name}: {v:+08d}')
+    def _straight_trim(self, l, r):
+        """Gyro-assisted straight-line correction (PI on yaw error) — see the STRAIGHT_KP/KI
+        comments above. Only engages when commanded PWM is equal and nonzero (straight
+        forward/backward); any turn (unequal PWM) or stop passes through untouched, drops the
+        heading lock, and resets the integral so it doesn't carry over into the next straight
+        run."""
+        now = time.monotonic()
+        if l != r or l == 0 or not self.imu_reader:
+            self._straight_target = None
+            self._straight_integral = 0.0
+            self._straight_t = None
+            return l, r
+        yaw = self.imu_reader.yaw
+        if self._straight_target is None:
+            self._straight_target = yaw
+            self._straight_integral = 0.0
+            self._straight_t = now
+            return l, r
+        dt = now - self._straight_t; self._straight_t = now
+        err = (yaw - self._straight_target + 180) % 360 - 180   # wrap to [-180,180]
+        if 0 < dt < 0.5:   # guard stalls/big gaps, same as PositionEstimator
+            self._straight_integral = max(-STRAIGHT_I_MAX, min(STRAIGHT_I_MAX,
+                                           self._straight_integral + err*dt))
+        trim = STRAIGHT_KP*err + STRAIGHT_KI*self._straight_integral
+        trim = max(-STRAIGHT_MAX_TRIM, min(STRAIGHT_MAX_TRIM, trim))
+        sign = 1 if l > 0 else -1    # reverse correction direction when backing up
+        # Sign flipped 2026-10-03 live test: the first guess (l-=trim, r+=trim) was positive
+        # feedback — a 4s drive swung heading +83° instead of holding it. This is the opposite.
+        l2 = max(-255, min(255, l + int(round(sign*trim))))
+        r2 = max(-255, min(255, r - int(round(sign*trim))))
+        return l2, r2
 
     def _send_motors(self):
         l=self.left_pwm; r=self.right_pwm
@@ -1293,7 +1470,11 @@ class RobotControlGUI:
         if not(self.connected and self.i2c):
             self.lbl_tx.config(text='(not sent)'); return
         # Positive PWM = forward on the wire too; each wheel's hardware direction is
-        # corrected in the firmware's calibration block (LEFT/RIGHT_MOTOR_DIR).
+        # corrected in the firmware's calibration block (LEFT/RIGHT_MOTOR_DIR). l/r are
+        # further trimmed by _straight_trim() for the gyro-assisted straight-line correction
+        # — self.left_pwm/right_pwm (the commanded intent) stay untouched for everything else
+        # (PositionEstimator's PWM fallback, the CSV, the frame API).
+        l,r = self._straight_trim(l,r)
         msg=f'{l},{r},{pa},{ta}\n'.encode()
         try:
             if SMBUS2:
@@ -1320,7 +1501,6 @@ class RobotControlGUI:
             except Exception:
                 pass
         self.enc_left,self.enc_right=el,er
-        self._update_enc_labels()
 
     # ── Sensor startup ────────────────────────────────────────────────────────
     def _start_sensors(self):
@@ -1372,7 +1552,8 @@ class RobotControlGUI:
         audio_samps = self.audio_reader.drain_samples() if self.audio_reader  else []
         yaw_now = (imu_samples[-1][0] if imu_samples
                    else (self.imu_reader.yaw if self.imu_reader else 0.0))
-        self._pos_est.update(self.left_pwm, self.right_pwm, yaw_now)
+        self._pos_est.update(self.enc_left, self.enc_right,
+                              self.left_pwm, self.right_pwm, yaw_now)
         frame = {
             'frame_id':      self._rec_frame_id,
             'timestamp':     datetime.now().isoformat(),
