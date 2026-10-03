@@ -490,13 +490,29 @@ conda run -n logots python src/logots_ui.py
   If audio drops out again, check that live config against `header_pinouts.png` first.
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
 - Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. **2026-10-03**: the drive motors' built-in JGA25-370 encoders are now wired up, and the motors were rewired to M1=right, M4=left. The right motor is noticeably stiffer to turn by hand, a likely cause of Open bug #1's drift to the right. The Arduino is now powered from the 12V battery through a 9V buck converter, and the shield takes 12V on EXT_PWR (see `src/pinout.txt` §6; the shield's PWR jumper must be off). Encoder counts are read back to the GUI (see "Arduino firmware protocol"). **Next (task 2)**: use them in `PositionEstimator` in place of the PWM speed model.
-- **Bench calibration pending after the 2026-10-03 firmware flash**: in the firmware's calibration block, check
-  - pan: 0 = front and +45 turns left; otherwise set `PAN_DIR = -1`, and trim `PAN_CENTER_DEG`
-  - wheels raised, W: does each wheel spin forward? otherwise flip that wheel's `*_MOTOR_DIR`
-  - encoder signs: done by a hand-turn test, `LEFT_ENC_DIR = +1`, `RIGHT_ENC_DIR = -1`
-    (mirror-mounted motor)
+- **Bench calibration in progress (2026-10-03)**: the firmware from commit `fd843bb` is flashed.
+  Values in its calibration block:
+  - **encoder signs: DONE.** `LEFT_ENC_DIR = +1`, `RIGHT_ENC_DIR = -1` (mirror-mounted motor).
+    Confirmed after reflash: both wheels count up when turned forward by hand (Serial Monitor).
+  - **motor directions: TODO, next on the Jetson.** Wheels raised, run the GUI, tap W, then
+    watch `EL`/`ER`. Each one that climbs is a wheel spinning forward; one that falls is
+    reversed, so flip that wheel's `*_MOTOR_DIR`. Expect one wheel to be reversed, since the
+    motors are mirror-mounted and wired identically.
+  - **pan: TODO.** Slider 0 should face front and +45 turn left; otherwise set `PAN_DIR = -1`.
+    Trim `PAN_CENTER_DEG` if front is slightly off.
 
-  Then reflash once with the corrected values. The other four still default to `90`/`+1`.
+  Edit the values on whichever machine, but **flashing is Mac-only** (Arduino IDE). The
+  Jetson session should commit the new values; Or then flashes from the Mac.
+- **Stiff right motor, to quantify**: the right motor is noticeably harder to turn by hand.
+  - Hold W with the wheels raised and compare how fast `EL` and `ER` climb.
+  - Find each wheel's minimum starting PWM.
+  - Take the wheels off and compare the bare output shafts: still stiffer means the gearbox;
+    equal means binding in the mount or wheel.
+  - Watch for L293D overheating or cut-outs (about 0.6 A per channel continuous).
+  - If the speeds differ a lot, add encoder-based speed matching between the wheels later.
+- **Counts per wheel revolution: not measured yet** (needed for task 2). Turn a wheel 5 full
+  turns by hand, tape mark to mark, and divide that side's count change by 5. Do both wheels.
+  Half-turn tests gave several hundred counts, so expect the low thousands per turn.
 - Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The capture loop is **drift-compensated**: it waits `PERIOD_MS` minus the time the tick's work took, so the actual rate tracks `TARGET_FPS` (default **10 Hz**, set in `logots_ui.py`) as long as the per-tick work fits inside the period. The header shows a live `FPS:actual/target` readout (green within 10% of target, amber below) — run on the Jetson and, if it can't hold green, set `TARGET_FPS` just under the sustained value. The camera runs at `CAMERA_FPS` (default 15, down from the sensor's 30) since the loop only keeps the latest frame; if `nvarguscamerasrc` rejects that framerate for its sensor mode, raise it or drop frames downstream with a `videorate` element. Recordings are timestamped, so sim playback is unaffected by the exact rate.
