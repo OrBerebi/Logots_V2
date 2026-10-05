@@ -24,6 +24,9 @@ Asaf's side, served inside the loop.
 - args: id:string, left_pwm:int(-255..255), right_pwm:int(-255..255), duration_s:number(0.1..10)
 - what: drive toward the plant — YOU output the exact motor command: left/right
   wheel PWM (positive = forward, equal values = straight) and seconds to run
+- physics (measured on the robot): PWM below ~65 does not move the wheels at
+  all (a silent no-op); at PWM 150 real forward speed is ~0.165 m/s, so to
+  cover N metres use duration_s ≈ N / 0.165 at PWM 150
 - when: you want a closer or better view than your last look gave you
 
 ## speak
