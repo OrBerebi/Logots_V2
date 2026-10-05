@@ -11,6 +11,9 @@ knowledge/**
 !knowledge/
 !knowledge/guidelines.md
 !knowledge/actions.md
+!knowledge/identity.md
+!knowledge/functions/
+!knowledge/functions/*.md
 experiments/initiation_e/*.csv
 experiments/initiation_e_2/*.csv
 runs/
