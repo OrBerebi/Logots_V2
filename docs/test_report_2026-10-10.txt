@@ -1,0 +1,184 @@
+LIVE TEST REPORT: INITIATION AND LISTEN MODE
+Date: 2026-10-10        Tested by: Or (on the robot)        Subject: PR #6 (modular prompts + --listen voice mode)
+
+SUMMARY
+-------
+Initiation works end to end and no longer gets stuck, but classification is
+unreliable and it gives up too early from far away. Listen mode hears speech
+correctly but picks the right action only about 1 time in 7, because of how the
+audio and prompt are packaged.
+
+
+1. INITIATION
+-------------
+All 5 runs finished on their own and wrote consistent memory files. The old
+"stuck on inspect for 12 steps" loop (open bug #2) never came back. The plant
+was a spider plant; it was named correctly in 2 of 5 runs.
+
+  Run  Start dist  Steps  Drives              Result                                   Correct?
+  ---  ----------  -----  ------------------  ---------------------------------------  --------------------------------
+  1    ~1.5-2 m    4      1 x 2 s (0.32 m)    Spider plant, medium                     Yes
+  2    ~1.5-2 m    4      1 x 2 s (0.31 m)    "Dracaena or similar indoor foliage",    No - confidently wrong
+                                              medium
+  3    ~1.5-2 m    5      1 x 2 s (0.32 m)    Unknown, low (gave up)                   Honest, but quit with 7 steps left
+  4    ~1.5-2 m    4      1 x 2 s (0.33 m)    Spider plant, medium                     Yes
+  5    ~2.5 m      4      1 x 2 s (0.30 m)    Unknown, low (gave up)                   Honest, but plant still ~2.2 m away
+
+Runs 2-5 used --speak; speech was clear on the robot's speaker. The approach
+drive itself is accurate: ~0.16 m/s at PWM 150 matches the calibration, with
+1-11 cm of sideways drift.
+
+What goes wrong:
+- It always drives exactly once, for exactly 2 s. Every run copied the example
+  values from actions.md (150/150, 2.0 s). It never used the
+  duration_s ~= N / 0.165 formula, because nothing tells it how far away the
+  plant is.
+- The anti-repeat rule ends the run too early. After one drive plus one more
+  look with no species, the rule "if repeating an action is not changing what
+  you see, choose finish" fires. In run 3 the model even claimed it had
+  "approached and inspected multiple times" after a single drive.
+- From 2.5 m it cannot succeed. One 0.3 m drive leaves the plant tiny in the
+  frame, so it gives up.
+- "Medium" confidence accepts a hedge. Run 2 stored "Dracaena or similar indoor
+  foliage" as the species, which passes the success rule while being wrong.
+
+
+2. LISTEN MODE (--listen)
+-------------------------
+Listen mode hears every word correctly but answers most requests with a
+greeting. The cause is the request layout sent to llama-server, not the mic,
+the model or the schema.
+
+Live session after the silence fix (clean 3-6 s clips, one request each):
+
+  #  What was said (Gemma's own transcription)            Listen mode chose                              OK?
+  -  ---------------------------------------------------  ---------------------------------------------  ---
+  1  "Hello, who are you?"                                speak: greeting                                Yes
+  2  "What is in front of you? Check out the camera."     speak: greeting                                No
+  3  "What plants do you see in front of you?"            speak: "no plants in my memory yet"            No
+  4  "Initialize and scan the room."                      speak: greeting                                No
+  5  "What do you see in front of you?"                   speak: greeting                                No
+  6  "Do you see any plants in front of you?"             speak: "I don't see any plants" (never looked) No
+  7  "Move closer to the plant, approach the plant."      speak: greeting                                No
+
+In an earlier session, "move closer to the plant" produced
+speak("I will move closer to the plant.") - a promise with no approach_plant,
+so the robot never moved.
+
+Root cause: the old module (audio_on_demand.py decide()) sends the prompt as a
+SYSTEM message and the audio ALONE as the user message. --listen (via
+mrt_reflective.py LlamaCppVisionBrain.ask()) puts the audio and the long
+identity + actions text TOGETHER in one user message. The small model
+(Gemma 4 E2B, q4) then answers the text ("You are Logots...") instead of the
+speech.
+
+A/B test on the same 4 saved clips, same server, temperature 0:
+
+  Clip (transcription)                       Old module      --listen as shipped   Asaph's prompt+schema,   Asaph's layout,
+                                                                                   old layout               no schema
+  -----------------------------------------  --------------  --------------------  -----------------------  -------------------
+  "What is your name? ... approach the       approach_plant  greeting              "My name is Logots.      greeting
+   plant"                                                                          Which plant...?"
+  "What plants do you see in front of you?"  scan_room       "not sure what        inspect                  "not sure what
+                                                             plant"                                         plant"
+  "There's a plant in front of you.          inspect_plant   inspect               inspect                  inspect
+   Inspect it."
+  "Approach the plant."                      approach_plant  greeting              approach_plant           greeting
+                                                                                   (150/150, 2 s)
+
+Moving only the layout (prompt -> system, audio alone in the user turn) takes
+--listen from 1/4 to 4/4 reasonable decisions. Removing the JSON schema does
+not help, so the schema is not the problem.
+
+
+3. SILENCE DETECTION (fixed today, Or's side)
+---------------------------------------------
+Recordings now end about 1 s after the speaker stops, instead of running
+8-21 s and merging requests. This is in the shared Ears class
+(src/audio_on_demand.py), so the GUI's built-in assistant benefits too.
+
+Cause: the I2S mic's baseline drifts at about 1-3 Hz - inaudible, but it read
+as RMS ~150 with spikes past 400. The old silence cut-off was a fixed
+SILENCE_RMS=300, so drift kept resetting the 1 s silence countdown. After a
+100 Hz high-pass, silence reads ~4 and speech 20-170.
+
+Fix:
+  1. High-pass the signal at 100 Hz (VAD_HIGHPASS_HZ) before measuring
+     loudness; scipy already ships with openwakeword.
+  2. SILENCE_RMS 300 -> 15, matched to the filtered signal.
+  3. The silence countdown starts only once speech has begun (2 loud chunks in
+     a row), so a pause after "Hey Jarvis" no longer cuts the recording. With
+     no speech at all it closes after NO_SPEECH_S = 4 s.
+
+The same 4 saved clips replayed through the new code:
+
+  Clip  Before   After   Transcription of the new clip
+  ----  -------  ------  ---------------------------------------------
+  1     21.0 s   2.3 s   "What is your name?"
+  2     12.7 s   4.3 s   "What plants do you see in front of you?"
+  3     10.1 s   5.0 s   "There's a plant in front of you. Inspect it."
+  4     12.6 s   3.2 s   "Approach the plant."
+
+Live afterwards: 7 of 7 recordings were 3.3-5.8 s, each one request, each
+transcribed word for word.
+
+
+4. ASKS FOR ASAPH
+-----------------
+None of these were changed on our side; your code is exactly as merged in PR #6.
+
+[ ] Listen mode - request layout. In LlamaCppVisionBrain.ask(), when audio is
+    given, send the prompt text as a system message and the audio alone as the
+    user message (as audio_on_demand.decide() does). This alone took the A/B
+    test from 1/4 to 4/4.
+[ ] Listen mode - no empty promises. Add a rule like "if the person asks for
+    something one of your actions does, choose that action - never use speak
+    to promise an action you are not taking", and "for questions about what is
+    in front of you, inspect first".
+[ ] Initiation - let it approach more than once. Scope the anti-repeat rule to
+    inspect: if a plant is visible but not yet identified, approach_plant again
+    (2-3 times) before finishing as unknown.
+[ ] Initiation - give it a sense of distance. Have inspect report how large the
+    plant is in the frame or a rough distance, so it can use the N / 0.165
+    formula instead of always 2 s.
+[ ] Initiation - tighten "medium". A hedge like "Dracaena or similar indoor
+    foliage" should not count as a medium-confidence species.
+
+
+5. SMALLER ISSUES AND WHERE THINGS ARE
+--------------------------------------
+Smaller issues:
+- An empty --knowledge-dir now crashes. Since prompts are assembled from
+  identity.md, functions/initiation.md and actions.md, the old "point it at an
+  empty dir" test recipe breaks. We tested with a dir holding only those
+  tracked files and no roster.
+- BrokenPipeError traceback from actions.py do_GET
+  (send_error(503, "no action yet")) when the GUI's poller times out, e.g.
+  while Piper loads. Harmless, but noisy.
+- Species filename gets a trailing underscore: "Spider Plant (Chlorophytum
+  comosum)" became spider_plant_chlorophytum_comosum_.md.
+- inspect can say species "none" with high confidence (initiation run 3,
+  step 1).
+- Listen mode starts llama-server only on the first wake word, so a cold start
+  leaves a minute or more of silence on the first request.
+
+Local changes on Or's side:
+- src/audio_on_demand.py - the silence-detection fix above.
+- src/logots_ui.py - VOICE_ASSISTANT=0 turns off the GUI's built-in voice
+  assistant, so it doesn't answer "Hey Jarvis" at the same time as --listen.
+
+Logs and clips (on the Jetson, under runs/, gitignored):
+- Initiation runs 1-5:
+    runs/initiation_20261010_122746.log, _122910, _123343, _123828, _124124
+- Listen session filmed on video (before the fix):
+    runs/voice_20261010_125431.log
+- Listen session with saved clips (before the fix):
+    runs/voice_20261010_130135.log + runs/voice_clip_20261010_1302*.wav,
+    _130308, _130343
+- Listen session after the silence fix:
+    runs/voice_20261010_131139.log + runs/voice_clip_20261010_1312*.wav,
+    _1313*.wav
+
+Any clip can be replayed with:
+    python src/functions.py --listen --wav <clip>
+Or also has a phone video of the filmed listen session.

@@ -47,8 +47,11 @@ import soundfile as sf
 AUDIO_RATE      = 16000   # Hz — the system-wide mic rate
 CHUNK           = 1280    # samples = 80 ms, openWakeWord's native step
 WAKE_THRESHOLD  = 0.5     # wake-word score above this = triggered
-SILENCE_RMS     = 300     # int16 RMS below this counts as silence
+SILENCE_RMS     = 15      # int16 RMS (after the high-pass) below this counts as silence
 SILENCE_S       = 1.0     # this much silence closes the capture
+VAD_HIGHPASS_HZ = 100     # the I2S mic's baseline drifts at ~1-3 Hz (RMS ~150, spikes
+                          # past 400) — filtered out, silence is ~4 and speech 20-170
+NO_SPEECH_S     = 4.0     # silence only counts once speech starts; give up after this
 MAX_UTTERANCE_S = 28.0    # hard cap (Gemma's audio ceiling is 30 s)
 ACTION_PORT     = 8788
 MODEL_ID        = "google/gemma-4-E4B-it"
@@ -125,6 +128,12 @@ class Ears:
         self._buf: list[np.ndarray] = []
         self.capturing = False
         self._silent_chunks = 0
+        from scipy.signal import butter, sosfilt_zi   # scipy ships with openwakeword
+        self._hp = butter(2, VAD_HIGHPASS_HZ, 'hp', fs=AUDIO_RATE, output='sos')
+        self._hp_zi0 = sosfilt_zi(self._hp)
+        self._hp_zi = None
+        self._loud_chunks = 0
+        self._speech_started = False
 
     def feed(self, chunk: np.ndarray):
         if not self.capturing:
@@ -133,13 +142,25 @@ class Ears:
                 self.capturing = True
                 self._buf = [chunk]               # utterance includes the wake tail
                 self._silent_chunks = 0
+                self._loud_chunks = 0
+                self._speech_started = False
+                self._hp_zi = self._hp_zi0 * float(chunk[-1])
             return None
 
         self._buf.append(chunk)
-        rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-        self._silent_chunks = self._silent_chunks + 1 if rms < SILENCE_RMS else 0
-        done = (self._silent_chunks * CHUNK / AUDIO_RATE >= SILENCE_S
-                or len(self._buf) * CHUNK / AUDIO_RATE >= MAX_UTTERANCE_S)
+        from scipy.signal import sosfilt
+        hp, self._hp_zi = sosfilt(self._hp, chunk.astype(np.float64), zi=self._hp_zi)
+        rms = float(np.sqrt(np.mean(hp ** 2)))
+        loud = rms >= SILENCE_RMS
+        # Two loud chunks in a row = speech has started (a lone one is the wake tail
+        # or a click); before that, a pause after "Hey Jarvis" must not close it.
+        self._loud_chunks = self._loud_chunks + 1 if loud else 0
+        self._speech_started |= self._loud_chunks >= 2
+        self._silent_chunks = 0 if loud else self._silent_chunks + 1
+        elapsed = len(self._buf) * CHUNK / AUDIO_RATE
+        done = ((self._speech_started and self._silent_chunks * CHUNK / AUDIO_RATE >= SILENCE_S)
+                or (not self._speech_started and elapsed >= NO_SPEECH_S)
+                or elapsed >= MAX_UTTERANCE_S)
         if not done:
             return None
 

@@ -928,7 +928,13 @@ class RobotControlGUI:
             self._frame_server = None
         # Started after FrameServer: it polls this GUI's own :8787, same as any
         # external client, so the server needs to be up first.
-        self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
+        # VOICE_ASSISTANT=0 skips it, e.g. while `functions.py --listen` owns the
+        # "Hey Jarvis" wake word — otherwise both answer the same utterance.
+        if os.environ.get('VOICE_ASSISTANT', '1') == '0':
+            print("[voice] built-in assistant disabled (VOICE_ASSISTANT=0)", flush=True)
+            self.voice_assistant = None
+        else:
+            self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
         self.action_reader = ActionReader(self); self.action_reader.start()
         self._loop()
 
@@ -1701,8 +1707,9 @@ class RobotControlGUI:
                             fg=(C_GREEN if ok else C_AMBER))
 
     def _update_voice_widgets(self):
-        stage = self.voice_assistant.stage if self.voice_assistant else 'unavailable'
+        stage = self.voice_assistant.stage if self.voice_assistant else 'off'
         llm_text, llm_fg = {
+            'off':         ('LLM: off',     C_SUB),
             'unavailable': ('LLM: n/a',     C_SUB),
             'loading':     ('LLM: loading', C_AMBER),
             'error':       ('LLM: error',   C_RED),
@@ -1710,6 +1717,7 @@ class RobotControlGUI:
         self.lbl_llm.config(text=f'⬤  {llm_text}', fg=llm_fg)
 
         voice_text, voice_fg = {
+            'off':         ('MIC: off',        C_SUB),
             'unavailable': ('MIC: n/a',        C_SUB),
             'loading':     ('MIC: loading',    C_AMBER),
             'error':       ('MIC: error',      C_RED),
