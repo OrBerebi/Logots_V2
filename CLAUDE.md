@@ -32,6 +32,7 @@ Logots_V2/
 ├── recordings/              — session CSVs written here (gitignored)
 │   └── session_YYYYMMDD_HHMMSS/
 │       └── session_YYYYMMDD_HHMMSS.csv
+├── docs/                    — architecture notes + live test reports (test_report_YYYY-MM-DD.txt)
 └── src/
     ├── logots_ui.py         — main GUI (all sensors + motor control + recording + sim mode)
     ├── logots_api.py        — HTTP client for the frame API (get_latest_frame)
@@ -352,6 +353,22 @@ correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`)
   (macOS) it's `None`, meaning "use the system's default output device" — `sounddevice`'s
   normal behavior, so Piper's audio plays out the Mac's actual speakers instead of erroring on
   a nonexistent ALSA device name.
+- **End-of-speech detection (`Ears`, fixed 2026-10-10, commit `255be72`)**: the I2S mic's
+  baseline drifts at ~1-3 Hz — inaudible, but it read as RMS ~150 with spikes past 400, so the
+  old fixed `SILENCE_RMS=300` kept getting reset and captures ran 8-21 s, merging separate
+  requests. `Ears.feed()` now high-passes each chunk at `VAD_HIGHPASS_HZ`=100 before the RMS
+  check (silence then reads ~4, speech 20-170), uses `SILENCE_RMS`=15, and only starts the 1 s
+  silence countdown once speech has begun (2 loud chunks in a row) — a pause after "Hey Jarvis"
+  no longer cuts the capture; with no speech at all it closes after `NO_SPEECH_S`=4 s. Captures
+  now end ~1 s after speech (3-6 s, one request each). Verified live in both the GUI's built-in
+  assistant (9/9 sensible actions) and `functions.py --listen`. Shared code: affects both paths.
+  If capture length regresses, measure clip RMS *after* a 100 Hz high-pass before touching the
+  threshold — raw RMS is dominated by the drift.
+- **`VOICE_ASSISTANT=0`** (env var, `logots_ui.py`, 2026-10-10): skips starting the built-in
+  `VoiceAssistant` (header shows `MIC: off`/`LLM: off`). Use it when running Asaph's
+  `functions.py --listen`, which also listens for "Hey Jarvis" — otherwise both answer the same
+  utterance. Note that `--listen` only spawns `llama-server` lazily on the first wake word, so
+  with the built-in assistant off the first request has a ~1 min cold start.
 
 ### Can Asaph run this on his Mac?
 **Sim mode: yes, unaffected, always has been.** `VoiceAssistant` degrades gracefully on any
@@ -426,6 +443,30 @@ conda run -n logots python src/logots_ui.py
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **PR #6 live test (2026-10-10) — full report: `docs/test_report_2026-10-10.txt`.** Tested
+  Asaph's modular prompts + `functions.py --listen` voice mode on the real robot. Summary:
+  - **Initiation**: 5 runs, all finished on their own with consistent memory files — **open
+    bug #2's `inspect` loop never reproduced** (likely fixed by PR #6's "stop repeating → finish"
+    rule). But it named the spider plant correctly only 2/5 (once "Dracaena or similar",
+    medium — confidently wrong), always drives exactly once for exactly 2 s (copies the
+    `actions.md` example; never uses the `N/0.165` formula since it has no distance estimate),
+    and that same anti-repeat rule makes it give up after one drive — from 2.5 m it can't
+    succeed. Asks for Asaph are in the report.
+  - **`--listen`**: hears every word (Gemma transcribes the clips perfectly) but picked the right
+    action ~1/7 live, mostly greetings, and once *spoke* "I will move closer" without calling
+    `approach_plant`. **Root cause proven**: `mrt_reflective.LlamaCppVisionBrain.ask()` puts
+    the audio and the long identity+actions text in ONE user message; the old
+    `audio_on_demand.decide()` sends the prompt as a system message and the audio alone. A/B on
+    the same 4 clips: Asaph's exact prompt+schema in the old layout → 4/4; as shipped → 1/4;
+    dropping the schema doesn't help. **Left for Asaph to fix — by agreement, his code
+    (`functions.py`, `mrt_reflective.py`, `actions.py`) was not modified.**
+  - Fixed on our side the same day: `Ears` end-of-speech detection and `VOICE_ASSISTANT=0` (see
+    "Voice assistant" above).
+  - **Test-recipe gotcha**: an empty `--knowledge-dir` now crashes (prompts are assembled from
+    `identity.md`, `functions/initiation.md`, `actions.md`). For a fresh initiation test, copy
+    just those tracked files (plus `guidelines.md`) into a new dir — no `roster.md`. Press
+    `⌖ POS` after hand-repositioning the robot between runs, or positions accumulate.
+  - Logs/clips from the session are under `runs/` on the Jetson (gitignored), listed in the report.
 - **`action_id` collision across separate `functions.py` runs skipped actuation silently —
   FIXED 2026-09-15** (found testing Asaf's `39038cf` "goal-oriented prompt chaining" patch with
   Or, same session): `ActionsEndpoint._next_id` in `src/actions.py` started at `1` fresh every
@@ -500,7 +541,8 @@ conda run -n logots python src/logots_ui.py
   `inspect_plant` without new information.
 
   **To reproduce today's testing:** GUI running, then
-  `conda run -n logots python src/functions.py --knowledge-dir <fresh-empty-dir>` (a
+  `conda run -n logots python src/functions.py --knowledge-dir <fresh-dir>` (since PR #6 the
+  dir must hold the tracked prompt files but no roster — see the 2026-10-10 entry above; a
   non-empty/default `knowledge/` dir with plants already on the roster makes it skip
   immediately — see `src/knowledge.py`'s `roster_empty()`). Decision log lands at
   `runs/initiation_<timestamp>.log` (gitignored).
