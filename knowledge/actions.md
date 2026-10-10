@@ -18,19 +18,25 @@ Asaf's side, served inside the loop.
   returns your reading of it (observation, species guess, confidence)
 - when: whenever you want current data — your attached image only updates
   when you inspect
+- output: {"action": "inspect", "args": {}}
 
 ## approach_plant
 - executed by: actuator
 - args: id:string, left_pwm:int(-255..255), right_pwm:int(-255..255), duration_s:number(0.1..10)
 - what: drive toward the plant — YOU output the exact motor command: left/right
   wheel PWM (positive = forward, equal values = straight) and seconds to run
+- physics (measured on the robot): PWM below ~65 does not move the wheels at
+  all (a silent no-op); at PWM 150 real forward speed is ~0.165 m/s, so to
+  cover N metres use duration_s ≈ N / 0.165 at PWM 150
 - when: you want a closer or better view than your last look gave you
+- output: {"action": "approach_plant", "args": {"id": "...", "left_pwm": 150, "right_pwm": 150, "duration_s": 2.0}}
 
 ## speak
 - executed by: actuator
 - args: text:string
 - what: say the text out loud
 - when: the human should hear something right now
+- output: {"action": "speak", "args": {"text": "..."}}
 
 ## finish
 - executed by: loop
@@ -38,3 +44,4 @@ Asaf's side, served inside the loop.
 - what: end the running function and deliver its results
 - when: the goal is achieved (e.g. classified with medium/high confidence) — or
   continuing clearly leads nowhere; then explain why in the summary
+- output: {"action": "finish", "args": {"summary": "...", ...function results}}

@@ -56,6 +56,24 @@ def guidelines(kdir: str) -> str:
     return open(os.path.join(kdir, "guidelines.md")).read()
 
 
+def _body(path: str) -> str:
+    """File text without its leading `# title` line — prompts get prose, not headers."""
+    lines = open(path).read().strip().splitlines()
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def identity(kdir: str) -> str:
+    """knowledge/identity.md — who the robot is; shared by every prompt."""
+    return _body(os.path.join(kdir, "identity.md"))
+
+
+def function_goal(kdir: str, name: str) -> str:
+    """knowledge/functions/<name>.md — one function's goal block."""
+    return _body(os.path.join(kdir, "functions", f"{name}.md"))
+
+
 SPECIES_RULE = ('the common species name, judged only from what you actually '
                 'saw; "unknown" is the honest answer if you never saw it well '
                 'enough to tell')

@@ -39,7 +39,10 @@ class VisionBrain:
         return self._pipe
 
     def ask(self, text: str, images: list | None = None, max_new_tokens: int = 1024,
-            schema: dict | None = None) -> str:   # schema: llama.cpp-only, ignored here
+            schema: dict | None = None, audio: str | None = None) -> str:
+        # schema/audio: llama.cpp-only; ignored here (audio prints a warning)
+        if audio:
+            print("[brain] audio input not supported on the transformers path — ignored", flush=True)
         content = [{"type": "image", "image": im} for im in (images or [])]
         content.append({"type": "text", "text": text})
         out = self._pipeline()(text=[{"role": "user", "content": content}],
@@ -61,7 +64,8 @@ class LlamaCppVisionBrain(LlamaCppBrain):
     Images go through the server's --media-path mechanism, like his audio does."""
 
     def ask(self, text: str, images: list | None = None, max_new_tokens: int = LLAMACPP_N_PREDICT,
-            schema: dict | None = None) -> str:
+            schema: dict | None = None, audio: str | None = None) -> str:
+        import shutil
         import urllib.request
         self._ensure_server()
         os.makedirs(self.media_dir, exist_ok=True)
@@ -71,6 +75,13 @@ class LlamaCppVisionBrain(LlamaCppBrain):
             im.save(os.path.join(self.media_dir, name), "JPEG", quality=90)
             names.append(name)
         content = [{"type": "image_url", "image_url": {"url": f"file://{n}"}} for n in names]
+        if audio:
+            aname = "reflective_utterance.wav"
+            apath = os.path.join(self.media_dir, aname)
+            if os.path.abspath(audio) != os.path.abspath(apath):
+                shutil.copy(audio, apath)
+            content.append({"type": "input_audio", "input_audio": {"url": f"file://{aname}"}})
+            names.append(aname)        # cleaned up with the images below
         content.append({"type": "text", "text": text})
         body = {"messages": [{"role": "user", "content": content}],
                 "temperature": 0, "max_tokens": max_new_tokens,
@@ -120,13 +131,14 @@ def _json_block(reply: str):
         raise ValueError(f"unparseable JSON from model ({e}); raw reply:\n{reply}") from e
 
 
-def ask_json(brain, prompt: str, images: list | None = None, schema: dict | None = None):
+def ask_json(brain, prompt: str, images: list | None = None, schema: dict | None = None,
+             audio: str | None = None):
     """One Gemma call → parsed JSON, with a single corrective retry on bad JSON.
     With a schema (llama.cpp), decoding itself is constrained to match it."""
     try:
-        return _json_block(brain.ask(prompt, images=images, schema=schema))
+        return _json_block(brain.ask(prompt, images=images, schema=schema, audio=audio))
     except ValueError as e:
         print(f"[brain] invalid JSON, retrying once — {str(e)[:120]}", flush=True)
         return _json_block(brain.ask(
             prompt + "\n\nIMPORTANT: output ONLY valid JSON. Do not use any quotation "
-                     "marks inside string values.", images=images, schema=schema))
+                     "marks inside string values.", images=images, schema=schema, audio=audio))

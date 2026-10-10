@@ -77,7 +77,9 @@ def build_step_schema(finish_args_schema: dict | None = None) -> dict:
 
 ACTION_SCHEMA = build_step_schema()
 
-STEP_PROMPT = """You are Logots, a plant-care robot. You work in GOAL-ORIENTED STEPS:
+STEP_PROMPT = """{identity}
+
+You work in GOAL-ORIENTED STEPS:
 read what has happened so far, think toward the goal, and choose ONE action.
 Your "thought" is passed to your next step — write it as a note to your future
 self about where you stand on the goal.
@@ -162,6 +164,7 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
             n=view_step, px=view["pos_x"], py=view["pos_y"],
             hdg=view["heading"], pan=view["pan_angle"])
         prompt = STEP_PROMPT.format(
+            identity=knowledge.identity(kdir),
             goal_block=goal_block, step=step, max_steps=max_steps,
             state=knowledge.state(kdir),
             actions=ACTIONS_MD,
@@ -227,13 +230,7 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
 def initiation(brain, endpoint, kdir: str, max_steps: int = MAX_STEPS,
                done_wait: float = DONE_WAIT_S, speak_thoughts: bool = False):
     """Cold start: look around, learn the plants, write all memory docs."""
-    goal_block = """MAIN GOAL — you are running the function "initiation": this robot has no
-memory yet. Meet the plant in front of you for the first time: classify it and
-deliver the information that initiates the memory documents. Success = finish
-carrying a classification you actually saw (medium or high confidence), or an
-honest report of why it was not possible. HOW to get there — when to look,
-when to move, when to stop — is entirely your decision; the ACTIONS list tells
-you what each tool does."""
+    goal_block = knowledge.function_goal(kdir, "initiation")
     finish_rule = (
         '- When you finish, `finish` args MUST include "plants": a list with one object '
         'per distinct plant seen, each with exactly these keys: "id" (short snake_case), '
@@ -286,6 +283,110 @@ def watering(brain, endpoint, kdir: str, **_):
 FUNCTIONS = {"initiation": initiation, "watering": watering}
 
 
+# ── Voice: "Hey Jarvis" → utterance → one action ─────────────────────────────
+VOICE_PROMPT = """{identity}
+
+A person just spoke to you — their words are the attached audio. Choose ONE of
+your ACTIONS in response. To answer in words, use the speak action — its text
+is played on your speaker.
+
+ACTIONS — the only actions that exist:
+{actions}
+
+Knowledge state: {state}
+Reply with STRICT JSON only: {{"action": "...", "args": {{...}}}}"""
+
+# Voice decisions use the actions.md output structure exactly: action + args,
+# schema-enforced like every other Gemma call (no free text, no thought field).
+VOICE_SCHEMA = {
+    "anyOf": [
+        {"type": "object",
+         "properties": {"action": {"const": name}, "args": ACTION_ARG_SCHEMAS[name]},
+         "required": ["action", "args"]}
+        for name in ACTIONS
+    ]
+}
+
+
+def _say(text: str):
+    print(f'[voice] say: "{text}"', flush=True)
+    if _speak is not None:
+        _speak(text)
+
+
+def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, log):
+    """One utterance → one free Gemma reply → judged by shape:
+    a valid action JSON runs that action; anything else is spoken aloud."""
+    import soundfile as sf
+    import tempfile
+    from audio_on_demand import AUDIO_RATE, LLAMACPP_MEDIA_DIR
+
+    os.makedirs(LLAMACPP_MEDIA_DIR, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=LLAMACPP_MEDIA_DIR) as tmp:
+        sf.write(tmp.name, utterance, AUDIO_RATE)
+        prompt = VOICE_PROMPT.format(identity=knowledge.identity(kdir),
+                                     actions=ACTIONS_MD, state=knowledge.state(kdir))
+        try:
+            decision = ask_json(brain, prompt, schema=VOICE_SCHEMA, audio=tmp.name)
+        except ValueError as e:
+            decision = {"action": "speak",
+                        "args": {"text": "Sorry, I could not form a decision."}}
+            print(f"[voice] undecodable reply — {str(e)[:100]}", flush=True)
+    os.unlink(tmp.name)
+    log.write(f"{'=' * 74}\nUTTERANCE at {datetime.now().isoformat(timespec='seconds')} "
+              f"({len(utterance) / AUDIO_RATE:.1f}s audio attached)\n{prompt}\n\n"
+              f"---- DECISION ----\n{json.dumps(decision)}\n\n")
+    log.flush()
+    if decision.get("action") not in ACTIONS:
+        decision = {"action": "speak", "args": {"text": "Sorry, I could not form a decision."}}
+    print(f"[voice] decision: {decision['action']}({json.dumps(decision['args'])})", flush=True)
+
+    action, args = decision["action"], decision["args"]
+    if action == "speak":
+        _say(str(args.get("text", "")))
+    elif action == "finish":                               # no loop running — just report
+        _say(str(args.get("summary", "Nothing to finish right now.")))
+    elif action == "inspect":
+        view = mrt_experience.last_row()
+        obs = ask_json(brain, OBSERVE_PROMPT.format(
+            px=view["pos_x"], py=view["pos_y"], hdg=view["heading"]),
+            images=[Image.fromarray(view["image"])], schema=OBSERVE_SCHEMA)
+        log.write(f"---- INSPECT RESULT ----\n{json.dumps(obs)}\n\n"); log.flush()
+        _say(f"{obs.get('observation', '')} My guess: {obs.get('species_guess', 'unknown')}, "
+             f"confidence {obs.get('confidence', 'low')}.")
+    else:                                                  # actuator action → the contract
+        payload = endpoint.publish(decision) if endpoint else {"action_id": 0}
+        report = wait_for_done(endpoint, payload["action_id"], done_wait)
+        _say("Done." if report else
+             f"I tried, but got no completion signal after {done_wait:.0f} seconds.")
+    log.write(f"---- EXECUTED ----\n{json.dumps(decision)}\n\n"); log.flush()
+
+
+def listen(brain, endpoint, kdir: str, done_wait: float, wav: str | None = None):
+    """Ears → Gemma → one action per utterance. Live from the frame API, or a
+    wav replay for testing (same semantics as audio_on_demand --wav)."""
+    from audio_on_demand import Ears, api_chunks, wav_chunks
+
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    log_path = os.path.join(RUNS_DIR, f"voice_{datetime.now():%Y%m%d_%H%M%S}.log")
+    log = open(log_path, "w")
+    print(f"[voice] log: {os.path.relpath(log_path)}", flush=True)
+
+    ears = Ears()
+    source = wav_chunks(wav) if wav else api_chunks()
+    print(f"[voice] asleep — waiting for the wake word "
+          f"({'wav replay' if wav else 'live'} mode)", flush=True)
+    for chunk in source:
+        utterance = ears.feed(chunk)
+        if ears.capturing and len(ears._buf) == 1:
+            print("[voice] wake word heard — recording …", flush=True)
+        if utterance is not None:
+            handle_utterance(utterance, brain, endpoint, kdir, done_wait, log)
+    utterance = ears.flush()                               # wav EOF closes the capture
+    if utterance is not None:
+        handle_utterance(utterance, brain, endpoint, kdir, done_wait, log)
+
+
 # ── Trigger + entry point ─────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="functions — run the routine the robot needs now")
@@ -296,6 +397,10 @@ def main():
     ap.add_argument("--speak", action="store_true",
                     help="speak each step's 'thought' aloud on the robot's speaker "
                          "(same Piper/\"demixer\" TTS path as the voice assistant)")
+    ap.add_argument("--listen", action="store_true",
+                    help="voice mode: wake word → utterance → one action "
+                         "(identity + the 4-action contract; free reply = spoken)")
+    ap.add_argument("--wav", help="with --listen: replay a wav instead of live audio")
     args = ap.parse_args()
 
     if args.speak and _speak is None:
@@ -306,6 +411,12 @@ def main():
     kdir = args.knowledge_dir
     knowledge.seed(kdir)
     print(f"[knowledge] {kdir}\n[knowledge] state: {knowledge.state(kdir)}", flush=True)
+
+    if args.listen:
+        brain = pick_brain()
+        endpoint = open_endpoint()
+        listen(brain, endpoint, kdir, done_wait=args.done_wait, wav=args.wav)
+        return
 
     # The trigger rule (guidelines rule 1): empty roster → initiation.
     if knowledge.roster_empty(kdir):
