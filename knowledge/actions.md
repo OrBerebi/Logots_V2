@@ -29,7 +29,7 @@ Asaf's side, served inside the loop.
   all (a silent no-op); at PWM 150 real forward speed is ~0.165 m/s, so to
   cover N metres use duration_s ≈ N / 0.165 at PWM 150
 - when: you want a closer or better view than your last look gave you
-- output: {"action": "approach_plant", "args": {"id": "...", "left_pwm": 150, "right_pwm": 150, "duration_s": 2.0}}
+- output: {"action": "approach_plant", "args": {"id": "...", "left_pwm": ..., "right_pwm": ..., "duration_s": ...}} — YOU choose the numbers (see physics above); longer duration_s covers more distance
 
 ## speak
 - executed by: actuator
