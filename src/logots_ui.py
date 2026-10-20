@@ -928,13 +928,16 @@ class RobotControlGUI:
             self._frame_server = None
         # Started after FrameServer: it polls this GUI's own :8787, same as any
         # external client, so the server needs to be up first.
-        # VOICE_ASSISTANT=0 skips it, e.g. while `functions.py --listen` owns the
-        # "Hey Jarvis" wake word — otherwise both answer the same utterance.
-        if os.environ.get('VOICE_ASSISTANT', '1') == '0':
-            print("[voice] built-in assistant disabled (VOICE_ASSISTANT=0)", flush=True)
-            self.voice_assistant = None
-        else:
+        # One listener owns "Hey Jarvis": Asaph's `functions.py --listen` (the
+        # 4-action contract). The built-in assistant (legacy v1 action list) is
+        # therefore OFF by default since 2026-10-20 (agreed Or+Asaph) — set
+        # VOICE_ASSISTANT=1 to run it instead, e.g. without functions.py.
+        if os.environ.get('VOICE_ASSISTANT', '0') == '1':
             self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
+        else:
+            print("[voice] built-in assistant off (default) — voice is "
+                  "`functions.py --listen`; set VOICE_ASSISTANT=1 for the legacy one", flush=True)
+            self.voice_assistant = None
         self.action_reader = ActionReader(self); self.action_reader.start()
         self._loop()
 
