@@ -86,32 +86,6 @@ LLAMACPP_MEDIA_DIR  = os.environ.get("LLAMACPP_MEDIA_DIR", "/tmp/logots_llamacpp
 LLAMACPP_STARTUP_TIMEOUT_S = 120   # one-time model load off disk; generous but bounded
 
 # ── The action schema (the Or↔Asaf contract; keep in sync with action_api.md) ─
-ACTIONS = {
-    "approach_plant": ("id",),
-    "return_to_base": (),
-    "scan_room":      (),
-    "initiation":     (),
-    "inspect_plant":  ("id",),
-    "capture_photo":  ("subject",),
-    "water_plant":    ("id", "ml"),
-    "speak":          ("text",),
-    "flag_issue":     ("sev", "msg"),
-    "daily_summary":  (),
-    "wait_until":     ("next",),
-}
-
-BRAIN_PROMPT = f"""You are the decision layer of a plant-care robot. You just heard a
-person speak (the clip begins with the wake phrase — ignore it). Choose ONE action.
-
-Actions and their args: {json.dumps({a: list(k) for a, k in ACTIONS.items()})}
-
-Reply with STRICT JSON only: {{"action": "...", "args": {{...}}}}.
-If the request does not map to any action other than speak, reply with
-{{"action": "speak", "args": {{"text": "<briefly say you can't do that and list what you can do>"}}}}.
-If the person asked a question, answer it with speak."""
-
-
-# ── Ears: wake word + VAD state machine ───────────────────────────────────────
 class Ears:
     """Feed 80 ms int16 chunks; returns a finished utterance (int16) or None."""
 
@@ -176,52 +150,7 @@ class Ears:
         return utterance
 
 
-# ── Brains ────────────────────────────────────────────────────────────────────
-class MockBrain:
-    """Filename-keyword rules — proves the pipeline with no model loaded."""
-
-    def decide(self, wav_path: str) -> dict:
-        name = os.path.basename(wav_path).lower()
-        if "water" in name:
-            return {"action": "water_plant", "args": {"id": "ficus_1", "ml": 50}}
-        if "inspect" in name or "look" in name:
-            return {"action": "inspect_plant", "args": {"id": "ficus_1"}}
-        return {"action": "speak", "args": {"text": "(mock) I can't do that."}}
-
-
-class GemmaBrain:
-    """Local Gemma 4: utterance audio in → one action out. Lazy-loads."""
-
-    def __init__(self, model_id: str = MODEL_ID):
-        self.model_id = model_id
-        self._pipe = None
-
-    def _pipeline(self):
-        if self._pipe is None:
-            import torch
-            from transformers import pipeline
-            device = "mps" if torch.backends.mps.is_available() else \
-                     ("cuda" if torch.cuda.is_available() else "cpu")
-            print(f"[brain] loading {self.model_id} on {device} …", flush=True)
-            self._pipe = pipeline(task="any-to-any", model=self.model_id,
-                                  dtype=torch.bfloat16, device=device)
-        return self._pipe
-
-    def ensure_ready(self):
-        """Force the lazy model load now, matching LlamaCppBrain._ensure_server()'s
-        eager-readiness pattern — so a missing torch/transformers install (or a
-        failed download) surfaces immediately at startup, not on the first utterance."""
-        self._pipeline()
-
-    def decide(self, wav_path: str) -> dict:
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": BRAIN_PROMPT}]},
-            {"role": "user", "content": [{"type": "audio", "audio": wav_path}]},
-        ]
-        out = self._pipeline()(text=messages, max_new_tokens=128)
-        return _parse_action(_assistant_text(out))
-
-
+# ── Brain (llama-server plumbing; decisions live in mrt_reflective.py) ──────
 class LlamaCppBrain:
     """Local Gemma 4 E2B via a persistent llama-server (Jetson path).
 
@@ -310,79 +239,6 @@ class LlamaCppBrain:
                 except Exception:
                     pass
 
-    def decide(self, wav_path: str) -> dict:
-        self._ensure_server()
-        # llama-server only resolves file:// URLs under --media-path; the live pipeline's
-        # tempfile already lands there (main()'s dir=scratch_dir), but decide() shouldn't
-        # assume that of every caller (e.g. tests passing an arbitrary path directly).
-        fname = os.path.basename(wav_path)
-        media_target = os.path.join(self.media_dir, fname)
-        copied = os.path.abspath(wav_path) != os.path.abspath(media_target)
-        if copied:
-            shutil.copy(wav_path, media_target)
-        body = {
-            "messages": [
-                {"role": "system", "content": BRAIN_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "input_audio", "input_audio": {"url": f"file://{fname}"}},
-                ]},
-            ],
-            "temperature": 0,
-            "max_tokens": LLAMACPP_N_PREDICT,
-            "reasoning_format": "none",
-        }
-        req = urllib.request.Request(
-            f"http://{self.host}:{self.port}/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                resp = json.loads(r.read())
-            out = resp["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"[brain] llama-server request failed: {e}", flush=True)
-            out = ""
-        finally:
-            if copied:
-                try:
-                    os.unlink(media_target)
-                except OSError:
-                    pass
-        reply = out.rsplit("<channel|>", 1)[-1]  # drop the reasoning trace, keep the verdict
-        return _parse_action(reply)
-
-
-def _assistant_text(out) -> str:
-    if isinstance(out, list) and out:
-        out = out[0]
-    gen = out.get("generated_text", out) if isinstance(out, dict) else out
-    if isinstance(gen, list) and gen:
-        content = gen[-1].get("content", gen[-1]) if isinstance(gen[-1], dict) else gen[-1]
-        if isinstance(content, list):
-            return "\n".join(b.get("text", "") for b in content if isinstance(b, dict)).strip()
-        return str(content).strip()
-    return str(gen).strip()
-
-
-def _parse_action(reply: str) -> dict:
-    """Model text → validated {action, args}; anything malformed → spoken refusal."""
-    m = re.search(r"\{.*\}", reply, re.DOTALL)
-    try:
-        d = json.loads(m.group(0)) if m else {}
-    except json.JSONDecodeError:
-        d = {}
-    action, args = d.get("action"), d.get("args", {})
-    if action in ACTIONS and isinstance(args, dict) and set(args) <= set(ACTIONS[action]):
-        return {"action": action, "args": args}
-    return {"action": "speak",
-            "args": {"text": "I couldn't map that to something I can do."}}
-
-
-# ── Mouth: TTS for `speak` actions, played out the robot's I2S amp ────────────
-_piper_voice = None
-
 
 def _get_piper_voice():
     global _piper_voice
@@ -411,52 +267,6 @@ def speak(text: str):
 
 
 # ── Action server (:8788) — the mirror of FrameServer ─────────────────────────
-class ActionServer:
-    def __init__(self, port: int = ACTION_PORT, sim_mode: bool = False, serve: bool = True):
-        """serve=False: track publish() bookkeeping (action_id/ts) without binding
-        `port` — for embedding inside logots_ui.py, where the functions layer (Asaf's
-        side) needs :8788 for its own ActionServer instance instead."""
-        self._latest = None
-        self._next_id = 1
-        self._lock = threading.Lock()
-        self._httpd = None
-        outer = self
-
-        if serve:
-            class Handler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    if self.path != "/latest_action":
-                        self.send_error(404); return
-                    with outer._lock:
-                        payload = outer._latest
-                    if payload is None:
-                        self.send_error(503, "no action yet"); return
-                    body = json.dumps(payload).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-
-                def log_message(self, *a):  # quiet
-                    pass
-
-            self._httpd = ThreadingHTTPServer(("localhost", port), Handler)
-            threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
-            print(f"[server] GET http://localhost:{port}/latest_action", flush=True)
-        self._sim = sim_mode
-
-    def publish(self, decision: dict) -> dict:
-        from datetime import datetime
-        with self._lock:
-            payload = {"action_id": self._next_id,
-                       "ts": datetime.now().isoformat(),
-                       **decision, "sim_mode": self._sim}
-            self._latest, self._next_id = payload, self._next_id + 1
-        return payload
-
-
-# ── Audio sources ─────────────────────────────────────────────────────────────
 def wav_chunks(path: str, realtime: bool = False):
     """Stream a wav as 80 ms int16 chunks, as if it were the live mic."""
     audio, sr = sf.read(path, dtype="int16")
@@ -502,61 +312,8 @@ def api_chunks(host: str = "localhost", port: int = 8787):
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser(description="audio_on_demand — wake word → Gemma → action API")
-    ap.add_argument("--wav", help="replay a wav instead of the live frame API (SIM equivalent)")
-    ap.add_argument("--realtime", action="store_true", help="pace wav replay at real time")
-    ap.add_argument("--brain", choices=["gemma", "llamacpp", "mock"], default="gemma")
-    ap.add_argument("--once", action="store_true", help="exit after the first action")
-    ap.add_argument("--port", type=int, default=ACTION_PORT)
-    args = ap.parse_args()
 
-    ears = Ears()
-    brain = {"gemma": GemmaBrain, "llamacpp": LlamaCppBrain, "mock": MockBrain}[args.brain]()
-    scratch_dir = None
-    if args.brain == "llamacpp":
-        os.makedirs(LLAMACPP_MEDIA_DIR, exist_ok=True)
-        scratch_dir = LLAMACPP_MEDIA_DIR
-        brain._ensure_server()  # pay the one-time model load now, not on the first real utterance
-    server = ActionServer(port=args.port, sim_mode=bool(args.wav))
-    source = wav_chunks(args.wav, args.realtime) if args.wav else api_chunks()
-    print(f"[ears] asleep — waiting for the wake word ({'wav' if args.wav else 'live'} mode)", flush=True)
-
-    def handle(utterance) -> dict:
-        print(f"[ears] utterance closed ({len(utterance)/AUDIO_RATE:.1f} s) → brain", flush=True)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=scratch_dir) as tmp:
-            sf.write(tmp.name, utterance, AUDIO_RATE)
-            t0 = time.time()
-            decision = brain.decide(tmp.name)
-        os.unlink(tmp.name)
-        payload = server.publish(decision)
-        print(f"[action] #{payload['action_id']}  {payload['action']}({payload['args']})  "
-              f"[{time.time()-t0:.1f} s]", flush=True)
-        if payload["action"] == "speak":
-            speak(payload["args"]["text"])
-        return payload
-
-    for chunk in source:
-        utterance = ears.feed(chunk)
-        if ears.capturing and len(ears._buf) == 1:
-            print("[ears] wake word heard — recording …", flush=True)
-        if utterance is None:
-            continue
-        handle(utterance)
-        if args.once:
-            return
-
-    # wav exhausted: EOF means the speech is over — flush any open capture
-    utterance = ears.flush()
-    if utterance is not None:
-        handle(utterance)
-        if args.once:
-            return
-    if args.wav:                       # keep serving for pollers
-        print("[ears] wav finished — still serving; Ctrl+C to quit", flush=True)
-        while True:
-            time.sleep(1)
-
-
-if __name__ == "__main__":
-    main()
+# The legacy standalone voice pipeline (wake word → v1 actions → ActionServer)
+# was removed 2026-10-20 (agreed Or+Asaph): voice is `functions.py --listen`.
+# This module keeps the shared plumbing: Ears, LlamaCppBrain's server
+# management, speak()/Piper, and the audio chunk sources.
