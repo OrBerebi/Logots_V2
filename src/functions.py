@@ -95,8 +95,10 @@ step {max_steps}, so achieve the goal before then:
 
 RULES:
 - Choose exactly ONE action per reply.
-- If repeating an action is not changing what you see or know, stop repeating —
-  choose finish and explain why in the summary.
+- Judge progress by RESULTS: an action that changed your position or your view
+  IS working — repeat it as long as it keeps making progress (several
+  approach_plant drives in a row are normal when the plant starts far away).
+- Stop and finish only when your actions produce no change at all.
 {finish_rule}
 
 Knowledge state: {state}
@@ -327,7 +329,8 @@ def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, lo
         prompt = VOICE_PROMPT.format(identity=knowledge.identity(kdir),
                                      actions=ACTIONS_MD, state=knowledge.state(kdir))
         try:
-            decision = ask_json(brain, prompt, schema=VOICE_SCHEMA, audio=tmp.name)
+            decision = ask_json(brain, "", schema=VOICE_SCHEMA, audio=tmp.name,
+                                system=prompt)
         except ValueError as e:
             decision = {"action": "speak",
                         "args": {"text": "Sorry, I could not form a decision."}}

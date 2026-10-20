@@ -364,11 +364,12 @@ correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`)
   assistant (9/9 sensible actions) and `functions.py --listen`. Shared code: affects both paths.
   If capture length regresses, measure clip RMS *after* a 100 Hz high-pass before touching the
   threshold — raw RMS is dominated by the drift.
-- **`VOICE_ASSISTANT=0`** (env var, `logots_ui.py`, 2026-10-10): skips starting the built-in
-  `VoiceAssistant` (header shows `MIC: off`/`LLM: off`). Use it when running Asaph's
-  `functions.py --listen`, which also listens for "Hey Jarvis" — otherwise both answer the same
-  utterance. Note that `--listen` only spawns `llama-server` lazily on the first wake word, so
-  with the built-in assistant off the first request has a ~1 min cold start.
+- **One voice listener (2026-10-20, agreed Or+Asaph)**: talking to the robot goes through
+  `conda run -n logots python src/functions.py --listen` — the 4-action contract. The GUI's
+  built-in `VoiceAssistant` (legacy v1 action list) is now OFF by default (header shows
+  `MIC: off`/`LLM: off`); set `VOICE_ASSISTANT=1` to start it instead — never run both, they
+  answer the same wake word. Note `--listen` spawns `llama-server` lazily on the first wake
+  word, so the first request has a ~1 min cold start.
 
 ### Can Asaph run this on his Mac?
 **Sim mode: yes, unaffected, always has been.** `VoiceAssistant` degrades gracefully on any

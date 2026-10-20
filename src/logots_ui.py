@@ -51,15 +51,6 @@ try:
 except ImportError:
     AUDIO_OK = False
 
-try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from audio_on_demand import (Ears, LlamaCppBrain, GemmaBrain, ActionServer as VoiceActionServer,
-                                  speak as tts_speak, api_chunks as voice_api_chunks,
-                                  ACTION_PORT as VOICE_ACTION_PORT, LLAMACPP_BIN as VOICE_LLAMACPP_BIN)
-    import soundfile as sf
-    VOICE_OK = True
-except ImportError:
-    VOICE_OK = False
 
 from PIL import Image, ImageTk
 
@@ -375,83 +366,6 @@ class AudioReader:
         if self._stream:
             try: self._stream.stop(); self._stream.close()
             except: pass
-
-# ── Voice assistant (wake word → LLM → spoken action) ──────────────────────────
-class VoiceAssistant(threading.Thread):
-    """Runs the audio_on_demand.py pipeline in-process: wake word → LlamaCppBrain
-    (a persistent, GPU-offloaded llama-server, unchanged from audio_on_demand.py)
-    → action, speaking `speak` actions out loud via Piper. Pulls audio from this
-    GUI's own frame API (:8787) — the same contract any external client uses, so
-    audio_on_demand.py's Ears/LlamaCppBrain/speak/api_chunks are reused as-is."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.stage = 'unavailable' if not VOICE_OK else 'loading'
-        self.error = None
-        self.ears  = None
-        self.brain = None
-        self.last_action = None
-
-    def run(self):
-        if not VOICE_OK:
-            return
-        # Auto-pick the brain: LlamaCppBrain needs the Jetson's compiled llama-server
-        # binary (fast, GPU-offloaded); elsewhere (e.g. a MacBook) fall back to
-        # GemmaBrain (transformers + MPS/CUDA/CPU) — that's the proven Mac-native path
-        # (see docs/v2_architecture/action_api.md). Override with VOICE_BRAIN=llamacpp|gemma.
-        brain_choice = os.environ.get('VOICE_BRAIN', 'auto')
-        use_llamacpp = brain_choice == 'llamacpp' or (
-            brain_choice == 'auto' and os.path.exists(VOICE_LLAMACPP_BIN))
-        try:
-            self.ears = Ears()
-            if use_llamacpp:
-                self.brain = LlamaCppBrain()
-                self.brain._ensure_server()
-            else:
-                self.brain = GemmaBrain()
-                self.brain.ensure_ready()
-            # :8788 is Asaf's functions-layer ActionServer port by default (see
-            # docs/v2_architecture/functions_layer_report.md) — don't bind it here
-            # unless explicitly asked to run the voice assistant standalone.
-            serve_action_api = os.environ.get('VOICE_ACTION_SERVER', '0') == '1'
-            action_server = VoiceActionServer(port=VOICE_ACTION_PORT, serve=serve_action_api)
-            if not serve_action_api:
-                print(f"[voice] action server on :{VOICE_ACTION_PORT} disabled (port free for "
-                      f"the functions layer) — set VOICE_ACTION_SERVER=1 to serve it here instead",
-                      flush=True)
-        except ImportError as e:
-            self.stage = 'error'; self.error = str(e)
-            print(f"[voice] startup failed: missing dependency ({e}) — GemmaBrain needs "
-                  f"'pip install torch transformers' in the logots env", flush=True)
-            return
-        except Exception as e:
-            self.stage = 'error'; self.error = str(e)
-            print(f'[voice] startup failed: {e}', flush=True)
-            return
-        print(f"[voice] using {'LlamaCppBrain' if use_llamacpp else 'GemmaBrain'}", flush=True)
-
-        self.stage = 'asleep'
-        for chunk in voice_api_chunks():
-            utterance = self.ears.feed(chunk)
-            self.stage = 'listening' if self.ears.capturing else 'asleep'
-            if utterance is None:
-                continue
-            self.stage = 'thinking'
-            try:
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    sf.write(tmp.name, utterance, AUDIO_RATE)
-                    decision = self.brain.decide(tmp.name)
-                os.unlink(tmp.name)
-                payload = action_server.publish(decision)
-                args_str = ', '.join(f'{k}={v}' for k, v in payload['args'].items())
-                self.last_action = f"{payload['action']}({args_str})"
-                print(f"[voice] action #{payload['action_id']}  {self.last_action}", flush=True)
-                if payload['action'] == 'speak':
-                    self.stage = 'speaking'
-                    tts_speak(payload['args']['text'])
-            except Exception as e:
-                print(f'[voice] utterance handling failed: {e}', flush=True)
-            self.stage = 'asleep'
 
 # ── Action reader (executes functions-layer decisions from :8788) ──────────────
 class ActionReader(threading.Thread):
@@ -915,7 +829,6 @@ class RobotControlGUI:
 
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
-        self.voice_assistant=None
         self.action_reader=None
 
         self._build_ui()
@@ -926,15 +839,6 @@ class RobotControlGUI:
         except Exception as e:
             print(f'[logots] frame API server not started: {e}')
             self._frame_server = None
-        # Started after FrameServer: it polls this GUI's own :8787, same as any
-        # external client, so the server needs to be up first.
-        # VOICE_ASSISTANT=0 skips it, e.g. while `functions.py --listen` owns the
-        # "Hey Jarvis" wake word — otherwise both answer the same utterance.
-        if os.environ.get('VOICE_ASSISTANT', '1') == '0':
-            print("[voice] built-in assistant disabled (VOICE_ASSISTANT=0)", flush=True)
-            self.voice_assistant = None
-        else:
-            self.voice_assistant = VoiceAssistant(); self.voice_assistant.start()
         self.action_reader = ActionReader(self); self.action_reader.start()
         self._loop()
 
@@ -951,10 +855,6 @@ class RobotControlGUI:
         self.lbl_cs.pack(side='right')
         self.lbl_fps=_lbl(f,'FPS: --',fg=C_SUB,font=('Courier',9,'bold'))
         self.lbl_fps.pack(side='right',padx=(0,16))
-        self.lbl_llm=_lbl(f,'⬤  LLM: --',fg=C_SUB,font=('Courier',9,'bold'))
-        self.lbl_llm.pack(side='right',padx=(0,16))
-        self.lbl_voice=_lbl(f,'⬤  --',fg=C_SUB,font=('Courier',9,'bold'))
-        self.lbl_voice.pack(side='right',padx=(0,16))
 
 
     def _main_panels(self):
@@ -1166,10 +1066,6 @@ class RobotControlGUI:
         _plbl(br,'RMS',font=('Courier',8)).pack(side='left')
         self.rms_cv=tk.Canvas(br,width=286,height=8,bg='#16162a',highlightthickness=0)
         self.rms_cv.pack(side='left',padx=6)
-        ar=tk.Frame(p,bg=C_PANEL); ar.pack(fill='x',padx=8,pady=(0,8))
-        _plbl(ar,'ACTION',font=('Courier',8)).pack(side='left')
-        self.lbl_voice_action=_plbl(ar,'(no action yet)',font=('Courier',8),fg=C_SUB)
-        self.lbl_voice_action.pack(side='left',padx=6)
 
     def _wave_idle(self):
         cv=self.wav_cv; w,h=356,90
@@ -1538,7 +1434,6 @@ class RobotControlGUI:
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
         self._update_fps_label()
-        self._update_voice_widgets()
 
         # Drift compensation: wait only the remainder of the period, so the actual
         # rate tracks TARGET_FPS instead of (work + fixed delay). If a tick overruns
@@ -1705,32 +1600,6 @@ class RobotControlGUI:
         ok  = fps >= 0.9 * TARGET_FPS           # green when within 10% of target
         self.lbl_fps.config(text=f'FPS:{fps:4.1f}/{TARGET_FPS}',
                             fg=(C_GREEN if ok else C_AMBER))
-
-    def _update_voice_widgets(self):
-        stage = self.voice_assistant.stage if self.voice_assistant else 'off'
-        llm_text, llm_fg = {
-            'off':         ('LLM: off',     C_SUB),
-            'unavailable': ('LLM: n/a',     C_SUB),
-            'loading':     ('LLM: loading', C_AMBER),
-            'error':       ('LLM: error',   C_RED),
-        }.get(stage, ('LLM: ready', C_GREEN))
-        self.lbl_llm.config(text=f'⬤  {llm_text}', fg=llm_fg)
-
-        voice_text, voice_fg = {
-            'off':         ('MIC: off',        C_SUB),
-            'unavailable': ('MIC: n/a',        C_SUB),
-            'loading':     ('MIC: loading',    C_AMBER),
-            'error':       ('MIC: error',      C_RED),
-            'asleep':      ('MIC: asleep',     C_SUB),
-            'listening':   ('MIC: listening',  C_GREEN),
-            'thinking':    ('MIC: thinking',   C_AMBER),
-            'speaking':    ('MIC: speaking',   C_BLUE_HI),
-        }.get(stage, (f'MIC: {stage}', C_SUB))
-        self.lbl_voice.config(text=f'⬤  {voice_text}', fg=voice_fg)
-
-        last_action = self.voice_assistant.last_action if self.voice_assistant else None
-        if last_action:
-            self.lbl_voice_action.config(text=last_action[:48], fg=C_GREEN)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
