@@ -241,4 +241,3 @@ NoMachine at `192.168.68.114:4000` — provides a full remote desktop on the Jet
 - Camera has a pink/IR hue — the IMX219-160 fisheye has no IR cut filter. Fix: M12 IR cut filter (hardware).
 - Drive motors have no encoders (open-loop), so the `pos_x`/`pos_y` estimate is directional but not metrically accurate until `ROBOT_MAX_SPEED_MPS` is calibrated. A feedback drivetrain is planned for the next body iteration.
 - A NoMachine remote-desktop session runs its own audio server and can silently redirect the voice assistant's spoken replies to your laptop's speakers instead of the robot's — run `unset PULSE_SERVER` before launching the GUI from a NoMachine terminal if that happens.
-.
