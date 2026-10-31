@@ -240,6 +240,9 @@ class LlamaCppBrain:
                     pass
 
 
+_piper_voice = None
+
+
 def _get_piper_voice():
     global _piper_voice
     if _piper_voice is None:
