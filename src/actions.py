@@ -7,6 +7,9 @@ The contract (v2 — proposed to Darab in this refactor):
     GET  /latest_action   unchanged — latest decision, dedupe on action_id
     POST /action_done     NEW — the actuator side reports a completed action:
                           {"action_id": N, "pos_x": .., "pos_y": .., "heading": ..}
+    GET  /status          what the listener is doing, for the GUI's indicators:
+                          {"stage": "off|loading|asleep|listening|thinking|acting|speaking",
+                           "last_action": "approach_plant(left_pwm=150, ...)" or null}
 
 Changes to the action set vs v1 (audio_on_demand.ACTIONS, untouched there):
     - `initiation` removed — it is a *function* (a routine in functions.py),
@@ -100,15 +103,17 @@ class ActionsEndpoint:
         # restarts while staying monotonically increasing within one run.
         self._next_id = int(time.time() * 1000)
         self._done: dict[int, dict] = {}
+        self._status = {"stage": "off", "last_action": None}   # "off": no listener in this process
         self._lock = threading.Lock()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != "/latest_action":
+                if self.path not in ("/latest_action", "/status"):
                     self.send_error(404); return
                 with outer._lock:
-                    payload = outer._latest
+                    payload = outer._status if self.path == "/status" else outer._latest
+                    payload = payload and dict(payload)
                 if payload is None:
                     self.send_error(503, "no action yet"); return
                 body = json.dumps(payload).encode()
@@ -150,13 +155,20 @@ class ActionsEndpoint:
         with self._lock:
             return self._done.get(action_id)
 
+    def set_status(self, stage: str | None = None, last_action: str | None = None):
+        with self._lock:
+            if stage is not None:
+                self._status["stage"] = stage
+            if last_action is not None:
+                self._status["last_action"] = last_action
+
 
 def open_endpoint(port: int = ACTION_PORT) -> ActionsEndpoint | None:
-    """Bind :8788, or None if taken (the GUI's voice assistant holds it when the
-    GUI runs with voice active) — the caller then prints decisions instead."""
+    """Bind :8788, or None if taken — only one functions.py process can drive the
+    robot, and the listener the GUI starts holds it by default."""
     try:
         return ActionsEndpoint(port)
     except OSError:
-        print(f"[actions] :{port} already taken (GUI voice assistant?) — "
-              f"decisions will be printed only", flush=True)
+        print(f"[actions] :{port} is already taken — by the GUI's voice listener or another "
+              f"functions.py. For a manual run, start the GUI with LISTEN=0.", flush=True)
         return None

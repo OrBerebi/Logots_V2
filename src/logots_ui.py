@@ -6,7 +6,9 @@ Panels: Drive + Arm  |  IMU orientation  |  Audio waveform  |  Video feed
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import atexit
 import math
+import signal
 import sys
 import time
 import threading
@@ -437,6 +439,32 @@ class ActionReader(threading.Thread):
         except Exception as e:
             print(f"[actions] failed to POST /action_done for #{aid}: {e}", flush=True)
 
+# ── Listener status (what functions.py --listen is doing, from :8788/status) ───
+class ListenerStatusReader(threading.Thread):
+    """Polls the voice listener's GET :8788/status for the header's LLM/MIC
+    indicators and the audio panel's ACTION row. Its own thread: ActionReader
+    sleeps through every drive, and the capture tick must never wait on HTTP."""
+
+    POLL_S = 0.2
+
+    def __init__(self, host='localhost', port=8788):
+        super().__init__(daemon=True)
+        self.url = f'http://{host}:{port}/status'
+        self.stage = 'off'       # 'off' = nothing answering on :8788
+        self.last_action = None
+
+    def run(self):
+        import urllib.request
+        while True:
+            try:
+                with urllib.request.urlopen(self.url, timeout=1.0) as resp:
+                    status = json.loads(resp.read())
+                self.stage = status.get('stage', 'off')
+                self.last_action = status.get('last_action') or self.last_action
+            except Exception:
+                self.stage = 'off'
+            time.sleep(self.POLL_S)
+
 # ── Camera reader ─────────────────────────────────────────────────────────────
 class CameraReader(threading.Thread):
     W, H = 640, 480
@@ -830,6 +858,7 @@ class RobotControlGUI:
         self.imu_reader=None; self.audio_reader=None; self.camera_reader=None
         self._imu_poly=None; self._imu_live=False
         self.action_reader=None
+        self.listener=None
 
         self._build_ui()
         self._bind_keys()
@@ -840,6 +869,11 @@ class RobotControlGUI:
             print(f'[logots] frame API server not started: {e}')
             self._frame_server = None
         self.action_reader = ActionReader(self); self.action_reader.start()
+        self.listener_status = ListenerStatusReader(); self.listener_status.start()
+        self._start_listener()
+        self.root.protocol('WM_DELETE_WINDOW',self._shutdown)
+        # via after(): never interrupt a tick mid-I2C-write with the final motor-stop
+        signal.signal(signal.SIGTERM,lambda *_: self.root.after(0,self._shutdown))
         self._loop()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
@@ -855,6 +889,10 @@ class RobotControlGUI:
         self.lbl_cs.pack(side='right')
         self.lbl_fps=_lbl(f,'FPS: --',fg=C_SUB,font=('Courier',9,'bold'))
         self.lbl_fps.pack(side='right',padx=(0,16))
+        self.lbl_llm=_lbl(f,'⬤  LLM: --',fg=C_SUB,font=('Courier',9,'bold'))
+        self.lbl_llm.pack(side='right',padx=(0,16))
+        self.lbl_voice=_lbl(f,'⬤  MIC: --',fg=C_SUB,font=('Courier',9,'bold'))
+        self.lbl_voice.pack(side='right',padx=(0,16))
 
 
     def _main_panels(self):
@@ -1066,6 +1104,11 @@ class RobotControlGUI:
         _plbl(br,'RMS',font=('Courier',8)).pack(side='left')
         self.rms_cv=tk.Canvas(br,width=286,height=8,bg='#16162a',highlightthickness=0)
         self.rms_cv.pack(side='left',padx=6)
+        ar=tk.Frame(p,bg=C_PANEL); ar.pack(fill='x',padx=8,pady=(0,8))
+        _plbl(ar,'ACTION',font=('Courier',8)).pack(side='left',anchor='n')
+        self.lbl_voice_action=_plbl(ar,'(no action yet)',font=('Courier',8),fg=C_SUB)
+        self.lbl_voice_action.config(wraplength=410,justify='left')   # approach_plant's args run long
+        self.lbl_voice_action.pack(side='left',padx=6)
 
     def _wave_idle(self):
         cv=self.wav_cv; w,h=356,90
@@ -1245,16 +1288,45 @@ class RobotControlGUI:
 
     def _off(self):
         """Closes the GUI app only — does NOT shut down the Jetson itself. Confirms first
-        (closing stops the voice assistant / frame API / actuation endpoint too), zeros and
-        sends a final motor-stop, flushes any active recording, then exits the process."""
+        (closing stops the voice listener / frame API / actuation too)."""
         if not messagebox.askyesno('Close GUI', 'Close the robot control GUI?'):
             return
+        self._shutdown()
+
+    def _shutdown(self):
+        """Every way out (OFF, window close, SIGTERM): flushes any active recording, zeros
+        and sends a final motor-stop, stops the voice listener, then exits the process."""
         if self._rec_manager.active:
             self._rec_manager.stop()
         self.left_pwm = self.right_pwm = 0
         self._send_motors()
+        self._stop_listener()
         self.root.destroy()
         sys.exit(0)
+
+    def _start_listener(self):
+        """One command starts the whole robot: launches the voice listener
+        (`functions.py --listen`) as its own process — this one owns sensors/actuators
+        and :8787, that one owns decisions and :8788. LISTEN=0 skips it, e.g. for a
+        manual functions.py run, which needs :8788 for itself."""
+        if os.environ.get('LISTEN','1') == '0':
+            print('[voice] listener not started (LISTEN=0)',flush=True)
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),'functions.py')
+        try:
+            self.listener = subprocess.Popen([sys.executable,script,'--listen'])
+        except OSError as e:
+            print(f'[voice] listener not started: {e}',flush=True)
+            return
+        atexit.register(self._stop_listener)   # also on Ctrl-C or an unhandled exception
+
+    def _stop_listener(self):
+        if self.listener is not None and self.listener.poll() is None:
+            self.listener.terminate()          # it stops its own llama-server on the way out
+            try:
+                self.listener.wait(timeout=8)  # llama-server gets up to 5 s of this
+            except subprocess.TimeoutExpired:
+                self.listener.kill()
 
     def _reset_pos(self):
         """Zero the position estimate (origin = here). Blocked during sim."""
@@ -1434,6 +1506,7 @@ class RobotControlGUI:
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
         self._update_fps_label()
+        self._update_voice_widgets()
 
         # Drift compensation: wait only the remainder of the period, so the actual
         # rate tracks TARGET_FPS instead of (work + fixed delay). If a tick overruns
@@ -1600,6 +1673,37 @@ class RobotControlGUI:
         ok  = fps >= 0.9 * TARGET_FPS           # green when within 10% of target
         self.lbl_fps.config(text=f'FPS:{fps:4.1f}/{TARGET_FPS}',
                             fg=(C_GREEN if ok else C_AMBER))
+
+    def _listener_stage(self):
+        stage = self.listener_status.stage
+        if stage == 'off' and self.listener is not None:   # ours, but nothing answering on :8788
+            return 'loading' if self.listener.poll() is None else 'error'
+        return stage
+
+    def _update_voice_widgets(self):
+        stage = self._listener_stage()
+        llm_text, llm_fg = {
+            'off':       ('LLM: off',     C_SUB),
+            'loading':   ('LLM: loading', C_AMBER),
+            'error':     ('LLM: error',   C_RED),
+        }.get(stage, ('LLM: ready', C_GREEN))
+        self.lbl_llm.config(text=f'⬤  {llm_text}', fg=llm_fg)
+
+        voice_text, voice_fg = {
+            'off':       ('MIC: off',       C_SUB),
+            'loading':   ('MIC: loading',   C_AMBER),
+            'error':     ('MIC: error',     C_RED),
+            'asleep':    ('MIC: asleep',    C_SUB),
+            'listening': ('MIC: listening', C_GREEN),
+            'thinking':  ('MIC: thinking',  C_AMBER),
+            'acting':    ('MIC: acting',    C_AMBER),
+            'speaking':  ('MIC: speaking',  C_BLUE_HI),
+        }.get(stage, (f'MIC: {stage}', C_SUB))
+        self.lbl_voice.config(text=f'⬤  {voice_text}', fg=voice_fg)
+
+        last_action = self.listener_status.last_action
+        if last_action:
+            self.lbl_voice_action.config(text=last_action[:120], fg=C_GREEN)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

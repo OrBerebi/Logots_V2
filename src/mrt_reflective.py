@@ -38,6 +38,9 @@ class VisionBrain:
                                   dtype=torch.bfloat16, device=device)
         return self._pipe
 
+    def ensure_ready(self):
+        self._pipeline()
+
     def ask(self, text: str, images: list | None = None, max_new_tokens: int = 1024,
             schema: dict | None = None, audio: str | None = None,
             system: str | None = None) -> str:
@@ -65,6 +68,9 @@ class LlamaCppVisionBrain(LlamaCppBrain):
     """Text+images through Darab's llama-server — his class untouched, extended
     here (our file) with an ask() so the same server that hears can also see.
     Images go through the server's --media-path mechanism, like his audio does."""
+
+    def ensure_ready(self):
+        self._ensure_server()
 
     def ask(self, text: str, images: list | None = None, max_new_tokens: int = LLAMACPP_N_PREDICT,
             schema: dict | None = None, audio: str | None = None,

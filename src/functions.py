@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -310,8 +311,15 @@ VOICE_SCHEMA = {
 }
 
 
-def _say(text: str):
+def _status(endpoint, **fields):
+    """Report to the GUI's indicators via :8788/status (no-op if the port wasn't ours)."""
+    if endpoint:
+        endpoint.set_status(**fields)
+
+
+def _say(text: str, endpoint=None):
     print(f'[voice] say: "{text}"', flush=True)
+    _status(endpoint, stage="speaking")
     if _speak is not None:
         _speak(text)
 
@@ -323,6 +331,7 @@ def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, lo
     import tempfile
     from audio_on_demand import AUDIO_RATE, LLAMACPP_MEDIA_DIR
 
+    _status(endpoint, stage="thinking")
     os.makedirs(LLAMACPP_MEDIA_DIR, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=LLAMACPP_MEDIA_DIR) as tmp:
         sf.write(tmp.name, utterance, AUDIO_RATE)
@@ -345,10 +354,12 @@ def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, lo
     print(f"[voice] decision: {decision['action']}({json.dumps(decision['args'])})", flush=True)
 
     action, args = decision["action"], decision["args"]
+    arg_text = ", ".join(f"{k}={v}" for k, v in args.items())
+    _status(endpoint, last_action=f"{action}({arg_text})")
     if action == "speak":
-        _say(str(args.get("text", "")))
+        _say(str(args.get("text", "")), endpoint)
     elif action == "finish":                               # no loop running — just report
-        _say(str(args.get("summary", "Nothing to finish right now.")))
+        _say(str(args.get("summary", "Nothing to finish right now.")), endpoint)
     elif action == "inspect":
         view = mrt_experience.last_row()
         obs = ask_json(brain, OBSERVE_PROMPT.format(
@@ -356,13 +367,25 @@ def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, lo
             images=[Image.fromarray(view["image"])], schema=OBSERVE_SCHEMA)
         log.write(f"---- INSPECT RESULT ----\n{json.dumps(obs)}\n\n"); log.flush()
         _say(f"{obs.get('observation', '')} My guess: {obs.get('species_guess', 'unknown')}, "
-             f"confidence {obs.get('confidence', 'low')}.")
+             f"confidence {obs.get('confidence', 'low')}.", endpoint)
     else:                                                  # actuator action → the contract
+        _status(endpoint, stage="acting")
         payload = endpoint.publish(decision) if endpoint else {"action_id": 0}
         report = wait_for_done(endpoint, payload["action_id"], done_wait)
         _say("Done." if report else
-             f"I tried, but got no completion signal after {done_wait:.0f} seconds.")
+             f"I tried, but got no completion signal after {done_wait:.0f} seconds.", endpoint)
     log.write(f"---- EXECUTED ----\n{json.dumps(decision)}\n\n"); log.flush()
+
+
+def _handle_safely(utterance, brain, endpoint, kdir: str, done_wait: float, log):
+    """The listener is always on: one failed request (LLM error, frame API gone)
+    gets an apology, not a dead listener."""
+    try:
+        handle_utterance(utterance, brain, endpoint, kdir, done_wait, log)
+    except Exception as e:
+        print(f"[voice] request failed — {e!r}", flush=True)
+        _say("Sorry, something went wrong with that request.", endpoint)
+    _status(endpoint, stage="asleep")
 
 
 def listen(brain, endpoint, kdir: str, done_wait: float, wav: str | None = None):
@@ -379,15 +402,17 @@ def listen(brain, endpoint, kdir: str, done_wait: float, wav: str | None = None)
     source = wav_chunks(wav) if wav else api_chunks()
     print(f"[voice] asleep — waiting for the wake word "
           f"({'wav replay' if wav else 'live'} mode)", flush=True)
+    _status(endpoint, stage="asleep")
     for chunk in source:
         utterance = ears.feed(chunk)
         if ears.capturing and len(ears._buf) == 1:
             print("[voice] wake word heard — recording …", flush=True)
+            _status(endpoint, stage="listening")
         if utterance is not None:
-            handle_utterance(utterance, brain, endpoint, kdir, done_wait, log)
+            _handle_safely(utterance, brain, endpoint, kdir, done_wait, log)
     utterance = ears.flush()                               # wav EOF closes the capture
     if utterance is not None:
-        handle_utterance(utterance, brain, endpoint, kdir, done_wait, log)
+        _handle_safely(utterance, brain, endpoint, kdir, done_wait, log)
 
 
 # ── Trigger + entry point ─────────────────────────────────────────────────────
@@ -416,8 +441,14 @@ def main():
     print(f"[knowledge] {kdir}\n[knowledge] state: {knowledge.state(kdir)}", flush=True)
 
     if args.listen:
+        # The GUI stops us with SIGTERM: exit normally, so atexit also stops llama-server
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda *_: sys.exit(0))
+        # First, so the GUI sees "loading". Without :8788 nothing we decide can drive.
+        endpoint = open_endpoint() or sys.exit(1)
+        _status(endpoint, stage="loading")
         brain = pick_brain()
-        endpoint = open_endpoint()
+        brain.ensure_ready()                               # load now, not on the first wake word
         listen(brain, endpoint, kdir, done_wait=args.done_wait, wav=args.wav)
         return
 
@@ -425,7 +456,7 @@ def main():
     if knowledge.roster_empty(kdir):
         print("[functions] roster empty → running initiation", flush=True)
         brain = pick_brain()
-        endpoint = open_endpoint()
+        endpoint = open_endpoint() or sys.exit(1)          # else every drive times out
         initiation(brain, endpoint, kdir, max_steps=args.max_steps,
                   done_wait=args.done_wait, speak_thoughts=args.speak)
     else:
