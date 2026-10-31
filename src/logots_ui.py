@@ -1698,6 +1698,7 @@ class RobotControlGUI:
             'thinking':  ('MIC: thinking',  C_AMBER),
             'acting':    ('MIC: acting',    C_AMBER),
             'speaking':  ('MIC: speaking',  C_BLUE_HI),
+            'initiation':('MIC: initiation',C_AMBER),   # busy with the routine, not listening
         }.get(stage, (f'MIC: {stage}', C_SUB))
         self.lbl_voice.config(text=f'⬤  {voice_text}', fg=voice_fg)
 

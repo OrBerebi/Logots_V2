@@ -22,6 +22,8 @@ Run (the GUI must be serving :8787):
     python src/functions.py                 # trigger check → run what's needed
     python src/functions.py --done-wait 15  # shorter completion timeout (replay tests)
     python src/functions.py --speak         # speak each step's "thought" out loud
+    python src/functions.py --listen        # voice mode; initiates first if no plants are known
+                                            # (the GUI launches this one itself, see LISTEN=0)
 """
 from __future__ import annotations
 
@@ -53,6 +55,7 @@ RUNS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 MAX_STEPS   = 12    # step budget per function run — a stuck loop must end
 DONE_WAIT_S = 120   # how long to wait for the actuator side's completion signal
+CAMERA_WAIT_S = 20  # a reused llama-server can have the listener ready before the camera
 
 # Constrained decoding (llama.cpp), built from knowledge/actions.md: only the
 # listed actions are generatable, each with exactly its declared args (types,
@@ -159,6 +162,7 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
     log_path = os.path.join(RUNS_DIR, f"{name}_{datetime.now():%Y%m%d_%H%M%S}.log")
     log = open(log_path, "w")
     print(f"[functions] prompt log: {os.path.relpath(log_path)}", flush=True)
+    _status(endpoint, stage=name)
 
     history: list[str] = []
     view, view_step = None, None      # no data until the LLM inspects
@@ -179,6 +183,7 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
                             schema=build_step_schema(finish_args_schema))
         thought = decision.get("thought", "")
         action, args = decision.get("action"), decision.get("args", {})
+        _status(endpoint, last_action=_action_label(action, args))
         log.write(f"{'=' * 74}\nSTEP {step} — PROMPT (image attached only if the LLM has inspected)\n"
                   f"{'=' * 74}\n{prompt}\n\n---- STEP {step} — GEMMA'S DECISION ----\n"
                   f"{json.dumps(decision)}\n\n")
@@ -317,6 +322,10 @@ def _status(endpoint, **fields):
         endpoint.set_status(**fields)
 
 
+def _action_label(action: str, args: dict) -> str:
+    return f"{action}({', '.join(f'{k}={v}' for k, v in args.items())})"
+
+
 def _say(text: str, endpoint=None):
     print(f'[voice] say: "{text}"', flush=True)
     _status(endpoint, stage="speaking")
@@ -354,8 +363,7 @@ def handle_utterance(utterance, brain, endpoint, kdir: str, done_wait: float, lo
     print(f"[voice] decision: {decision['action']}({json.dumps(decision['args'])})", flush=True)
 
     action, args = decision["action"], decision["args"]
-    arg_text = ", ".join(f"{k}={v}" for k, v in args.items())
-    _status(endpoint, last_action=f"{action}({arg_text})")
+    _status(endpoint, last_action=_action_label(action, args))
     if action == "speak":
         _say(str(args.get("text", "")), endpoint)
     elif action == "finish":                               # no loop running — just report
@@ -386,6 +394,39 @@ def _handle_safely(utterance, brain, endpoint, kdir: str, done_wait: float, log)
         print(f"[voice] request failed — {e!r}", flush=True)
         _say("Sorry, something went wrong with that request.", endpoint)
     _status(endpoint, stage="asleep")
+
+
+def _initiate_if_needed(brain, endpoint, kdir: str, max_steps: int, done_wait: float,
+                        speak_thoughts: bool):
+    """The trigger rule (guidelines rule 1) for the always-on listener: no plants
+    known → initiation first, then listening. Live camera only: a replayed recording
+    can't respond to drives, and its plants don't belong in this robot's memory.
+    A failure must not cost us the listener; the roster stays empty, so the next
+    launch tries again."""
+    if not knowledge.roster_empty(kdir):
+        return
+    try:
+        deadline = time.time() + CAMERA_WAIT_S
+        view = mrt_experience.last_row()
+        while view["image"] is None and not view["sim_mode"] and time.time() < deadline:
+            time.sleep(1)
+            view = mrt_experience.last_row()
+        if view["sim_mode"]:
+            print("[functions] roster empty, but replaying a recording — skipping initiation",
+                  flush=True)
+            return
+        if view["image"] is None:
+            print("[functions] roster empty, but no camera frame — skipping initiation", flush=True)
+            _say("My camera is not available, so I can't start initiation.", endpoint)
+            return
+        print("[functions] roster empty → running initiation before listening", flush=True)
+        _say("I don't know any plants yet. Starting initiation.", endpoint)
+        initiation(brain, endpoint, kdir, max_steps=max_steps, done_wait=done_wait,
+                   speak_thoughts=speak_thoughts)
+    except Exception as e:
+        print(f"[functions] initiation failed — {e!r}", flush=True)
+    _say("I couldn't learn any plants. I will try again next time I start."
+         if knowledge.roster_empty(kdir) else "Initiation finished.", endpoint)
 
 
 def listen(brain, endpoint, kdir: str, done_wait: float, wav: str | None = None):
@@ -449,6 +490,8 @@ def main():
         _status(endpoint, stage="loading")
         brain = pick_brain()
         brain.ensure_ready()                               # load now, not on the first wake word
+        if not args.wav:                                   # a replay isn't the robot starting up
+            _initiate_if_needed(brain, endpoint, kdir, args.max_steps, args.done_wait, args.speak)
         listen(brain, endpoint, kdir, done_wait=args.done_wait, wav=args.wav)
         return
 

@@ -8,7 +8,8 @@ The contract (v2 — proposed to Darab in this refactor):
     POST /action_done     NEW — the actuator side reports a completed action:
                           {"action_id": N, "pos_x": .., "pos_y": .., "heading": ..}
     GET  /status          what the listener is doing, for the GUI's indicators:
-                          {"stage": "off|loading|asleep|listening|thinking|acting|speaking",
+                          {"stage": "off|loading|asleep|listening|thinking|acting|speaking"
+                                    " or a running function's name, e.g. initiation",
                            "last_action": "approach_plant(left_pwm=150, ...)" or null}
 
 Changes to the action set vs v1 (audio_on_demand.ACTIONS, untouched there):

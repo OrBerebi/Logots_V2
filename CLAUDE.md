@@ -16,8 +16,9 @@ conda run -n logots python src/logots_ui.py
 - Conda env: `logots` (Python 3.10, NumPy 2.x) — `environment.yml` works on both Jetson and macOS
 - Always run through conda — system Python is missing deps and system OpenCV is incompatible (NumPy 1.x vs 2.x)
 - This one command starts the whole robot: the GUI launches the voice listener
-  (`functions.py --listen`) as its own process. For a manual `functions.py` run, start the GUI
-  with `LISTEN=0` instead — see "Voice assistant"
+  (`functions.py --listen`) as its own process. **If no plants are known yet, the robot then runs
+  initiation and drives by itself right after launch.** For a manual `functions.py` run, or to
+  prevent that, start the GUI with `LISTEN=0` — see "Voice assistant"
 - On the Mac there is no hardware: sensors show error/unavailable, Arduino stays DISCONNECTED — use **Sim mode** with a recording CSV
 
 ## Platform
@@ -253,7 +254,8 @@ that report's asks #2/#3) closes the loop from this side:
   the listener the GUI starts. Another `functions.py` exits immediately with a message naming
   `LISTEN=0` (see "Voice assistant" below).
 - **Status (2026-10-31)**: `GET :8788/status` returns `{"stage", "last_action"}` for the GUI's
-  indicators. A `functions.py` process that isn't `--listen` reports stage `off`.
+  indicators. A plain `functions.py` run reports `off` until a routine starts, then the routine's
+  name (`initiation`).
 - **Not yet done**: only `approach_plant` is actuated; other actions (`inspect_plant`, `finish`,
   `speak`, …) are Asaf's-side or no-ops here by design per the report. Concurrent manual
   joystick/keyboard driving while `ActionReader` is also driving is unguarded (last write wins)
@@ -306,13 +308,21 @@ client, and imports `Ears`, `speak` and the `llama-server` plumbing from `audio_
   launch, and the model loads right away (~1 min on the Jetson), not on the first wake word.
   **`LISTEN=0`** skips it. Use that for a manual `functions.py` run, which needs `:8788` itself;
   otherwise that run exits immediately. Never run two listeners: they'd answer the same wake word.
+- **Auto-initiation (2026-10-31)**: once the model has loaded, `_initiate_if_needed()` checks the
+  roster. If no plants are known, the listener announces it out loud, runs initiation, and only
+  then starts listening, so **the robot drives by itself right after launch and can't hear you
+  until initiation ends** (up to 12 steps). `OFF` is the only full stop. It's skipped when plants
+  are known, during Sim (a recording's plants don't belong in this robot's memory), with no camera
+  frame after 20 s (it says so out loud), and with `--wav`. If it doesn't finish, nothing is
+  written and the roster stays empty, so it runs again on the next launch. A run that finishes
+  with no plants also leaves the roster empty, so that one repeats too.
 - **Shutdown**: `_shutdown()` sends the listener SIGTERM, and it exits normally so its
   `llama-server` stops too. A `llama-server` the listener only reused (already running on
   `:8789`) is left alone. **Gap**: if the GUI is force-killed or crashes, the listener keeps
   running. A new GUI shows that listener's status and works with it, but it keeps running the
   old code until stopped: `pkill -f 'functions.py --listen'`.
 - **Status in the GUI**: header `⬤ LLM:` (off/loading/ready/error) and `⬤ MIC:`
-  (off/loading/asleep/listening/thinking/acting/speaking/error), plus an `ACTION` row in the
+  (off/loading/initiation/asleep/listening/thinking/acting/speaking/error), plus an `ACTION` row in the
   AUDIO INPUT panel showing the last decided action (e.g.
   `approach_plant(id=unknown, left_pwm=150, right_pwm=150, duration_s=1.5)`). The listener
   serves them on `GET :8788/status`; `ListenerStatusReader` polls that in its own thread (the
@@ -543,12 +553,21 @@ calibration" in Known issues); git credentials ("Git setup").
   moved voice out of the GUI, which was the right architecture, but one-command startup and the
   status indicators went with it by accident (the auto-start request was posted 4 minutes before
   merge and never built). Both are back with the processes still separate — see "Voice
-  assistant". Tested on the Mac only, with `--wav` replay and no motors. **Still to do, live on
-  the robot**: `git pull`, launch the GUI, wait for `MIC: asleep`/`LLM: ready`, say "Hey Jarvis,
-  come closer to the plant" (it will drive), and watch `listening`, `thinking`, `acting`,
-  `speaking`, the `ACTION` row and the spoken "Done." Press `OFF`, then `pgrep llama-server`
-  should print nothing. Check the header and `ACTION` layout on the robot's fonts (only checked
-  by widget geometry on the Mac), and watch FPS now that the listener and model run from launch.
+  assistant". Asaph tested it on the robot the same day and is happy with the listening.
+- **Auto-initiation pushed without drive limits — open discussion for Asaph and Or
+  (2026-10-31)**: the listener now runs initiation at launch when no plants are known (see "Voice
+  assistant"). **It hasn't run on the robot yet**: clear the floor and be ready at `OFF` the first
+  time. In the Mac test (real GUI, listener, model and `ActionReader`, no motors, a frozen camera
+  frame, log `runs/initiation_20261031_120116.log` on Asaph's Mac) it inspected at steps 1 and 4,
+  then chose `approach_plant` 8 times in a row, each time saying it needed "one more approach"
+  before a final look. That's 10 drives of 2 s, ~3.3 m at the measured floor speed, then the step
+  budget ran out and nothing was written. The frozen frame doesn't explain it, since the model
+  never looked again after step 4, so it may well happen live. The prompt's "repeat while it
+  makes progress" rule (PR #7) counts position change as progress, and decoding is `temp=0` (see
+  Open bug #2). There's no obstacle detection. **Proposed and deliberately not built**: refuse a
+  second drive in a row without an `inspect`, and cap driving at ~3 m per initiation run. These
+  are hard rules on the LLM, which PR #5 avoided on purpose, so Asaph and Or are to decide
+  together. The finish path was only tested with initiation stubbed out.
 - **Voice replies were silent 2026-10-20 → 2026-10-31, fixed in `a2fad25`**: `1af9463` deleted
   the module-level `_piper_voice = None` while keeping the code that reads it, so every `speak()`
   raised `NameError`. `speak()` swallows errors by design and only printed `[mouth] speak failed`,
