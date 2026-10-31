@@ -19,7 +19,10 @@ conda run -n logots python src/logots_ui.py
 
 ## Platform
 - **Hardware**: Jetson Orin Nano, JetPack 6.2.2 (L4T R36.5), ARM64 (upgraded 2026-08-02 from R36.4.7 — see Known issues)
-- **Remote access**: NoMachine at 192.168.68.114:4000. Virtual display is `:1001.0`
+- **Remote access**: NoMachine, port 4000 — host `logots-desktop.local` on any network (Mac
+  profile `Logots-any-network`), or `192.168.55.1` over the USB-C cable. Robot #1 lives at
+  Asaph's home in Berlin since 2026-10-31 (`192.168.178.101` on his WiFi; `192.168.68.114` was
+  the old home address). Virtual display is `:1001.0`. New Jetson: see "New Jetson setup"
 - **Storage**: NVMe nvme0n1p1 (500GB Kingston). SD card removed.
 - **Shutdown timeout**: systemd set to 5s (`/etc/systemd/system.conf`)
 
@@ -33,6 +36,7 @@ Logots_V2/
 │   └── session_YYYYMMDD_HHMMSS/
 │       └── session_YYYYMMDD_HHMMSS.csv
 ├── docs/                    — architecture notes + live test reports (test_report_YYYY-MM-DD.txt)
+│   └── robot1_system/       — robot #1's pin screenshot + asound demixer block (see "New Jetson setup")
 └── src/
     ├── logots_ui.py         — main GUI (all sensors + motor control + recording + sim mode)
     ├── logots_api.py        — HTTP client for the frame API (get_latest_frame)
@@ -424,6 +428,101 @@ conda run -n logots python src/logots_ui.py
 ## System tweaks (already applied)
 - gnome-terminal copy/paste remapped to `Ctrl+C` / `Ctrl+V` via gsettings
 - systemd `DefaultTimeoutStopSec=5s` for fast headless shutdown
+- **Desktop works over NoMachine (2026-10-31)**: polkit rules so the WiFi icon and Shut Down
+  button work from the NoMachine desktop, and a blank login-keyring password so Chromium stops
+  asking for the password — full steps in "New Jetson setup" below.
+
+## New Jetson setup (robot #2) — recap of the 2026-10-31 Berlin setup
+Robot #1 (hostname `logots-desktop`) stays at Asaph's home in Berlin from 2026-10-31, on his
+WiFi. That day its desktop was made fully usable over NoMachine. These steps repeat that on a
+new Jetson, in order. They assume what robot #1 has: JetPack 6 / Ubuntu 22.04, user `logots`,
+an Xfce NoMachine desktop.
+
+**Why it's needed**: Ubuntu treats the NoMachine desktop as a *remote* session. Its permission
+system (polkit) only allows network and power changes from someone at the robot's own screen,
+and the login keyring only unlocks with a password typed at login. So out of the box, over
+NoMachine: the WiFi icon fails ("Failed to add/activate connection — Not authorized to control
+networking"), Shut Down and Suspend are greyed out, and Chromium asks for the password ("Unlock
+Login Keyring") on every launch.
+
+1. **First connection: USB-C cable.** With no network yet, plug the Mac into the Jetson's USB-C
+   port. The Jetson is at `192.168.55.1` — NoMachine host `192.168.55.1`, port 4000 (Mac
+   profile `Jetson-USB-cable`). This works whatever network the robot is on; keep the profile.
+2. **Give it its own name** (not done on robot #1; recommended so the two robots never share a
+   `.local` address or NoMachine profile). Pick it on the first-boot "Your computer's name"
+   screen (e.g. `logots2`), or later: `sudo hostnamectl set-hostname logots2`, put the same
+   name on the `127.0.1.1` line of `/etc/hosts`, reboot.
+3. **Join WiFi from a terminal** (works before step 4):
+   ```bash
+   nmcli radio wifi                                  # "disabled"? → sudo nmcli radio wifi on
+   sudo nmcli device wifi rescan && nmcli device wifi list
+   sudo nmcli --ask device wifi connect "<SSID>"     # asks for the WiFi password
+   hostname -I                                       # the new IP
+   ```
+   Saved system-wide, so it reconnects at boot with nobody logged in. Earlier networks stay saved.
+4. **WiFi icon and Shut Down button.** Check `pkaction --version` first: `0.105` (Ubuntu 22.04)
+   reads `.pkla` files as below.
+   ```bash
+   sudo tee /etc/polkit-1/localauthority/50-local.d/10-logots-network.pkla >/dev/null <<'EOF'
+   [Allow logots to manage networking from any session]
+   Identity=unix-user:logots
+   Action=org.freedesktop.NetworkManager.*
+   ResultAny=yes
+   ResultInactive=yes
+   ResultActive=yes
+   EOF
+   sudo tee /etc/polkit-1/localauthority/50-local.d/10-logots-power.pkla >/dev/null <<'EOF'
+   [Allow logots to shut down and reboot from any session]
+   Identity=unix-user:logots
+   Action=org.freedesktop.login1.power-off*;org.freedesktop.login1.reboot*
+   ResultAny=yes
+   ResultInactive=yes
+   ResultActive=yes
+   EOF
+   sudo systemctl restart polkit
+   killall nm-applet; nohup nm-applet >/dev/null 2>&1 &   # the WiFi icon caches permissions
+   xfce4-panel -r                                         # so does the Xfce panel's Shut Down
+   ```
+   Check: `nmcli general permissions` → rows say `yes`;
+   `busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanPowerOff`
+   → `s "yes"` (was `"challenge"`). Suspend stays greyed on purpose — not granted. This grants
+   nothing new (`logots` already has sudo). Fallbacks: the `sudo nmcli` commands above,
+   `sudo poweroff`. On a GNOME desktop, log out and back in instead of `xfce4-panel -r`. If
+   `pkaction --version` is newer than 0.105 (e.g. an Ubuntu 24.04-based JetPack), `.pkla`
+   files are ignored and the same rules must be written as JavaScript in
+   `/etc/polkit-1/rules.d/` — not tested. (The robot GUI's `OFF` button only closes
+   `logots_ui.py`, never the Jetson.)
+5. **Chromium's password prompt.** `sudo apt install -y seahorse`, run `seahorse`, then
+   Passwords and Keys → right-click **Login** → Change Password → current password as the old
+   one, both new fields empty → accept unencrypted storage. Restart Chromium. Keeps what's
+   saved, but the keyring is then unencrypted on disk — don't save personal passwords in the
+   robot's Chromium.
+6. **NoMachine by name, not IP.** On the Mac, a NoMachine connection with host
+   `<hostname>.local`, port 4000, protocol NX works on any network with no IP lookup. Robot
+   #1's is `Logots-any-network` (`logots-desktop.local`). With the USB cable also plugged in,
+   `.local` may resolve to `192.168.55.1` — still the robot. For a fixed number on one network,
+   reserve the address in its router (FritzBox: Home Network → Network → Network Connections →
+   edit the device → "Always assign this network device the same IPv4 address").
+
+**Robot #1's system files, saved in the repo (`docs/robot1_system/`)**:
+- `header_pinouts.png` — robot #1's known-good 40-pin config in `jetson-io.py`: `i2c8` on 3/5
+  (IMU), `i2c2` on 27/28 (Arduino), `i2s2` on 12/35/38/40 (mic + amp), `uarta` on 8/10; all
+  other pins power, GND or unused. Set the new Jetson to match with
+  `sudo /opt/nvidia/jetson-io/jetson-io.py` → Configure Jetson 40pin Header → Configure header
+  pins manually, then save and reboot (Critical rule 1: always via `jetson-io.py`). Back out
+  without saving when only looking — saving rewrites the boot config.
+- `asound_demixer.conf` — the `"demixer"` speaker PCM that `speak()` plays through on Linux.
+  Only this block is custom; the rest of `/etc/asound.conf` is NVIDIA's stock file (licensed,
+  not copied). Install and test commands are in the file's header.
+- Still only on robot #1: `~/models/` (Gemma GGUF + mmproj ~4.3 GB, Piper voice) —
+  re-downloadable, see README.
+
+**Rest of the robot setup** (documented elsewhere): conda env (`environment.yml`, "How to
+run"); camera overlay via `jetson-io.py` (Critical rule 1); `DefaultTimeoutStopSec=5s` in
+`/etc/systemd/system.conf`; Piper voice download and the CUDA `llama-server` build + Gemma
+GGUF/mmproj under `~/models/` (README); openwakeword models, downloaded once per conda env
+("Voice assistant"); Arduino flash + calibration block ("Arduino firmware protocol", "Bench
+calibration" in Known issues); git credentials ("Git setup").
 
 ## Critical rules
 1. **Never manually edit `/boot/extlinux/extlinux.conf`** — always use `jetson-io.py`. Manual edits brick the boot.
@@ -580,7 +679,8 @@ conda run -n logots python src/logots_ui.py
   recording (`logots/logots_unified_test.wav`, Jun 3). Best guess: a manual pin edit on Jun 4 (likely when
   adding the Arduino `i2c2` pins) wasn't incremental and dropped the `i2s2` group. Fixed by re-adding
   `i2s2` via `jetson-io.py` → "Configure header pins manually"; user confirmed all sensors working after.
-  If audio drops out again, check that live config against `header_pinouts.png` first.
+  If audio drops out again, check that live config against `header_pinouts.png` first (copy in the repo:
+  `docs/robot1_system/header_pinouts.png`).
 - Camera has pink/IR hue — missing IR cut filter on IMX219-160 fisheye. Need M12 IR cut filter hardware.
 - Robot is assembled: motors and servos are physically connected to the Arduino and the I2C command flow drives them. **2026-10-03**: the drive motors' built-in JGA25-370 encoders are now wired up, and the motors were rewired to M1=right, M4=left. The right motor is noticeably stiffer to turn by hand, a likely cause of Open bug #1's drift to the right. The Arduino is now powered from the 12V battery through a 9V buck converter, and the shield takes 12V on EXT_PWR (see `src/pinout.txt` §6; the shield's PWR jumper must be off). Encoder counts are read back to the GUI (see "Arduino firmware protocol"). **Task 2 done 2026-10-03**: `PositionEstimator` now uses them in place of the PWM speed model (see "Recording feature" position note above).
 - **Bench calibration (2026-10-03), done on the Jetson**: the firmware from commit `fd843bb` is
