@@ -15,6 +15,9 @@ conda run -n logots python src/logots_ui.py
 ```
 - Conda env: `logots` (Python 3.10, NumPy 2.x) — `environment.yml` works on both Jetson and macOS
 - Always run through conda — system Python is missing deps and system OpenCV is incompatible (NumPy 1.x vs 2.x)
+- This one command starts the whole robot: the GUI launches the voice listener
+  (`functions.py --listen`) as its own process. For a manual `functions.py` run, start the GUI
+  with `LISTEN=0` instead — see "Voice assistant"
 - On the Mac there is no hardware: sensors show error/unavailable, Arduino stays DISCONNECTED — use **Sim mode** with a recording CSV
 
 ## Platform
@@ -53,7 +56,9 @@ Logots_V2/
 | `src/logots_ui.py` | Main GUI — all sensors + motor control + recording + sim mode + frame API server |
 | `src/logots_api.py` | Client module for the frame API — `get_latest_frame()` |
 | `src/api_demo.py` | Toy example using the API: video + synced audio playback |
-| `src/audio_on_demand.py` | Wake word → local LLM → action → TTS; also runs in-process inside `logots_ui.py` (see "Voice assistant") |
+| `src/functions.py` | Decision layer: routines like initiation, plus `--listen` voice mode (see "Voice assistant") |
+| `src/actions.py` | The `:8788` contract: `/latest_action`, `/action_done`, `/status` |
+| `src/audio_on_demand.py` | Shared voice plumbing only: `Ears` (wake word), `llama-server` management, `speak()`/Piper, audio sources |
 | `src/firmware/logots_motor_control/logots_motor_control.ino` | Arduino firmware |
 | `src/pinout.txt` | Full 40-pin header wiring reference |
 | `environment.yml` | Conda environment spec |
@@ -146,9 +151,11 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
   longer shown in the GUI** (removed 2026-10-03, once the position feature built on them was
   validated) — internal/debug data, not something the user needs to see.
 - **`OFF` button (2026-10-03)**: closes the GUI application only — does **not** shut down the
-  Jetson. Confirms first, flushes any active recording, sends a final motor-stop, then exits.
+  Jetson. Confirms first, then `_shutdown()`: flushes any active recording, sends a final
+  motor-stop, stops the voice listener, exits. Closing the window and SIGTERM take the same
+  `_shutdown()` path, without the confirmation (2026-10-31).
 - Header `⬤ MIC:`/`⬤ LLM:` indicators and the AUDIO INPUT panel's `ACTION` row are the voice
-  assistant's status — see "Voice assistant" below. All status glyphs use the same plain `⬤`
+  listener's status — see "Voice assistant" below. All status glyphs use the same plain `⬤`
   dingbat as the connection indicator (not emoji — the deployed GUI's font has no color-emoji
   support, confirmed 2026-08-16; don't reach for 🎤/🧠-style pictographic emoji anywhere in this
   file, use `⬤`/`▶`/`⚫`/`■`/`⌖`/`⌨` instead).
@@ -242,9 +249,11 @@ that report's asks #2/#3) closes the loop from this side:
   `actions.py` before wiring it up) — not the `:8787`-frame-field idea floated earlier, which
   doesn't satisfy what `functions.py` actually waits on.
 - **Port note**: `ActionReader` is a client only (`urllib.request` against `:8788`) — it doesn't
-  bind a port itself, so `functions.py`'s own `ActionsEndpoint` (which does bind `:8788`) needs
-  that port free, which is why the voice assistant's action server is off by default now (see
-  "Voice assistant" below).
+  bind a port itself. Only one `functions.py` process can hold `:8788`, and by default that's
+  the listener the GUI starts. Another `functions.py` exits immediately with a message naming
+  `LISTEN=0` (see "Voice assistant" below).
+- **Status (2026-10-31)**: `GET :8788/status` returns `{"stage", "last_action"}` for the GUI's
+  indicators. A `functions.py` process that isn't `--listen` reports stage `off`.
 - **Not yet done**: only `approach_plant` is actuated; other actions (`inspect_plant`, `finish`,
   `speak`, …) are Asaf's-side or no-ops here by design per the report. Concurrent manual
   joystick/keyboard driving while `ActionReader` is also driving is unguarded (last write wins)
@@ -288,22 +297,37 @@ baking into `approach_plant` reasoning if you ever have the LLM pick `left_pwm`/
 
 ## Voice assistant ("Hey Jarvis" → local LLM → spoken action)
 
-`src/audio_on_demand.py` (wake word → `Ears` → `LlamaCppBrain` → action → `speak`) now runs
-**in-process inside `logots_ui.py`** via a `VoiceAssistant(threading.Thread)`, started
-automatically on GUI launch — one command line (`python src/logots_ui.py`), no separate
-terminal, no separate conda env. It reuses `audio_on_demand.py`'s classes unmodified (`Ears`,
-`LlamaCppBrain`, `ActionServer`, `speak`, `api_chunks`) and pulls audio the same way any
-external client would — polling this GUI's own frame API on `:8787` — so the module stays a
-correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`) if ever needed.
+**Two processes, one command.** The GUI (`logots_ui.py`) owns sensors, actuators and `:8787`.
+The listener (`functions.py --listen`) owns decisions and `:8788`: wake word → `Ears` → Gemma →
+one action from the 4-action contract → executed. It pulls audio from `:8787` like any other
+client, and imports `Ears`, `speak` and the `llama-server` plumbing from `audio_on_demand.py`.
 
-- **Status in the GUI**: header `⬤ LLM:` (loading/ready/error) and `⬤ MIC:`
-  (asleep/listening/thinking/speaking), plus an `ACTION` row in the AUDIO INPUT panel showing
-  the last decided action (e.g. `water_plant(id=ficus, ml=250)`). All driven by
-  `VoiceAssistant.stage`/`.last_action`, polled each GUI tick in `_update_voice_widgets()`.
+- **Startup (2026-10-31)**: `_start_listener()` launches the listener as a subprocess on GUI
+  launch, and the model loads right away (~1 min on the Jetson), not on the first wake word.
+  **`LISTEN=0`** skips it. Use that for a manual `functions.py` run, which needs `:8788` itself;
+  otherwise that run exits immediately. Never run two listeners: they'd answer the same wake word.
+- **Shutdown**: `_shutdown()` sends the listener SIGTERM, and it exits normally so its
+  `llama-server` stops too. A `llama-server` the listener only reused (already running on
+  `:8789`) is left alone. **Gap**: if the GUI is force-killed or crashes, the listener keeps
+  running. A new GUI shows that listener's status and works with it, but it keeps running the
+  old code until stopped: `pkill -f 'functions.py --listen'`.
+- **Status in the GUI**: header `⬤ LLM:` (off/loading/ready/error) and `⬤ MIC:`
+  (off/loading/asleep/listening/thinking/acting/speaking/error), plus an `ACTION` row in the
+  AUDIO INPUT panel showing the last decided action (e.g.
+  `approach_plant(id=unknown, left_pwm=150, right_pwm=150, duration_s=1.5)`). The listener
+  serves them on `GET :8788/status`; `ListenerStatusReader` polls that in its own thread (the
+  capture tick must never wait on HTTP, and `ActionReader` sleeps through every drive), and
+  `_update_voice_widgets()` draws them each tick. The GUI works out two states itself in
+  `_listener_stage()`: its listener is running but not answering yet = `loading`; it exited and
+  nothing is answering = `error`. **Don't drive the `ACTION` row from `/latest_action`**: in
+  voice mode only drives are published there, not `speak` or `inspect`.
+- **Failed requests**: `_handle_safely()` turns any error during a request (LLM failure, frame
+  API gone) into a spoken apology, and the listener keeps going. While it's handling a request
+  it isn't listening, so it can't hear you during a drive.
 - **Latency (2026-08-16 fix, ~20-30s → ~1-2s/utterance)**: `LlamaCppBrain` used to spawn a
   fresh `llama-mtmd-cli` process per utterance (full model reload every time) and was still
   forced CPU-only. It now runs a **persistent `llama-server`** (spawned once, GPU-offloaded,
-  health-checked via `/health`) and `decide()` is just an HTTP call. A second fix was needed on
+  health-checked via `/health`) and each request is just an HTTP call. A second fix was needed on
   top of that: this GGUF's chain-of-thought reasoning trace added ~300 tokens (~10s) per call
   for no accuracy benefit on this schema-constrained task — `--reasoning off` on the server
   cut that to the final ~1-2s. This also closes out the old CPU-only/GPU-OOM workaround
@@ -346,13 +370,11 @@ correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`)
   `~/llama.cpp/build/bin/llama-server` plus the downloaded GGUF/mmproj/Piper files under
   `~/models/` — is **not** part of the repo or `environment.yml`; see "Can Asaph run this on
   his Mac?" below for what that means off-robot.
-- **Brain auto-selection (2026-08-16)**: `VoiceAssistant` picks `LlamaCppBrain` if
-  `~/llama.cpp/build/bin/llama-server` exists on disk, else falls back to `GemmaBrain`
-  (transformers, MPS/CUDA/CPU) — so the same GUI code works on the Jetson (fast path) and a
-  MacBook (Mac-native path) with zero config. Override with `VOICE_BRAIN=llamacpp|gemma` env
-  var if needed. `GemmaBrain.ensure_ready()` forces its lazy model load at startup (mirrors
-  `LlamaCppBrain._ensure_server()`) so a missing `torch`/`transformers` install surfaces
-  immediately as `⬤ LLM: error`, not silently on the first utterance.
+- **Brain selection**: `mrt_reflective.pick_brain()` picks `LlamaCppVisionBrain` if
+  `~/llama.cpp/build/bin/llama-server` exists on disk, else `VisionBrain` (transformers). Override
+  with `VOICE_BRAIN=llamacpp|gemma`. **Voice needs the llama.cpp path**: `VisionBrain` ignores
+  audio input, so without `llama-server` the model never hears the request. `ensure_ready()`
+  loads either brain at startup, so a load failure shows up at once as `⬤ LLM: error`.
 - **`SPEAKER_DEVICE` is now platform-aware**: defaults to `"demixer"` only on Linux; elsewhere
   (macOS) it's `None`, meaning "use the system's default output device" — `sounddevice`'s
   normal behavior, so Piper's audio plays out the Mac's actual speakers instead of erroring on
@@ -364,59 +386,33 @@ correct standalone script too (`python src/audio_on_demand.py --brain llamacpp`)
   check (silence then reads ~4, speech 20-170), uses `SILENCE_RMS`=15, and only starts the 1 s
   silence countdown once speech has begun (2 loud chunks in a row) — a pause after "Hey Jarvis"
   no longer cuts the capture; with no speech at all it closes after `NO_SPEECH_S`=4 s. Captures
-  now end ~1 s after speech (3-6 s, one request each). Verified live in both the GUI's built-in
-  assistant (9/9 sensible actions) and `functions.py --listen`. Shared code: affects both paths.
+  now end ~1 s after speech (3-6 s, one request each). Verified live with `functions.py --listen`.
   If capture length regresses, measure clip RMS *after* a 100 Hz high-pass before touching the
   threshold — raw RMS is dominated by the drift.
 - **One voice listener (2026-10-20, agreed Or+Asaph)**: talking to the robot goes through
-  `conda run -n logots python src/functions.py --listen` — the 4-action contract. The GUI's
-  built-in `VoiceAssistant` (legacy v1 action list) is now OFF by default (header shows
-  `MIC: off`/`LLM: off`); set `VOICE_ASSISTANT=1` to start it instead — never run both, they
-  answer the same wake word. Note `--listen` spawns `llama-server` lazily on the first wake
-  word, so the first request has a ~1 min cold start.
+  `functions.py --listen`, the 4-action contract. The GUI's old in-process `VoiceAssistant` and
+  its v1 action list were deleted in PR #7, along with `GemmaBrain` and `audio_on_demand.py`'s
+  standalone script; `VOICE_ASSISTANT` no longer exists. Don't bring them back: the two-process
+  split above is the architecture.
 
-### Can Asaph run this on his Mac?
-**Sim mode: yes, unaffected, always has been.** `VoiceAssistant` degrades gracefully on any
-startup failure (missing binary, missing deps) — caught, sets `⬤ LLM:`/`⬤ MIC:` to `error`,
-thread exits cleanly, nothing else in the GUI (Sim mode, sensors, frame API) is affected.
+### Running voice off the robot (Mac)
+**Sim mode works with no extra setup.** Any listener startup failure (missing binary, missing
+deps) shows `⬤ LLM:`/`⬤ MIC:` as `error`, and nothing else in the GUI is affected. The listener
+also runs during Sim and hears the replayed audio. A drive it decides isn't executed there, so
+it reports no completion after 120 s. Start with `LISTEN=0` to skip it and the model load.
 
-**The real voice feature (live mic → LLM → spoken reply), with his own Mac hardware: also yes,
-as of the 2026-08-16 brain-auto-selection fix — with one manual step.** `GemmaBrain` needs
-`torch` + `transformers`, deliberately **not** added to the shared `environment.yml` (adding
-them would force a heavy, Jetson-risky install — generic PyPI `torch` doesn't have Jetson/CUDA
-support, unlike NVIDIA's special Jetson wheels, and the Jetson doesn't need `GemmaBrain` at all
-since `LlamaCppBrain` already covers it there). So on his Mac, after the normal
-`conda env create -f environment.yml`, he additionally needs:
-```bash
-pip install torch transformers
-```
-in the `logots` env — after that, launching `python src/logots_ui.py` in Real mode (not Sim)
-will auto-select `GemmaBrain`, capture from his MacBook's real mic (`AudioReader` uses
-`sounddevice`'s system default, no Jetson-specific code there), decide actions with Gemma 4 on
-MPS, and speak `speak` actions out his Mac's real speakers (`SPEAKER_DEVICE` fallback above).
-Without that `pip install` step, he'll just see `⬤ LLM: error` with a clear message naming the
-missing dependency — harmless, same graceful-degradation path as before.
+**Real voice needs the llama.cpp path**: `~/llama.cpp/build/bin/llama-server` plus the GGUF and
+mmproj under `~/models/`, and the Piper voice under `~/models/piper/` (see "Brain selection").
+These aren't in the repo or `environment.yml`. Audio then comes from the Mac's mic and speech
+goes to its speakers (`SPEAKER_DEVICE` above). Tested 2026-10-31 with `--wav` replay; a live
+wake word on the Mac wasn't tested that day.
 - `openwakeword`/`piper-tts`/`sounddevice`/`soundfile` all install fine on macOS (piper-tts
   ships `macosx_11_0_arm64` wheels; openwakeword's `tflite-runtime` dep is Linux-only per its
   own package metadata, so macOS falls back to the onnx backend anyway — same one we now force
   everywhere, so no behavior difference to fix later).
-- This is the same `GemmaBrain` already documented in `docs/v2_architecture/action_api.md`
-  (~2-4s/utterance warm) — nothing new about the model itself, just that `VoiceAssistant` can
-  now reach it automatically instead of him needing a separate script/env.
-
-**Startup steps for Asaph, first run after this update:**
-```bash
-cd /Users/orberebi/Documents/GitHub/Logots_V2
-git pull origin main
-conda env update -n logots -f environment.yml --prune   # picks up openwakeword/piper-tts/soundfile
-conda run -n logots python src/logots_ui.py
-```
-- **Sim mode**: click **▶ SIM**, pick any session CSV — unaffected by any of today's changes,
-  works with the steps above alone.
-- **Real voice feature (his own Mac mic/speakers), optional**: additionally run
-  `pip install torch transformers` in the `logots` env first, per "Can Asaph run this on his
-  Mac?" above, then launch in Real mode (not Sim). Without that extra install, the header just
-  shows `⬤ LLM: error` — harmless, not a bug, and everything else in the GUI still works fine.
+- **To test the listener without speaking**: start the GUI with `LISTEN=0`, then
+  `conda run -n logots python src/functions.py --listen --wav <16 kHz clip with "Hey Jarvis">`.
+  The clip decides and drives like a live request, so `ActionReader` will drive real motors.
 
 ## Git setup
 - Remote: `https://github.com/OrBerebi/Logots_V2.git`
@@ -543,6 +539,22 @@ calibration" in Known issues); git credentials ("Git setup").
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **GUI starts the listener again, indicators restored (2026-10-31, commit `5351d40`)**: PR #7
+  moved voice out of the GUI, which was the right architecture, but one-command startup and the
+  status indicators went with it by accident (the auto-start request was posted 4 minutes before
+  merge and never built). Both are back with the processes still separate — see "Voice
+  assistant". Tested on the Mac only, with `--wav` replay and no motors. **Still to do, live on
+  the robot**: `git pull`, launch the GUI, wait for `MIC: asleep`/`LLM: ready`, say "Hey Jarvis,
+  come closer to the plant" (it will drive), and watch `listening`, `thinking`, `acting`,
+  `speaking`, the `ACTION` row and the spoken "Done." Press `OFF`, then `pgrep llama-server`
+  should print nothing. Check the header and `ACTION` layout on the robot's fonts (only checked
+  by widget geometry on the Mac), and watch FPS now that the listener and model run from launch.
+- **Voice replies were silent 2026-10-20 → 2026-10-31, fixed in `a2fad25`**: `1af9463` deleted
+  the module-level `_piper_voice = None` while keeping the code that reads it, so every `speak()`
+  raised `NameError`. `speak()` swallows errors by design and only printed `[mouth] speak failed`,
+  so `--listen` and `--speak` still decided and drove, and the regression test (which checked
+  the decision) passed. **When testing voice, check the output for `[mouth]` errors: a correct
+  decision doesn't prove the robot spoke.**
 - **PR #6 live test (2026-10-10) — full report: `docs/test_report_2026-10-10.txt`.** Tested
   Asaph's modular prompts + `functions.py --listen` voice mode on the real robot. Summary:
   - **Initiation**: 5 runs, all finished on their own with consistent memory files — **open
@@ -560,12 +572,12 @@ calibration" in Known issues); git credentials ("Git setup").
     the same 4 clips: Asaph's exact prompt+schema in the old layout → 4/4; as shipped → 1/4;
     dropping the schema doesn't help. **Left for Asaph to fix — by agreement, his code
     (`functions.py`, `mrt_reflective.py`, `actions.py`) was not modified.**
-  - Fixed on our side the same day: `Ears` end-of-speech detection and `VOICE_ASSISTANT=0` (see
-    "Voice assistant" above).
+  - Fixed on our side the same day: `Ears` end-of-speech detection (see "Voice assistant" above).
   - **Test-recipe gotcha**: an empty `--knowledge-dir` now crashes (prompts are assembled from
     `identity.md`, `functions/initiation.md`, `actions.md`). For a fresh initiation test, copy
     just those tracked files (plus `guidelines.md`) into a new dir — no `roster.md`. Press
-    `⌖ POS` after hand-repositioning the robot between runs, or positions accumulate.
+    `⌖ POS` after hand-repositioning the robot between runs, or positions accumulate. Since
+    2026-10-31, start the GUI with `LISTEN=0` for these runs, or `functions.py` can't get `:8788`.
   - Logs/clips from the session are under `runs/` on the Jetson (gitignored), listed in the report.
 - **`action_id` collision across separate `functions.py` runs skipped actuation silently —
   FIXED 2026-09-15** (found testing Asaf's `39038cf` "goal-oriented prompt chaining" patch with
@@ -587,9 +599,8 @@ calibration" in Known issues); git credentials ("Git setup").
   back-to-back `functions.py` runs against the same still-running GUI (no restart in between)
   both drove `approach_plant` cleanly, no timeout.
 - **`functions.py --speak` added 2026-09-15**: each step's `"thought"` is now spoken aloud
-  through the robot's speaker via the same Piper/`"demixer"` TTS path as the voice assistant
-  (`audio_on_demand.speak()`, imported directly — self-contained, doesn't need `logots_ui.py`'s
-  `VoiceAssistant` running). Opt-in flag, off by default so normal/scheduled runs don't pay the
+  through the robot's speaker via the same Piper/`"demixer"` TTS path as the voice listener
+  (`audio_on_demand.speak()`, imported directly). Opt-in flag, off by default so normal/scheduled runs don't pay the
   Piper load + playback latency per step. Verified live: audible and clear on the robot's
   speaker during a full initiation run.
 - **Functions-layer actuation (2026-09-15) — live-tested against the real robot today, mixed
@@ -640,7 +651,7 @@ calibration" in Known issues); git credentials ("Git setup").
   `knowledge/guidelines.md` or the `STEP_PROMPT` in `functions.py`) against repeating
   `inspect_plant` without new information.
 
-  **To reproduce today's testing:** GUI running, then
+  **To reproduce today's testing:** GUI running with `LISTEN=0`, then
   `conda run -n logots python src/functions.py --knowledge-dir <fresh-dir>` (since PR #6 the
   dir must hold the tracked prompt files but no roster — see the 2026-10-10 entry above; a
   non-empty/default `knowledge/` dir with plants already on the roster makes it skip
@@ -662,13 +673,6 @@ calibration" in Known issues); git credentials ("Git setup").
   servo/motor jitter reappears, check first whether new code was added *inside* an ISR —
   anything slow in an AVR ISR reintroduces this exact class of bug. Requires reflashing from
   the MacBook (Arduino IDE) to take effect; user confirmed fixed after flashing.
-- **Voice assistant done (2026-08-16), diff not yet committed**: wake word → local LLM →
-  spoken action, fully wired into `logots_ui.py` as a background thread — see "Voice assistant"
-  section above for the full write-up (latency fix, TTS, speaker-routing gotcha, the physical
-  wiring fault found, openwakeword's ONNX-backend requirement, Mac/Sim-mode compatibility).
-  `git status` currently shows `src/audio_on_demand.py`, `src/logots_ui.py`, `environment.yml`
-  modified and `PLAN_llamacpp_gpu_offload.md` untracked — review and commit when ready.
-  `PLAN_llamacpp_gpu_offload.md` (repo root) has the detailed before/after latency numbers.
 - **Post-upgrade regressions found and fixed (2026-08-02):** the r36.4.7→r36.5 upgrade reset the boot
   loader's `DEFAULT` to `primary` (see Critical rules #1) — broke the camera, fixed via `jetson-io.py`.
   Separately, the mic/speaker went silent (`sd.InputStream` reads exact `0.0` even with real input) —
