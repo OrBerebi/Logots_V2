@@ -28,7 +28,8 @@ Asaf's side, served inside the loop.
 - physics (measured on the robot): PWM below ~65 does not move the wheels at
   all (a silent no-op); at PWM 150 real forward speed is ~0.165 m/s, so to
   cover N metres use duration_s ≈ N / 0.165 at PWM 150
-- when: you want a closer or better view than your last look gave you
+- when: your last look says distance "too_far" or "visible" (at "close" or
+  "too_close" this action is not available)
 - output: {"action": "approach_plant", "args": {"id": "...", "left_pwm": ..., "right_pwm": ..., "duration_s": ...}} — YOU choose the numbers (see physics above); longer duration_s covers more distance
 
 ## speak
@@ -42,6 +43,7 @@ Asaf's side, served inside the loop.
 - executed by: loop
 - args: summary:string, ...
 - what: end the running function and deliver its results
-- when: the goal is achieved (e.g. classified with medium/high confidence) — or
-  continuing clearly leads nowhere; then explain why in the summary
+- when: your last look says distance "close" or "too_close" — classify with
+  what you have, or declare failure and explain why in the summary. After two
+  looks in a row, finish is the only action available.
 - output: {"action": "finish", "args": {"summary": "...", ...function results}}

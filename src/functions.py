@@ -63,11 +63,15 @@ CAMERA_WAIT_S = 20  # a reused llama-server can have the listener ready before t
 # model reasons toward the goal before committing to an action; it is passed to
 # the next step's prompt (goal-oriented chaining) and rides along in the :8788
 # payload so the actuator side may speak it. The VALUES are the LLM's decision.
-def build_step_schema(finish_args_schema: dict | None = None) -> dict:
+def build_step_schema(finish_args_schema: dict | None = None,
+                      exclude: set | frozenset = frozenset()) -> dict:
     """The decision schema; a function may pass a strict schema for finish's
-    args so its results (e.g. initiation's plant list) cannot be omitted."""
+    args so its results (e.g. initiation's plant list) cannot be omitted.
+    Actions in `exclude` are left out, so they cannot be generated this step."""
     variants = []
     for name in ACTIONS:
+        if name in exclude:
+            continue
         args = ACTION_ARG_SCHEMAS[name]
         if name == "finish" and finish_args_schema:
             args = finish_args_schema
@@ -123,8 +127,23 @@ surroundings — the attached image is what you see right now, from pos
 In one sentence, describe what you can see. If a plant is visible, give your
 best species guess from its visible features, and how confident you are; if no
 plant is visible, say so in the observation and use "none" as the guess.
+
+Also judge your distance to the plant, as a person standing where the camera is:
+  "too_far"   — the plant is a small part of the scene; you can't make out its leaves
+  "visible"   — you can see its leaves, but not their detail
+  "close"     — the detail of its leaves is clear
+  "too_close" — the plant fills the frame or is cut off by it, or it is no
+                longer in view (you have passed it)
 Reply with STRICT JSON only: {{"observation": "...", "species_guess": "...",
-"confidence": "low"|"medium"|"high"}}"""
+"confidence": "low"|"medium"|"high", "distance": "too_far"|"visible"|"close"|"too_close"}}"""
+
+# Distances at which driving closer is no longer possible: approach_plant is
+# left out of the decision schema, so the model cannot generate it.
+NO_APPROACH = {"close", "too_close"}
+
+# After this many looks in a row with nothing else in between, finish is the
+# only action left: the model must write up whatever it has.
+MAX_LOOKS_IN_ROW = 2
 
 OBSERVE_SCHEMA = {
     "type": "object",
@@ -132,8 +151,9 @@ OBSERVE_SCHEMA = {
         "observation":   {"type": "string"},
         "species_guess": {"type": "string"},
         "confidence":    {"enum": ["low", "medium", "high"]},
+        "distance":      {"enum": ["too_far", "visible", "close", "too_close"]},
     },
-    "required": ["observation", "species_guess", "confidence"],
+    "required": ["observation", "species_guess", "confidence", "distance"],
 }
 
 
@@ -151,6 +171,25 @@ def wait_for_done(endpoint, action_id: int, timeout: float = DONE_WAIT_S) -> dic
     return None
 
 
+def _inspect(brain, log, step: int):
+    """Look AND judge: fresh mart row, then Gemma reads it with OBSERVE_PROMPT.
+    Returns (row, step, history text, distance) — the text goes into the chain
+    so every look adds information, not just pixels."""
+    row = mrt_experience.last_row()
+    obs = ask_json(brain, OBSERVE_PROMPT.format(
+        px=row["pos_x"], py=row["pos_y"], hdg=row["heading"]),
+        images=[Image.fromarray(row["image"])], schema=OBSERVE_SCHEMA)
+    log.write(f"---- STEP {step} — INSPECT RESULT ----\n{json.dumps(obs)}\n\n")
+    log.flush()
+    print(f"[functions]   saw: {obs.get('species_guess')} "
+          f"({obs.get('confidence')}, {obs.get('distance')}) — "
+          f"{str(obs.get('observation'))[:80]}", flush=True)
+    saw = (f'saw: "{obs.get("observation", "")}" — species guess: '
+           f'{obs.get("species_guess", "?")}, confidence: {obs.get("confidence", "?")}, '
+           f'distance: {obs.get("distance", "?")}')
+    return row, step, saw, obs.get("distance")
+
+
 def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
                  kdir: str, max_steps: int = MAX_STEPS,
                  finish_args_schema: dict | None = None,
@@ -166,6 +205,8 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
 
     history: list[str] = []
     view, view_step = None, None      # no data until the LLM inspects
+    distance = None                   # the last look's distance judgement
+    looks_in_row = 0                  # consecutive looks (inspect or the automatic one)
     for step in range(1, max_steps + 1):
         view_block = VIEW_NONE if view is None else VIEW_LAST.format(
             n=view_step, px=view["pos_x"], py=view["pos_y"],
@@ -180,7 +221,10 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
             view_block=view_block)
         decision = ask_json(brain, prompt,
                             images=[] if view is None else [Image.fromarray(view["image"])],
-                            schema=build_step_schema(finish_args_schema))
+                            schema=build_step_schema(finish_args_schema, exclude=(
+                                set(ACTIONS) - {"finish"} if looks_in_row >= MAX_LOOKS_IN_ROW
+                                else {"approach_plant"} if distance in NO_APPROACH
+                                else set())))
         thought = decision.get("thought", "")
         action, args = decision.get("action"), decision.get("args", {})
         _status(endpoint, last_action=_action_label(action, args))
@@ -198,31 +242,28 @@ def run_function(name: str, goal_block: str, finish_rule: str, brain, endpoint,
         if action == "finish":
             return decision, history, view
         if action == "inspect":
-            # Asaf-side: look AND judge — fresh mart row, then Gemma reads it;
-            # the result goes into the history so every inspect adds
-            # information, not just pixels.
-            view, view_step = mrt_experience.last_row(), step
-            obs = ask_json(brain, OBSERVE_PROMPT.format(
-                px=view["pos_x"], py=view["pos_y"],
-                hdg=view["heading"]), images=[Image.fromarray(view["image"])],
-                schema=OBSERVE_SCHEMA)
-            log.write(f"---- STEP {step} — INSPECT RESULT ----\n{json.dumps(obs)}\n\n")
-            log.flush()
-            print(f"[functions]   saw: {obs.get('species_guess')} "
-                  f"({obs.get('confidence')}) — {str(obs.get('observation'))[:80]}", flush=True)
-            history.append(f'{entry} → saw: "{obs.get("observation", "")}" — species guess: '
-                           f'{obs.get("species_guess", "?")}, confidence: {obs.get("confidence", "?")}')
+            view, view_step, saw, distance = _inspect(brain, log, step)
+            looks_in_row += 1
+            history.append(f"{entry} → {saw}")
             continue
 
+        looks_in_row = 0                 # any other action breaks the run of looks
         old = view or mrt_experience.last_row()
         old_x, old_y = old["pos_x"], old["pos_y"]
         payload = endpoint.publish(decision) if endpoint \
             else {"action_id": step}          # :8788 taken — decision printed only
         report = wait_for_done(endpoint, payload["action_id"], done_wait)
         if report:
-            history.append(f"{entry}({json.dumps(args)}) → done, moved "
-                           f"({old_x:.2f}, {old_y:.2f}) → ({report.get('pos_x', 0):.2f}, "
-                           f"{report.get('pos_y', 0):.2f})")
+            moved = (f"{entry}({json.dumps(args)}) → done, moved "
+                     f"({old_x:.2f}, {old_y:.2f}) → ({report.get('pos_x', 0):.2f}, "
+                     f"{report.get('pos_y', 0):.2f})")
+            if action == "approach_plant":
+                # After moving, the loop always looks: the next decision rests
+                # on what is there now, never on a look from before the drive.
+                view, view_step, saw, distance = _inspect(brain, log, step)
+                looks_in_row = 1
+                moved += f" → then inspected automatically → {saw}"
+            history.append(moved)
         else:
             now = mrt_experience.last_row()
             history.append(f"{entry}({json.dumps(args)}) → NO completion signal after "
