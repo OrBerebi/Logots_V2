@@ -6,8 +6,27 @@
  *   pan                  : -90 to +90 degrees (0 = camera facing front, + = left)
  *   tilt                 : 0 to 180 degrees
  *
- * Read-back (Arduino -> Jetson): a 10-byte I2C read from 0x08 returns
- *   [0xE5][int32 left_count][int32 right_count][sum8 of bytes 0..8], little-endian.
+ * Self-contained motions (Jetson -> Arduino, added 2026-11-10). Sent once; the
+ * Arduino runs the wheels to an encoder-count target and stops. See motion.h.
+ *   "R,{seq},{counts},{fast},{slow},{ramp},{kb}\n"   rotate on the spot until
+ *        (right_delta - left_delta)/2 reaches {counts}; + = left turn
+ *   "T,{seq},{counts},{fast},{slow},{ramp},{kb}\n"   traverse straight until
+ *        (right_delta + left_delta)/2 reaches {counts}; + = forward
+ *   "S,{seq},{steer}\n"   heading correction for the running traverse {seq}: the
+ *        wanted (right_delta - left_delta)/2. The Jetson moves it from the IMU.
+ *   seq  : 1..255, a repeated seq is ignored (the Jetson resends until it sees it
+ *          in the read-back).  counts = 0 cancels.
+ *   fast / slow : PWM far from / near the target;  ramp : slow-down zone in counts
+ *   kb   : wheel-balance gain, PWM per count x100
+ *   While a motion runs, left_pwm/right_pwm of drive messages are ignored.
+ *
+ * Watchdog: no valid message for 500 ms -> motors stop, a running motion aborts.
+ *
+ * Read-back (Arduino -> Jetson): a 13-byte I2C read from 0x08 returns
+ *   [0xE5][int32 left_count][int32 right_count][sum8 of bytes 0..8]   (bytes 0..9,
+ *   unchanged, so a 10-byte read still works) then
+ *   [mot_seq][mot_state][(mot_seq + mot_state + 0x5A) & 0xFF]  (one motion at a time,
+ *   rotate and traverse share them).
  *   Counts are cumulative quadrature (4x) encoder ticks; positive = forward.
  *
  * Hardware (see src/pinout.txt):
@@ -20,6 +39,7 @@
 #include <Wire.h>
 #include <AFMotor.h>
 #include <Servo.h>
+#include "motion.h"
 
 // ── Calibration (set from the bench test, then reflash) ─────────────────────
 const int PAN_CENTER_DEG  = 90;  // servo angle that faces front (trim after re-seating horn)
@@ -72,7 +92,14 @@ uint8_t prevR, prevL;   // last 2-bit (B<<1)|A state, touched only by the ISR af
 const int8_t QDEC[16] = {0, +1, -1, 0,  -1, 0, 0, +1,  +1, 0, 0, -1,  0, -1, +1, 0};
 
 #define ENC_PKT_HDR 0xE5
-#define ENC_PKT_LEN 10
+#define ENC_PKT_LEN 13   // 10-byte encoder packet + mot_seq, mot_state, check
+#define MOT_PKT_SALT 0x5A
+
+// ── Motion (rotate / traverse) + watchdog ───────────────────────────────────────────────────
+Motion mot;
+bool motWasActive = false;
+const unsigned long WATCHDOG_MS = 500;   // the Jetson sends every ~100 ms
+unsigned long lastMsgTime = 0;
 
 unsigned long lastEncPrintTime = 0;
 int32_t lastPrintedLeft = 0, lastPrintedRight = 0;
@@ -94,6 +121,8 @@ void setup() {
   pinMode(A1, INPUT_PULLUP);
   pinMode(A2, INPUT_PULLUP);
   pinMode(A3, INPUT_PULLUP);
+  motionInit(mot);
+
   uint8_t p = PINC;
   prevR = p & 0x03;
   prevL = (p >> 2) & 0x03;
@@ -110,8 +139,31 @@ void loop() {
     parseMessage(pendingBuffer);
     messageReady = false;
   }
-  controlMotor(motorLeft,  LEFT_MOTOR_DIR  * target_left_pwm);
-  controlMotor(motorRight, RIGHT_MOTOR_DIR * target_right_pwm);
+  // Watchdog: a silent Jetson (crashed or frozen GUI) must not leave the wheels turning.
+  if (millis() - lastMsgTime > WATCHDOG_MS) {
+    target_left_pwm = 0;
+    target_right_pwm = 0;
+    motionAbort(mot);
+  }
+
+  noInterrupts();
+  int32_t encL = encLeft, encR = encRight;
+  interrupts();
+  motionStep(mot, encL, encR, millis());
+
+  if (motionActive(mot)) {
+    controlMotor(motorLeft,  LEFT_MOTOR_DIR  * mot.outL);
+    controlMotor(motorRight, RIGHT_MOTOR_DIR * mot.outR);
+  } else {
+    controlMotor(motorLeft,  LEFT_MOTOR_DIR  * target_left_pwm);
+    controlMotor(motorRight, RIGHT_MOTOR_DIR * target_right_pwm);
+  }
+  if (motWasActive && !motionActive(mot)) {
+    Serial.print("MOT end state="); Serial.print(mot.state);
+    Serial.print(" progress=");     Serial.print(motionProgress(mot, encL, encR));
+    Serial.print(" target=");       Serial.println(mot.target);
+  }
+  motWasActive = motionActive(mot);
   smoothServoMove();
   printEncoders();
 }
@@ -189,7 +241,8 @@ void receiveEvent(int bytesReceived) {
 
 // ── I2C ISR: master read -> encoder packet ────────────────────────────────
 // Runs in the TWI interrupt with interrupts off, so the 32-bit counts are read
-// atomically. Builds 10 bytes and returns; nothing else belongs here.
+// atomically. Builds 13 bytes and returns; nothing else belongs here. Bytes 0..9
+// are the original encoder packet; a master that reads only 10 still gets it.
 void requestEvent() {
   uint8_t pkt[ENC_PKT_LEN];
   int32_t l = encLeft, r = encRight;
@@ -197,18 +250,55 @@ void requestEvent() {
   memcpy(&pkt[1], &l, 4);   // AVR is little-endian
   memcpy(&pkt[5], &r, 4);
   uint8_t sum = 0;
-  for (uint8_t i = 0; i < ENC_PKT_LEN - 1; i++) sum += pkt[i];
-  pkt[ENC_PKT_LEN - 1] = sum;
+  for (uint8_t i = 0; i < 9; i++) sum += pkt[i];
+  pkt[9]  = sum;
+  pkt[10] = mot.seq;
+  pkt[11] = mot.state;
+  pkt[12] = (uint8_t)(mot.seq + mot.state + MOT_PKT_SALT);
   Wire.write(pkt, ENC_PKT_LEN);
+}
+
+// ── Parse "R|T,{seq},{counts},{fast},{slow},{ramp},{kb}" and "S,{seq},{steer}" ──
+void parseMotion(const char* msg) {
+  int seq = 0, fast = 0, slow = 0, ramp = 0, kb = 0;
+  long counts = 0;
+  if (msg[0] == 'S') {
+    if (sscanf(msg + 1, ",%d,%ld", &seq, &counts) == 2) {
+      lastMsgTime = millis();
+      motionSteer(mot, (uint8_t)seq, counts);
+    }
+    return;                      // sent every tick while traversing: no Serial print
+  }
+  int n = sscanf(msg + 1, ",%d,%ld,%d,%d,%d,%d", &seq, &counts, &fast, &slow, &ramp, &kb);
+  if (n != 6 || seq < 1 || seq > 255) {
+    Serial.print("Parse error: ");
+    Serial.println(msg);
+    return;
+  }
+  lastMsgTime = millis();
+  noInterrupts();
+  int32_t encL = encLeft, encR = encRight;
+  interrupts();
+  uint8_t mode = msg[0] == 'R' ? MOT_SPIN : MOT_STRAIGHT;
+  if (motionCommand(mot, mode, (uint8_t)seq, counts, fast, slow, ramp, kb, encL, encR, millis())) {
+    target_left_pwm = 0;     // nothing left over to resume when the motion ends
+    target_right_pwm = 0;
+    Serial.print(msg[0] == 'R' ? "ROT seq=" : "TRAV seq="); Serial.print(seq);
+    Serial.print(" counts="); Serial.println(counts);
+  }
 }
 
 // ── Parse "{left},{right},{pan},{tilt}" ────────────────────────────────────
 void parseMessage(const char* msg) {
+  if (msg[0] == 'R' || msg[0] == 'T' || msg[0] == 'S') { parseMotion(msg); return; }
   int lp = 0, rp = 0, pa = 0, ta = 90;
   int n = sscanf(msg, "%d,%d,%d,%d", &lp, &rp, &pa, &ta);
   if (n == 4) {
-    target_left_pwm  = lp;
-    target_right_pwm = rp;
+    lastMsgTime = millis();
+    if (!motionActive(mot)) {   // a motion owns the wheels until it ends
+      target_left_pwm  = lp;
+      target_right_pwm = rp;
+    }
     target_pan_angle  = panToServo(pa);
     target_tilt_angle = constrain(ta, 0, 180);
     Serial.print("OK  L="); Serial.print(lp);

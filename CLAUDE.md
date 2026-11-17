@@ -48,7 +48,8 @@ Logots_V2/
     ├── pinout.txt           — full 40-pin header wiring reference
     └── firmware/
         └── logots_motor_control/
-            └── logots_motor_control.ino  — Arduino firmware
+            ├── logots_motor_control.ino  — Arduino firmware
+            └── motion.h                  — rotate/traverse-by-counts state machine (plain C++, PC-testable)
 ```
 
 ## Key files
@@ -59,6 +60,7 @@ Logots_V2/
 | `src/api_demo.py` | Toy example using the API: video + synced audio playback |
 | `src/functions.py` | Decision layer: routines like initiation, plus `--listen` voice mode (see "Voice assistant") |
 | `src/actions.py` | The `:8788` contract: `/latest_action`, `/action_done`, `/status` |
+| `src/motion_live_test.py` | Live test of traverse / rotate / servo on the real robot (see Known issues) |
 | `src/audio_on_demand.py` | Shared voice plumbing only: `Ears` (wake word), `llama-server` management, `speak()`/Piper, audio sources |
 | `src/firmware/logots_motor_control/logots_motor_control.ino` | Arduino firmware |
 | `src/pinout.txt` | Full 40-pin header wiring reference |
@@ -97,6 +99,35 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
     was re-seated so servo 90 = front). The firmware maps it to a servo angle with
     `PAN_CENTER_DEG`/`PAN_DIR` from its calibration block and starts at front on power-up.
   - tilt: 0 to 180 degrees
+- **Motion messages (2026-11-10, untested on the robot — see Known issues)**: sent once,
+  the Arduino runs the wheels to an encoder-count target and stops by itself (`motion.h`):
+  - `"R,{seq},{counts},{fast},{slow},{ramp},{kb}\n"` — rotate on the spot until
+    `(right_delta − left_delta)/2` reaches `counts` (+ = left turn)
+  - `"T,{seq},{counts},{fast},{slow},{ramp},{kb}\n"` — traverse straight until
+    `(right_delta + left_delta)/2` reaches `counts` (+ = forward)
+  - `"S,{seq},{steer}\n"` — during traverse `seq` only: the wanted
+    `(right_delta − left_delta)/2`. The Jetson sends it every tick from the IMU heading error.
+  - `counts=0` cancels. `seq` is 1..255 and a repeated `seq` is ignored, so the GUI resends
+    R/T every tick until the read-back shows it. `fast`/`slow` = PWM far from/near the
+    target, `ramp` = slow-down zone in counts, `kb` = wheel-balance gain ×100: all tuning is
+    sent from the Jetson, so tuning needs no reflash.
+  - `motion.h` does: PWM ramp-down, a trim that keeps the wheels balanced (pivot in place /
+    matched for straight), a PWM boost when the wheels don't move, an early cut for
+    coasting, up to 2 touch-up passes, a time limit that grows with the distance (max 60 s).
+    While a motion runs, the drive message's `left_pwm`/`right_pwm` are ignored (pan/tilt
+    still apply).
+- **Watchdog (2026-11-10)**: no valid message for 500 ms → motors stop and a running motion
+  aborts. A frozen or crashed GUI no longer leaves the wheels turning. Sim mode sends
+  nothing, so the motors are stopped there too.
+- **Motion status in the read-back**: the read is now 13 bytes. Bytes 0–9 are the encoder
+  packet below, unchanged; then `[mot_seq][mot_state][(mot_seq+mot_state+0x5A)&0xFF]`
+  (`mot_state`: 0 idle, 1 moving, 2 settling, 3 done, 4 timeout, 5 aborted; rotate and
+  traverse share them, one motion at a time). Firmware from before 2026-11-10 returns only
+  10 bytes; the extra three then fail their check, the GUI sets `fw_motion=False`, keeps
+  reading encoders, and refuses motions with "Arduino needs the new firmware (reflash)".
+- **Tilt on the wire stays the raw servo angle** (0…180). The signed tilt of the servo
+  command is converted on the Jetson (`tilt_to_raw()`), so a GUI/firmware version mix can
+  never throw the tilt servo to an end stop.
 - **Encoder read-back**: a 10-byte I2C read from `0x08` returns `[0xE5][int32 left][int32 right]
   [sum8 of bytes 0..8]`, little-endian, read by `_read_encoders()` each real tick and shown as
   `EL`/`ER` in the side panel (`----` = no reading). Counts are cumulative 4x-quadrature ticks,
@@ -129,7 +160,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
   LOGOTS ROBOT CONTROL          ⬤ MIC: asleep  ⬤ LLM: ready  FPS:8.2/10  ⬤ DISCONNECTED
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
-│  joystick + pan/    │  3D Madgwick AHRS   │
+│  traverse/rotate +  │  3D Madgwick AHRS   │
 │  tilt sliders +     │  YPR display        │
 │  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
@@ -160,7 +191,31 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
   dingbat as the connection indicator (not emoji — the deployed GUI's font has no color-emoji
   support, confirmed 2026-08-16; don't reach for 🎤/🧠-style pictographic emoji anywhere in this
   file, use `⬤`/`▶`/`⚫`/`■`/`⌖`/`⌨` instead).
-- Keyboard: W/S = forward/back, A/D = turn, SPACE = stop
+- **Three parameters, no free driving (2026-11-10, Or's decision)**: the robot is moved
+  only by `traverse` (cm, + = forward), `rotate` (degrees, + = left) and `servo` (pan, tilt)
+  — from the GUI and from the LLM alike. The joystick is gone; **don't bring back
+  drag-to-drive or hold-a-key driving.** In DRIVE & CAM, left column, top to bottom:
+  - the **motion dial** (`_motion_dial()`/`_draw_joy()`): display only. The knob moves
+    up/down with a traverse, the outer ring fills with a rotation (dim arc = requested,
+    bright arc = done, up = heading at the start). In Sim it replays the recorded PWM.
+  - **TRAVERSE**: `FWD 50` `FWD 10` `BWD 10` `BWD 50`, and a box + `GO` (±200 cm)
+  - **ROTATE**: `L 90°` `L 15°` `R 15°` `R 90°`, and a box + `GO` (±180°)
+  - **Servo** = the PAN and TILT sliders (right column). TILT is signed since 2026-11-10:
+    0 = level, + = up, shown as `TLT:+10°`. Internally `tilt_angle` is still the raw servo
+    angle (wire, CSV, frame API), converted by `tilt_to_raw()`/`tilt_from_raw()` with
+    `TILT_LEVEL_DEG`/`TILT_DIR` — which way is "up" is a guess until checked on the robot.
+  Each press sends one command to `Mover`; the robot carries it out and stops by itself.
+- Keyboard: W/S = traverse `TRAV_KEY_STEP_CM` (10 cm) forward/back, A/D = rotate
+  `ROT_KEY_STEP_DEG` (15°) left/right, one step per press (a held key starts the next step
+  when one ends), SPACE = stop
+- **Who is moving the robot (2026-11-10)**: the badge at the top right of DRIVE & CAM
+  (`lbl_auto`, drawn by `_update_drive_widgets()`) shows `⬤ READY`, `⬤ TRAVERSING +10 cm ·
+  6 cm to go` / `⬤ ROTATING +15° · 6° to go` (from the GUI), `⬤ SELF-DRIVING  traverse -30 cm
+  · 12 cm to go` / `rotate …` / `servo (+45, +10)` / `approach_plant · 1.4 s left` (from the
+  LLM), then how the last motion ended for 5 s. While `self_driving` is true the dial's knob
+  is amber and the mini-map shows a dashed line at a rotation's target heading. **The motion
+  controls are ignored meanwhile; only SPACE and `■ STOP` (`_estop()`) cancel**, and the
+  cancelled action still reports where the robot ended up.
 - Arduino auto-connects on startup, retries every 3s if lost
 
 ## Recording feature
@@ -242,6 +297,29 @@ that report's asks #2/#3) closes the loop from this side:
   then zeros them; `_send_motors()`'s normal per-tick I2C send does the rest. Blocked while
   `sim_mode` is on. Tolerates `:8788` not being up yet (functions.py not running) — just keeps
   polling silently.
+- **The three motion commands (2026-11-10)** — what the LLM is meant to use from now on;
+  full spec for Asaph in `docs/v2_architecture/motion_commands.md`. Each is published once
+  and answered with one `/action_done`:
+  - `{"action":"traverse","args":{"cm":-30}}` → report adds `moved_cm` (encoders)
+  - `{"action":"rotate","args":{"degrees":-45}}` → report adds `turned_deg` (IMU)
+  - `{"action":"servo","args":{"pan":45,"tilt":10}}` → report adds the `pan`/`tilt` set
+  - `problem` (string) is added when a command was limited (±200 cm, ±180°, pan ±45),
+    stopped from the GUI, timed out, or could not run.
+  `traverse` and `rotate` go through `gui._mover` (`Mover`, next to `PositionEstimator`);
+  tuning is the `SPIN_*`/`ROT_*`/`TRAV_*` block at the top of `logots_ui.py`.
+  - *Rotate*, one pass at a time: degrees → counts (`SPIN_COUNTS_PER_DEG`) → the firmware's
+    R message → wait for its `done` → wait for the yaw to be still → compare with the IMU →
+    another pass for the difference if over `ROT_TOL_DEG` (1.5°), up to `ROT_MAX_PASSES`
+    (4). It learns the real counts-per-degree from every pass over 10° and prints it.
+  - *Traverse*, one pass: cm → counts (`TRAV_COUNTS_PER_CM`, from the bench-measured
+    encoder constants, no guess) → T message. While it runs, each tick moves the S steer
+    value against the IMU heading error (`TRAV_STEER_K`), so the starting heading is held
+    even where matched wheels would curve. Distance is taken from the encoders.
+  - *Servo*: sets `pan_angle`/`tilt_angle`, waits for the travel time, reports.
+  **The LLM side was deliberately not touched** (Or, 2026-11-10: Asaph does it):
+  `knowledge/actions.md` has none of the three yet, and `functions.py`'s step history shows
+  only position, so `rotate`/`servo` would read as "no change" until he adds heading/pan/tilt.
+  `approach_plant` is unchanged and still works.
 - **Completion signal**: after driving, `ActionReader` reads the live pose off
   `gui._pos_est` (`.x`/`.y`/`.heading`) and does `POST :8788/action_done` with
   `{"action_id", "pos_x", "pos_y", "heading"}` — exactly the shape `actions.py`'s
@@ -256,10 +334,9 @@ that report's asks #2/#3) closes the loop from this side:
 - **Status (2026-10-31)**: `GET :8788/status` returns `{"stage", "last_action"}` for the GUI's
   indicators. A plain `functions.py` run reports `off` until a routine starts, then the routine's
   name (`initiation`).
-- **Not yet done**: only `approach_plant` is actuated; other actions (`inspect_plant`, `finish`,
-  `speak`, …) are Asaf's-side or no-ops here by design per the report. Concurrent manual
-  joystick/keyboard driving while `ActionReader` is also driving is unguarded (last write wins)
-  — fine for now since the two aren't expected to run at once, revisit if that changes.
+- **Not actuated here**: `inspect_plant`, `finish`, `speak`, … are Asaf's-side or no-ops by
+  design per the report. GUI input while `ActionReader` moves the robot is guarded since
+  2026-11-10: the motion controls are ignored and SPACE/`■ STOP` cancel the action.
 
 ## Note for Asaph — 2026-10-03 changes relevant to the LLM/functions layer
 
@@ -549,6 +626,65 @@ calibration" in Known issues); git credentials ("Git setup").
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
+- **Motion commands (traverse / rotate / servo) written 2026-11-10 and NOT YET RUN ON THE
+  ROBOT — Asaph, start here.** Or wrote them on the Mac with the robot in Berlin. What was
+  checked: the firmware compiles; `motion.h` reaches its count target against a simulated
+  motor model on a PC (sticky wheels, unequal wheels, steer, cancel, watchdog, dead motors);
+  the GUI side passes 42 checks against a fake Arduino and fake IMU (rotate with a wrong
+  counts-per-degree guess, traverse on a floor that curves, cancel, old firmware, wrong
+  direction, all three commands over `:8788`). None of that is a hardware test, and every
+  value marked GUESS in the `SPIN_*`/`ROT_*`/`TRAV_*`/`TILT_*` block is a starting point.
+  Expect a tuning round, and possibly a firmware fix and a second flash. First run, in order:
+  1. `git pull`, then flash `src/firmware/logots_motor_control` from the Mac (Arduino IDE;
+     `motion.h` is in the same folder and is picked up automatically). **Until it is flashed
+     the wheels can't be moved from the GUI at all** ("Arduino needs the new firmware"),
+     since the GUI no longer has free driving; `approach_plant` from the LLM still works.
+  2. **Wheels off the floor**, GUI running with `LISTEN=0` (so initiation doesn't start).
+     - `FWD 10`: both wheels turn forward, then stop. Badge: `moved +10.0 cm`.
+     - `L 15°`: right wheel forward, left backward, briefly. The body doesn't turn while
+       raised, so the IMU sees nothing and it ends "still … off after 4 passes": fine here.
+     - Nothing moves and it ends "Arduino gave up" → look for `ROT seq=…`/`TRAV seq=…` in
+       the Serial Monitor.
+     - TILT slider up: the camera should tilt **up**. If it goes down, set `TILT_DIR = -1`.
+       If slider 0 isn't level, set `TILT_LEVEL_DEG`.
+  3. On the floor, clear space, hand on SPACE:
+     - `L 15°`, `L 90°`, `R 90°`. Badge **"turned the wrong way: flip SPIN_DIR"** → set
+       `SPIN_DIR = -1`, restart the GUI (no reflash). The terminal prints the measured
+       counts/deg on each big pass: put the value it settles on into `SPIN_COUNTS_PER_DEG`
+       (the 20 there assumes ~16 cm between the wheels, which nobody measured). With the
+       right value most rotations take one pass.
+     - `FWD 50` next to a tape measure: distance should be within a couple of cm.
+       Watch the heading: if the robot weaves left-right, lower `TRAV_STEER_K`; if it
+       curves steadily, raise it. If it veers hard one way at once, `SPIN_DIR` is wrong
+       (the steering uses the same sign).
+     - Stops short/overshoots by the same amount each time → `ROT_PWM_SLOW`/`TRAV_PWM_SLOW`
+       (lower = gentler arrival; the firmware raises it by itself if the wheels stick) and
+       the `*_RAMP_*` values. Creeps forward while rotating → raise `ROT_BALANCE_K`.
+  4. **Run the live test** (`src/motion_live_test.py`) — this is the acceptance test for the
+     feature, and the first thing for Claude to run on the Jetson once the firmware is
+     flashed. It plays the LLM's part: publishes each command once on `:8788`, waits for
+     the report, and compares it with the IMU heading / encoder position / servo angles on
+     `:8787`. GUI running with `LISTEN=0` (the test needs `:8788`), then:
+     ```bash
+     conda run --no-capture-output -n logots python src/motion_live_test.py --stage raised  # wheels off the floor
+     conda run --no-capture-output -n logots python src/motion_live_test.py --stage floor   # 1 m clear all round, ~3 min
+     conda run --no-capture-output -n logots python src/motion_live_test.py --stage tape    # asks a person for tape-measure readings
+     ```
+     Each prints PASS/FAIL per check, exits non-zero on any FAIL, and saves the text to
+     `runs/motion_test_<stage>_<timestamp>.txt`. A preflight (GUI up, Real mode, Arduino
+     connected, new firmware) runs first and nothing moves if it fails. `floor` stays within
+     ~60 cm of the start: servo sweep, rotations of 15/90/45° both ways, traverses of
+     10/30/50 cm both ways, 4×90° back to the same heading, and a 400° request that must be
+     limited to 180°. It cannot stop a motion (the contract has no cancel): SPACE in the GUI.
+     Its limits (3°, 1.5 cm, …, top of the file) are looser than the controller's targets on
+     purpose: it answers "does it work", not "is it tuned". What it can't see is whether the
+     sensors themselves are right, which is what `--stage tape` is for. On the Mac it was
+     dry-run against a fake Arduino only (88/88, and it refuses to move with old firmware).
+  5. LLM side: `docs/v2_architecture/motion_commands.md`.
+  Not handled: the IMU yaw drifts slowly and a motion trusts it for the seconds it runs;
+  there is no obstacle detection (a traverse is capped at 2 m per command for that reason).
+  Recordings show the nominal `ROT_PWM_FAST`/`TRAV_PWM_FAST` in `left_pwm`/`right_pwm` while
+  the Arduino is moving the wheels, not the PWM it actually applied.
 - **GUI starts the listener again, indicators restored (2026-10-31, commit `5351d40`)**: PR #7
   moved voice out of the GUI, which was the right architecture, but one-command startup and the
   status indicators went with it by accident (the auto-start request was posted 4 minutes before

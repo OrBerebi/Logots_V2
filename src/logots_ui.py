@@ -67,6 +67,10 @@ API_PORT      = 8787
 ARDUINO_ADDR  = 0x08
 ENC_PKT_HDR   = 0xE5   # encoder read-back packet: hdr, int32 left, int32 right, sum8
 ENC_PKT_LEN   = 10     # (see requestEvent() in the firmware)
+MOT_PKT_LEN   = 13     # the same packet + [mot_seq][mot_state][check] (firmware with motions)
+MOT_PKT_SALT  = 0x5A   # check = (mot_seq + mot_state + salt) & 0xFF
+# firmware motion states (motion.h); rotate and traverse share them, one motion at a time
+MOT_IDLE, MOT_MOVING, MOT_SETTLE, MOT_DONE, MOT_TIMEOUT, MOT_ABORTED = range(6)
 IMU_I2C_BUS   = 7
 MPU_ADDR      = 0x68
 AUDIO_RATE    = 16000
@@ -136,6 +140,58 @@ STRAIGHT_KI       = 0.4   # PWM counts of trim per (degree·second) of accumulat
                            # slightly ahead) without raising KP again.
 STRAIGHT_I_MAX    = 40     # anti-windup clamp on the accumulated integral's contribution
 STRAIGHT_MAX_TRIM = 60    # clamp, so a large transient error can't stall/reverse a wheel
+
+# Motion commands (2026-11-10): traverse(cm), rotate(degrees), servo(pan, tilt). Each is
+# sent once and the robot carries it out by itself. For the two wheel motions the Arduino
+# runs the wheels to an encoder-count target and stops (motion.h); Mover below turns
+# cm/degrees into counts and uses the IMU for what the encoders can't see: the real angle
+# of a rotation (correction passes) and the heading during a traverse (steering).
+# Every number here is sent to the Arduino with each command, so tuning never needs a
+# reflash. NOT YET RUN ON THE ROBOT: all values marked GUESS are starting points.
+# + degrees = left = IMU yaw going up. + cm = forward.
+SPIN_COUNTS_PER_DEG = 20.0  # encoder counts of (right-left)/2 per degree of body rotation.
+                            # GUESS (assumes ~16 cm between the wheels). Mover learns the
+                            # real value from the IMU and prints it: copy it here.
+SPIN_DIR          = +1      # flip to -1 if a rotation aborts with "turned the wrong way"
+ROT_PWM_FAST      = 150     # PWM far from the target
+ROT_PWM_SLOW      = 90      # PWM near the target; the firmware raises it by itself if the
+                            # wheels don't move (stiction)
+ROT_RAMP_DEG      = 20      # slow down from FAST to SLOW over the last this-many degrees
+ROT_BALANCE_K     = 0.5     # PWM of trim per count of difference between the two wheels,
+                            # keeps the robot pivoting in place
+ROT_TOL_DEG       = 1.5     # IMU error accepted without another correction pass
+ROT_MAX_PASSES    = 4       # first pass + corrections
+ROT_SETTLE_S      = 0.3     # yaw (rotate) / wheels (traverse) must be still this long
+ROT_STILL_DEG     = 0.3     # "still" = yaw changed less than this in one tick
+ROT_WRONG_WAY_DEG = 8       # turned this far against the command -> abort (SPIN_DIR wrong)
+ROT_TIMEOUT_S     = 20      # a whole rotate request, all passes
+ROT_KEY_STEP_DEG  = 15      # one A / D key press
+TRAV_KEY_STEP_CM  = 10      # one W / S key press
+
+# Traverse: distance comes from the encoders alone (bench-measured constants above, ~2% on
+# the 2026-10-03 tape test), so there is no guess in the cm -> counts conversion.
+TRAV_COUNTS_PER_CM = ((LEFT_COUNTS_PER_REV + RIGHT_COUNTS_PER_REV) / 2.0
+                      / (WHEEL_CIRCUMFERENCE_M * 100.0))      # ~146 counts of (left+right)/2
+TRAV_PWM_FAST     = 150     # ~0.165 m/s on the floor (2026-10-03)
+TRAV_PWM_SLOW     = 90
+TRAV_RAMP_CM      = 10      # slow down over the last this-many cm
+TRAV_BALANCE_K    = 0.5     # PWM of trim per count the wheels are off the wanted difference
+TRAV_STEER_K      = 0.15    # GUESS. Each tick the wanted wheel difference moves by this
+                            # fraction of the IMU heading error. Higher = straighter but can
+                            # weave (the 2026-10-03 lesson with STRAIGHT_KP); 0 = wheels
+                            # simply matched, no IMU.
+TRAV_STEER_MAX_DEG = 30     # the IMU may bend the wheel difference by at most this much
+TRAV_TOL_CM       = 1.0     # further off than this at the end is reported as a problem
+TRAV_MAX_CM       = 200     # one traverse is clamped to this: there is no obstacle detection
+
+# Servo command: pan as everywhere else (0 = front, + = left); tilt signed, 0 = level, + = up.
+# The wire, the tilt slider, the CSV and the frame API keep the raw tilt servo angle.
+TILT_LEVEL_DEG    = 90      # raw tilt servo angle with the camera level. GUESS (the start pose)
+TILT_DIR          = +1      # GUESS: +1 if a larger raw angle tilts the camera UP, else -1
+SERVO_PAN_MAX     = 45      # same cap as the GUI pan slider
+SERVO_TILT_MAX    = 90
+SERVO_MS_PER_DEG  = 2       # wait this long per degree of travel before reporting (the
+                            # firmware steps 1 degree per ms; this leaves margin)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C_BG      = '#1e1e2e'
@@ -337,6 +393,271 @@ class PositionEstimator:
         self.y += forward * math.sin(th)
         self.heading = yaw_deg
 
+# ── Motion commands: traverse / rotate / servo ────────────────────────────────
+def _wrap180(a):
+    return (a + 180) % 360 - 180
+
+def tilt_to_raw(tilt):
+    """Signed tilt (0 = level, + = up) -> raw tilt servo angle 0..180."""
+    return int(max(0, min(180, round(TILT_LEVEL_DEG + TILT_DIR * tilt))))
+
+def tilt_from_raw(raw):
+    return int(round((raw - TILT_LEVEL_DEG) * TILT_DIR))
+
+class Mover:
+    """One wheel motion at a time, rotate(degrees) or traverse(cm), stepped once per real
+    tick. The request is made once; this carries it through and sets job['event'].
+
+    Rotate, per pass: degrees still to turn -> encoder counts -> one "R,..." message to the
+    Arduino, resent every tick until the read-back shows its seq. The Arduino spins to that
+    count and stops (motion.h). Once the yaw is still, the turn so far is read off the IMU
+    (wheels scrub when spinning, so counts alone are a few percent off) and, if it is more
+    than ROT_TOL_DEG from the request, another pass covers the difference. Each large pass
+    also measures the real counts-per-degree, which replaces the SPIN_COUNTS_PER_DEG guess
+    for the rest of the session.
+
+    Traverse: cm -> counts -> one "T,..." message. The Arduino drives to the count with the
+    two wheels matched. While it runs, every tick sends "S,..." = how far apart the wheels
+    should be, moved against the IMU heading error, so the heading at the start is held even
+    if matched wheels would curve. One pass: for distance the encoders are the reference."""
+
+    def __init__(self, gui):
+        self.gui = gui
+        self.job = None
+        self.last = None             # result of the last finished request
+        self.counts_per_deg = SPIN_COUNTS_PER_DEG
+        self._seq = None
+        self._lock = threading.Lock()
+
+    @property
+    def active(self):
+        return self.job is not None
+
+    def request(self, kind, amount, source='manual'):
+        """kind 'rotate' (degrees, + = left) or 'traverse' (cm, + = forward). Returns the
+        job (wait on job['event'], then read job['result']) or None if one is already
+        running. Any thread."""
+        with self._lock:
+            if self.job is not None:
+                return None
+            self.job = {'kind': kind, 'requested': float(amount), 'source': source,
+                        'turned': 0.0, 'moved': 0.0, 'yaw_prev': None, 'phase': 'start',
+                        'passes': 0, 'nominal': (0, 0), 't0': time.monotonic(),
+                        'timeout': (ROT_TIMEOUT_S if kind == 'rotate'
+                                    else 10 + abs(amount) * 0.3),
+                        'cancel': None, 'result': None, 'event': threading.Event()}
+            return self.job
+
+    def cancel(self, reason='stopped'):
+        job = self.job
+        if job is not None and not job['cancel']:
+            job['cancel'] = reason
+
+    def abort(self, reason):
+        """End now without telling the Arduino (it is gone, or its watchdog will stop it)."""
+        if self.job is not None:
+            self._finish(False, reason)
+
+    def wire_message(self):
+        """The motion message to send this tick in place of the drive message, or None."""
+        job = self.job
+        if job is None:
+            return None
+        if job['phase'] == 'run' and job['kind'] == 'traverse':
+            return f"S,{job['seq']},{int(round(job['steer']))}\n".encode()
+        if job['phase'] not in ('send', 'cancel'):
+            return None
+        letter = 'R' if job['kind'] == 'rotate' else 'T'
+        if job['counts'] == 0:
+            return f"{letter},{job['seq']},0,0,0,0,0\n".encode()
+        if job['kind'] == 'rotate':
+            fast, slow, kb = ROT_PWM_FAST, ROT_PWM_SLOW, ROT_BALANCE_K
+            ramp = ROT_RAMP_DEG * self.counts_per_deg
+        else:
+            fast, slow, kb = TRAV_PWM_FAST, TRAV_PWM_SLOW, TRAV_BALANCE_K
+            ramp = TRAV_RAMP_CM * TRAV_COUNTS_PER_CM
+        return (f"{letter},{job['seq']},{job['counts']},{fast},{slow},"
+                f"{int(round(ramp))},{int(round(kb * 100))}\n").encode()
+
+    def step(self, now=None):
+        job = self.job
+        if job is None:
+            return
+        g = self.gui
+        now = time.monotonic() if now is None else now
+        d = 0.0
+        imu = g.imu_reader
+        if imu is not None and imu.status == 'running':
+            yaw = imu.yaw
+            if job['yaw_prev'] is not None:
+                d = _wrap180(yaw - job['yaw_prev'])
+                job['turned'] += d
+            job['yaw_prev'] = yaw
+        else:
+            job['yaw_prev'] = None
+        job['nominal'] = (0, 0)
+        trav = job['kind'] == 'traverse'
+        if trav and job['phase'] != 'start':
+            moved = self._moved_cm()
+            if moved is not None:
+                job['moved'] = moved
+        ph = job['phase']
+        if ph == 'start':
+            if not (g.connected and g.i2c):
+                return self._finish(False, 'Arduino not connected')
+            if not g.fw_motion:
+                return self._finish(False, 'Arduino needs the new firmware (reflash)')
+            if job['cancel']:
+                return self._finish(False, job['cancel'])
+            if trav:
+                return self._begin_traverse(now)
+            return self._begin_pass(job['requested'], now)
+        if not g.connected:
+            return self._finish(False, 'Arduino disconnected')
+        if ph != 'cancel' and (job['cancel'] or now - job['t0'] > job['timeout']):
+            job['cancel'] = job['cancel'] or f"timed out after {job['timeout']:.0f} s"
+            job.update(seq=self._next_seq(), counts=0, phase='cancel', t_phase=now)
+            return
+        if ph == 'cancel':
+            if g.fw_mot_seq == job['seq'] or now - job['t_phase'] > 1.0:
+                self._finish(False, job['cancel'])
+        elif ph == 'send':
+            if g.fw_mot_seq == job['seq']:
+                job['phase'] = 'run'
+        elif ph == 'run':
+            st = g.fw_mot_state if g.fw_mot_seq == job['seq'] else None
+            if st == MOT_MOVING:
+                if trav:
+                    job['nominal'] = (job['dir'] * TRAV_PWM_FAST, job['dir'] * TRAV_PWM_FAST)
+                else:
+                    job['nominal'] = (-job['dir'] * ROT_PWM_FAST, job['dir'] * ROT_PWM_FAST)
+            elif st in (MOT_DONE, MOT_TIMEOUT, MOT_ABORTED):
+                job.update(fw_end=st, phase='settle', t_phase=now, t_still=now,
+                           enc_prev=(g.enc_left, g.enc_right))
+            if trav and job['yaw_prev'] is not None:
+                # Turned left of the starting heading (turned > 0): ask the wheels for a
+                # difference that turns right, and keep adding while the error lasts.
+                lim = TRAV_STEER_MAX_DEG * self.counts_per_deg
+                job['steer'] = max(-lim, min(lim, job['steer'] - TRAV_STEER_K * job['turned']
+                                             * self.counts_per_deg * SPIN_DIR))
+        elif ph == 'settle':
+            if trav:
+                enc = (g.enc_left, g.enc_right)
+                if enc != job['enc_prev']:
+                    job['enc_prev'] = enc; job['t_still'] = now
+            elif abs(d) > ROT_STILL_DEG:
+                job['t_still'] = now
+            if now - job['t_still'] >= ROT_SETTLE_S or now - job['t_phase'] > 2.0:
+                self._end_traverse() if trav else self._evaluate(now)
+
+    def _enc_progress(self):
+        g = self.gui
+        if g.enc_left is None or g.enc_right is None:
+            return None
+        return (g.enc_right - g.enc_left) / 2.0
+
+    def _moved_cm(self):
+        """Distance since the traverse began, from the encoders (same maths as
+        PositionEstimator: each wheel's own counts-per-rev, averaged)."""
+        g = self.gui; job = self.job
+        if g.enc_left is None or g.enc_right is None or job.get('enc0') is None:
+            return None
+        l = (g.enc_left  - job['enc0'][0]) / LEFT_COUNTS_PER_REV
+        r = (g.enc_right - job['enc0'][1]) / RIGHT_COUNTS_PER_REV
+        return (l + r) / 2.0 * WHEEL_CIRCUMFERENCE_M * 100.0
+
+    def _next_seq(self):
+        fw = self.gui.fw_mot_seq
+        base = self._seq if self._seq is not None else (fw or 0)
+        new = base % 255 + 1                 # 1..255
+        if new == fw:                        # must differ from the one the Arduino holds
+            new = new % 255 + 1
+        self._seq = new
+        return new
+
+    def _begin_traverse(self, now):
+        job = self.job; g = self.gui
+        counts = int(round(job['requested'] * TRAV_COUNTS_PER_CM))
+        if counts == 0:
+            return self._finish(True, '')
+        if g.enc_left is None or g.enc_right is None:
+            return self._finish(False, 'no encoder reading from the Arduino')
+        job['passes'] = 1
+        job.update(seq=self._next_seq(), counts=counts, dir=(1 if counts > 0 else -1),
+                   enc0=(g.enc_left, g.enc_right), steer=0.0, turned=0.0,
+                   phase='send', t_phase=now)
+
+    def _end_traverse(self):
+        job = self.job
+        off = job['requested'] - job['moved']
+        if job['fw_end'] == MOT_TIMEOUT:
+            self._finish(False, 'Arduino gave up: wheels not turning?')
+        elif job['fw_end'] == MOT_ABORTED:
+            self._finish(False, 'Arduino stopped it (lost contact with the Jetson)')
+        elif abs(off) > TRAV_TOL_CM:
+            self._finish(False, f'stopped {off:+.1f} cm from the target')
+        else:
+            self._finish(True, '' if job['yaw_prev'] is not None
+                         else 'no IMU: wheels matched, heading not checked')
+
+    def _begin_pass(self, rem_deg, now):
+        job = self.job
+        counts = int(round(rem_deg * self.counts_per_deg)) * SPIN_DIR
+        if counts == 0:
+            return self._finish(True, '')
+        job['passes'] += 1
+        job.update(seq=self._next_seq(), counts=counts, dir=(1 if rem_deg > 0 else -1),
+                   pass_req=rem_deg, pass_turned0=job['turned'],
+                   pass_enc0=self._enc_progress(), phase='send', t_phase=now)
+
+    def _evaluate(self, now):
+        job = self.job
+        enc0, enc1 = job['pass_enc0'], self._enc_progress()
+        left_counts = (enc1 - enc0) * SPIN_DIR if enc0 is not None and enc1 is not None else None
+        if job['yaw_prev'] is None:          # no IMU: the wheel encoders are all there is
+            if left_counts is not None:
+                job['turned'] += left_counts / self.counts_per_deg
+            return self._finish(left_counts is not None,
+                                'no IMU: angle from the wheel encoders only')
+        pass_turn = job['turned'] - job['pass_turned0']
+        if abs(pass_turn) >= ROT_WRONG_WAY_DEG and pass_turn * job['pass_req'] < 0:
+            return self._finish(False, 'turned the wrong way: flip SPIN_DIR in logots_ui.py')
+        if left_counts is not None and abs(pass_turn) >= 10 and left_counts * pass_turn > 0:
+            measured = abs(left_counts) / abs(pass_turn)
+            self.counts_per_deg = max(0.5 * SPIN_COUNTS_PER_DEG, min(2.0 * SPIN_COUNTS_PER_DEG,
+                                      0.5 * self.counts_per_deg + 0.5 * measured))
+            print(f"[rotate] pass {job['passes']}: asked {job['pass_req']:+.1f}°, IMU says "
+                  f"{pass_turn:+.1f}° for {left_counts:+.0f} counts = {measured:.1f} counts/deg "
+                  f"(now using {self.counts_per_deg:.1f}; SPIN_COUNTS_PER_DEG is "
+                  f"{SPIN_COUNTS_PER_DEG})", flush=True)
+        rem = job['requested'] - job['turned']
+        if abs(rem) <= ROT_TOL_DEG:
+            self._finish(True, '')
+        elif job['fw_end'] == MOT_TIMEOUT:
+            self._finish(False, 'Arduino gave up: wheels not turning?')
+        elif job['passes'] >= ROT_MAX_PASSES:
+            self._finish(False, f"still {rem:+.1f}° off after {job['passes']} passes")
+        else:
+            self._begin_pass(rem, now)
+
+    def _finish(self, ok, reason):
+        job = self.job
+        res = {'kind': job['kind'], 'requested': job['requested'],
+               'turned': round(job['turned'], 2), 'moved': round(job['moved'], 2),
+               'passes': job['passes'], 'ok': ok, 'reason': reason, 't': time.monotonic()}
+        job['result'] = res
+        self.last = res
+        self.job = None
+        job['event'].set()
+        if job['kind'] == 'rotate':
+            did = f"turned {res['turned']:+.1f}° in {job['passes']} pass(es)"
+            asked = f"{job['requested']:+.0f}°"
+        else:
+            did = f"moved {res['moved']:+.1f} cm, heading changed {res['turned']:+.1f}°"
+            asked = f"{job['requested']:+.0f} cm"
+        print(f"[{job['kind']}] {job['source']} {asked}: {did}"
+              + (f" ({reason})" if reason else ''), flush=True)
+
 # ── Audio reader ──────────────────────────────────────────────────────────────
 class AudioReader:
     def __init__(self):
@@ -371,16 +692,21 @@ class AudioReader:
 
 # ── Action reader (executes functions-layer decisions from :8788) ──────────────
 class ActionReader(threading.Thread):
-    """Ask #3 in docs/v2_architecture/functions_layer_report.md: polls Asaf's
-    functions-layer ActionsEndpoint (GET :8788/latest_action, src/actions.py)
-    and executes approach_plant's left_pwm/right_pwm/duration_s on the motors,
-    the same way the joystick does (sets gui.left_pwm/right_pwm; _send_motors()
-    ticks them out over I2C). Completion (ask #2) is reported back over the
-    real contract actions.py already implements — POST :8788/action_done with
-    {"action_id", "pos_x", "pos_y", "heading"} — which is what functions.py's
-    wait_for_done()/endpoint.completion() actually waits on (NOT the :8787
-    frame API; an earlier version of this reader used a `last_action_id` field
-    there, but that doesn't satisfy the contract actions.py implements)."""
+    """Executes the decisions published on :8788 (GET /latest_action, src/actions.py) and
+    answers each with one POST /action_done, the contract functions.py's wait_for_done()
+    blocks on. The motion commands (2026-11-10) are sent ONCE and the robot carries them
+    out by itself:
+
+        traverse  {"cm": -30}              drive straight, + = forward      (Mover)
+        rotate    {"degrees": -45}         turn on the spot, + = left       (Mover)
+        servo     {"pan": 45, "tilt": 10}  camera: pan + = left, tilt + = up, 0/0 = ahead
+
+    approach_plant (left_pwm/right_pwm/duration_s) is the older PWM-for-a-time action, kept
+    so today's functions.py keeps working until it switches to the three above.
+    The report always carries pos_x/pos_y/heading, plus moved_cm / turned_deg / pan+tilt,
+    and "problem" when the command was limited, cancelled or failed. While a wheel motion
+    runs the GUI shows a self-driving badge and ignores its controls; SPACE / STOP cancel
+    it, and it still reports. Full spec: docs/v2_architecture/motion_commands.md."""
 
     POLL_S = 0.2
 
@@ -410,11 +736,92 @@ class ActionReader(threading.Thread):
             if aid is None or aid == self._seen_id:
                 continue
             self._seen_id = aid
-            if action.get('action') == 'approach_plant' and not self.gui.sim_mode:
+            if self.gui.sim_mode:
+                continue
+            name = action.get('action')
+            if name == 'approach_plant':
                 self._drive(action)
+            elif name == 'rotate':
+                self._move(action, 'rotate', 'degrees', 180.0, 'turned_deg', 'turned')
+            elif name == 'traverse':
+                self._move(action, 'traverse', 'cm', float(TRAV_MAX_CM), 'moved_cm', 'moved')
+            elif name == 'servo':
+                self._servo(action)
+
+    def _wait_free(self):
+        """A manual rotation step may still be running; let it end first."""
+        while self.gui._mover.active and not self._stop_evt.is_set():
+            time.sleep(0.1)
+
+    def _report(self, aid, name, **extra):
+        import urllib.request
+        pos = self.gui._pos_est
+        report = {'action_id': aid, 'pos_x': pos.x, 'pos_y': pos.y, 'heading': pos.heading,
+                  **extra}
+        try:
+            req = urllib.request.Request(self.post_url, data=json.dumps(report).encode(),
+                                         headers={'Content-Type': 'application/json'}, method='POST')
+            urllib.request.urlopen(req, timeout=1.0).close()
+            print(f"[actions] {name} #{aid} done, reported pos "
+                  f"({pos.x:.2f}, {pos.y:.2f}) heading {pos.heading:.0f}°", flush=True)
+        except Exception as e:
+            print(f"[actions] failed to POST /action_done for #{aid}: {e}", flush=True)
+
+    def _move(self, action, kind, arg, limit, report_key, result_key):
+        args = action.get('args', {})
+        try:
+            asked = float(args[arg])
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"[actions] bad {kind} args {args}: {e}", flush=True)
+            return
+        amount = max(-limit, min(limit, asked))
+        aid = action['action_id']
+        print(f"[actions] {kind} #{aid} {amount:+.0f}", flush=True)
+        self._wait_free()
+        job = self.gui._mover.request(kind, amount, 'llm')
+        res = {}
+        if job is not None:
+            job['event'].wait(job['timeout'] + 5)
+            res = job['result'] or {}
+        extra = {report_key: res.get(result_key, 0.0)}
+        problems = [res.get('reason') or ('' if res else f'{kind} did not run')]
+        if amount != asked:
+            problems.append(f'{arg} limited to ±{limit:.0f}')
+        if any(problems):
+            extra['problem'] = '; '.join(x for x in problems if x)
+        self._report(aid, kind, **extra)
+
+    def _servo(self, action):
+        args = action.get('args', {})
+        try:
+            pan_asked, tilt_asked = float(args['pan']), float(args['tilt'])
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"[actions] bad servo args {args}: {e}", flush=True)
+            return
+        g = self.gui
+        pan = int(round(max(-SERVO_PAN_MAX, min(SERVO_PAN_MAX, pan_asked))))
+        raw = tilt_to_raw(max(-SERVO_TILT_MAX, min(SERVO_TILT_MAX, tilt_asked)))
+        tilt = tilt_from_raw(raw)
+        aid = action['action_id']
+        print(f"[actions] servo #{aid} pan {pan:+d} tilt {tilt:+d}", flush=True)
+        travel = max(abs(pan - g.pan_angle), abs(raw - g.tilt_angle))
+        g.pan_angle, g.tilt_angle = pan, raw     # sent with the next tick; sliders follow
+        g.servo_note = (f'servo ({pan:+d}, {tilt:+d})', time.monotonic())
+        # the firmware steps the servos 1 degree per ms; report once they have arrived
+        self._stop_evt.wait(0.25 + travel * SERVO_MS_PER_DEG / 1000.0)
+        extra = {'pan': pan, 'tilt': tilt}
+        problems = []
+        if pan != round(pan_asked):
+            problems.append(f'pan limited to ±{SERVO_PAN_MAX}')
+        if tilt != round(tilt_asked):
+            problems.append('tilt limited to what the servo can reach')
+        if not (g.connected and g.i2c):
+            problems.append('Arduino not connected')
+        if problems:
+            extra['problem'] = '; '.join(problems)
+        self._report(aid, 'servo', **extra)
 
     def _drive(self, action):
-        import urllib.request
         args = action.get('args', {})
         try:
             l   = max(-255, min(255, int(args['left_pwm'])))
@@ -425,19 +832,16 @@ class ActionReader(threading.Thread):
             return
         aid = action['action_id']
         print(f"[actions] approach_plant #{aid} L={l} R={r} for {dur}s", flush=True)
-        self.gui.left_pwm, self.gui.right_pwm = l, r
-        time.sleep(dur)
-        self.gui.left_pwm = self.gui.right_pwm = 0
-        pos = self.gui._pos_est
-        report = {'action_id': aid, 'pos_x': pos.x, 'pos_y': pos.y, 'heading': pos.heading}
-        try:
-            req = urllib.request.Request(self.post_url, data=json.dumps(report).encode(),
-                                         headers={'Content-Type': 'application/json'}, method='POST')
-            urllib.request.urlopen(req, timeout=1.0).close()
-            print(f"[actions] approach_plant #{aid} done, reported pos "
-                  f"({pos.x:.2f}, {pos.y:.2f}) heading {pos.heading:.0f}°", flush=True)
-        except Exception as e:
-            print(f"[actions] failed to POST /action_done for #{aid}: {e}", flush=True)
+        g = self.gui
+        self._wait_free()
+        g._auto_cancel.clear()
+        g.auto = {'label': 'approach_plant', 't_end': time.monotonic() + dur}
+        g.left_pwm, g.right_pwm = l, r
+        stopped = g._auto_cancel.wait(dur)               # SPACE / STOP end it early
+        g.left_pwm = g.right_pwm = 0
+        g.auto = None
+        extra = {'problem': 'stopped by the user before the end'} if stopped else {}
+        self._report(aid, 'approach_plant', **extra)
 
 # ── Listener status (what functions.py --listen is doing, from :8788/status) ───
 class ListenerStatusReader(threading.Thread):
@@ -813,7 +1217,7 @@ def _btn(p,txt,color,cmd,**kw):
 
 # ── Main GUI ──────────────────────────────────────────────────────────────────
 class RobotControlGUI:
-    JOY_R = 108
+    JOY_R = 84     # the motion dial (display only since 2026-11-10)
     JOY_T = 20
 
     def __init__(self, root):
@@ -823,12 +1227,18 @@ class RobotControlGUI:
         root.resizable(False,False)
 
         self.joy_x=self.joy_y=0.0
-        self.joy_dragging=False
-        self.keys_held=set()
         self.left_pwm=self.right_pwm=0
         self.pan_angle=0     # -90…+90, 0 = camera facing front, + = left
         self.tilt_angle=90
         self.enc_left=self.enc_right=None   # cumulative encoder counts; None = no reading
+        self.fw_motion=False                # the Arduino's firmware has the rotate command
+        self.fw_mot_seq=self.fw_mot_state=None   # its last rotate seq / state; None = no reading
+        self._mover=Mover(self)         # rotate-by-degrees requests (manual and LLM)
+        self.auto=None                      # {'label','t_end'} while ActionReader drives
+        self.servo_note=None                # (text, time) of the last servo command, for the badge
+        self._auto_cancel=threading.Event() # set by SPACE / STOP to end that drive early
+        self._joy_drawn=None                # last state drawn on the joystick
+        self._was_rotating=False
         self._straight_target=None   # locked IMU yaw for the gyro straight-line trim, see _straight_trim()
         self._straight_integral=0.0  # accumulated yaw error for the trim's integral term
         self._straight_t=None        # time.monotonic() of the last _straight_trim() call
@@ -928,61 +1338,135 @@ class RobotControlGUI:
     # ── Control panel ─────────────────────────────────────────────────────────
     def _ctrl_panel(self,parent):
         p=parent
-        _plbl(p,'DRIVE  &  CAM',font=('Courier',9,'bold')).pack(pady=(8,4))
+        h=tk.Frame(p,bg=C_PANEL); h.pack(fill='x',padx=12,pady=(8,4))
+        _plbl(h,'DRIVE  &  CAM',font=('Courier',9,'bold')).pack(side='left')
+        # READY, or what the wheels/servos are doing right now (see _update_drive_widgets)
+        self.lbl_auto=_plbl(h,'⬤  READY',font=('Courier',9,'bold')); self.lbl_auto.pack(side='right')
         row=tk.Frame(p,bg=C_PANEL); row.pack(padx=10,pady=(0,8))
-        self._joystick(row)
+        lc=tk.Frame(row,bg=C_PANEL); lc.pack(side='left',anchor='n')   # dial, traverse + rotate below
+        self._motion_dial(lc)
+        self._motion_controls(lc)
         rc=tk.Frame(row,bg=C_PANEL); rc.pack(side='left')   # sliders on top, map below
         sl=tk.Frame(rc,bg=C_PANEL); sl.pack(side='top')
         self._cam_sliders(sl)
         self._position_map(rc)
 
-    def _joystick(self,parent):
+    def _motion_dial(self,parent):
+        """Display only (2026-11-10): the robot is controlled by three parameters, traverse
+        (cm), rotate (degrees) and servo (pan, tilt), from the controls below and the
+        sliders. There is no free driving any more. The dial shows what the wheels are
+        doing: the knob moves up/down with a traverse, the ring fills with a rotation.
+        Every item is created once here and updated in place by _draw_joy(), which runs
+        every tick (creating canvas items per tick is what cost the FPS on 2026-10-03)."""
         sz=(self.JOY_R+14)*2
-        self.joy_cv=tk.Canvas(parent,width=sz,height=sz,bg=C_PANEL,highlightthickness=0)
-        self.joy_cv.pack(side='left',padx=(4,10))
-        self._draw_joy()
-        self.joy_cv.bind('<ButtonPress-1>',  self._jp)
-        self.joy_cv.bind('<B1-Motion>',      self._jm)
-        self.joy_cv.bind('<ButtonRelease-1>',self._jr)
-
-    def _draw_joy(self):
-        cv=self.joy_cv; R=self.JOY_R; tr=self.JOY_T; cx=cy=R+14
-        cv.delete('all')
+        cv=self.joy_cv=tk.Canvas(parent,width=sz,height=sz,bg=C_PANEL,highlightthickness=0)
+        cv.pack(side='top',padx=(4,10))
+        R=self.JOY_R; tr=self.JOY_T; cx=cy=R+14
         cv.create_oval(cx-R,cy-R,cx+R,cy+R,fill='#16162a',outline=C_BORDER,width=2)
         for f in (.5,1.): r2=R*f; cv.create_oval(cx-r2,cy-r2,cx+r2,cy+r2,outline=C_BORDER,fill='')
         cv.create_line(cx-R+8,cy,cx+R-8,cy,fill=C_BORDER)
         cv.create_line(cx,cy-R+8,cx,cy+R-8,fill=C_BORDER)
-        mr=R-tr-2; tx=cx+self.joy_x*mr; ty=cy-self.joy_y*mr
-        g=tr+7; cv.create_oval(tx-g,ty-g,tx+g,ty+g,fill='#0d2a40',outline='')
-        fc=C_BLUE_HI if self.joy_dragging else C_BLUE
-        cv.create_oval(tx-tr,ty-tr,tx+tr,ty+tr,fill=fc,outline='#5bb3e8')
-        cv.create_oval(tx-4,ty-4,tx+4,ty+4,fill='#cce8ff',outline='')
         for txt,x,y in [('FWD',cx,cy-R+8),('BWD',cx,cy+R-8),('L',cx-R+8,cy),('R',cx+R-8,cy)]:
             cv.create_text(x,y,text=txt,fill=C_SUB,font=('Courier',7))
+        # rotation shown on the ring: up = heading when it started, left turn = anticlockwise
+        ra=R+7; box=(cx-ra,cy-ra,cx+ra,cy+ra)
+        self._joy_arc_req =cv.create_arc(*box,start=90,extent=0,style='arc',outline='#7a5a1e',width=5,state='hidden')
+        self._joy_arc_done=cv.create_arc(*box,start=90,extent=0,style='arc',outline=C_AMBER,width=5,state='hidden')
+        self._joy_mark    =cv.create_line(0,0,0,0,fill=C_TEXT,width=3,state='hidden')
+        self._joy_glow=cv.create_oval(0,0,0,0,fill='#0d2a40',outline='')
+        self._joy_knob=cv.create_oval(0,0,0,0,fill=C_BLUE,outline='#5bb3e8')
+        self._joy_dot =cv.create_oval(0,0,0,0,fill='#cce8ff',outline='')
+        self._draw_joy()
 
-    def _jp(self,e):
-        if self.sim_mode: return
-        self.joy_dragging=True;  self._jxy(e.x,e.y)
-    def _jm(self,e):
-        if self.sim_mode: return
-        self._jxy(e.x,e.y)
-    def _jr(self,e):
-        if self.sim_mode: return
-        self.joy_dragging=False; self.joy_x=self.joy_y=0.0
-        self._pwm(); self._draw_joy()
-    def _jxy(self,mx,my):
-        cx=cy=self.JOY_R+14; dx,dy=mx-cx,my-cy
-        lim=self.JOY_R-self.JOY_T-2; d=math.hypot(dx,dy)
-        if d>lim: dx=dx/d*lim; dy=dy/d*lim
-        self.joy_x=dx/lim; self.joy_y=-dy/lim
-        self._pwm(); self._draw_joy()
+    def _draw_joy(self):
+        job=self._mover.job
+        rot=(round(job['requested']),round(job['turned'])) if job and job['kind']=='rotate' else None
+        driving=self.self_driving
+        state=(round(self.joy_x,3),round(self.joy_y,3),driving,rot)
+        if state==self._joy_drawn: return
+        self._joy_drawn=state
+        cv=self.joy_cv; R=self.JOY_R; tr=self.JOY_T; cx=cy=R+14
+        mr=R-tr-2; tx=cx+self.joy_x*mr; ty=cy-self.joy_y*mr
+        g=tr+7; cv.coords(self._joy_glow,tx-g,ty-g,tx+g,ty+g)
+        cv.coords(self._joy_knob,tx-tr,ty-tr,tx+tr,ty+tr)
+        cv.coords(self._joy_dot,tx-4,ty-4,tx+4,ty+4)
+        cv.itemconfig(self._joy_knob,fill=(C_AMBER if driving else C_BLUE),
+                      outline=('#f0b070' if driving else '#5bb3e8'))
+        cv.itemconfig(self._joy_glow,fill=('#40280d' if driving else '#0d2a40'))
+        if rot:
+            req,done=rot
+            lim=lambda v: max(-359,min(359,v))
+            cv.itemconfig(self._joy_arc_req, extent=lim(req), state='normal')
+            cv.itemconfig(self._joy_arc_done,extent=lim(done),state='normal')
+            a=math.radians(90+req)
+            cv.coords(self._joy_mark,cx+(R-2)*math.cos(a),cy-(R-2)*math.sin(a),
+                                     cx+(R+13)*math.cos(a),cy-(R+13)*math.sin(a))
+            cv.itemconfig(self._joy_mark,state='normal')
+        else:
+            for item in (self._joy_arc_req,self._joy_arc_done,self._joy_mark):
+                cv.itemconfig(item,state='hidden')
+
+    def _motion_controls(self,parent):
+        """The only wheel controls: TRAVERSE in cm (+ = forward) and ROTATE in degrees
+        (+ = left). Step buttons, or type any value and GO. Each sends one command; the
+        robot carries it out and stops by itself."""
+        def b(p,txt,cmd):
+            return tk.Button(p,text=txt,bg=C_BORDER,fg=C_TEXT,relief='flat',font=('Courier',9,'bold'),
+                             padx=4,pady=2,command=cmd,cursor='hand2',
+                             activebackground=C_BLUE,activeforeground=C_TEXT)
+        self._move_entries={}
+        for kind,title,steps,unit,init,limit in [
+                ('traverse','TRAVERSE',[('FWD 50',50),('FWD 10',10),('BWD 10',-10),('BWD 50',-50)],
+                 'cm + = fwd','30',TRAV_MAX_CM),
+                ('rotate','ROTATE',[('L 90°',90),('L 15°',15),('R 15°',-15),('R 90°',-90)],
+                 '°  + = left','30',180)]:
+            r1=tk.Frame(parent,bg=C_PANEL); r1.pack(pady=(6,1))
+            for txt,v in steps:
+                b(r1,txt,lambda k=kind,v=v:self._move_manual(k,v)).pack(side='left',padx=2)
+            r2=tk.Frame(parent,bg=C_PANEL); r2.pack(pady=(1,0))
+            _plbl(r2,title,font=('Courier',8,'bold'),width=8,anchor='w').pack(side='left')
+            var=tk.StringVar(value=init)
+            ent=tk.Entry(r2,textvariable=var,width=5,justify='right',
+                         bg='#16162a',fg=C_TEXT,insertbackground=C_TEXT,relief='flat',
+                         font=('Courier',10,'bold'),highlightthickness=1,
+                         highlightbackground=C_BORDER,highlightcolor=C_BLUE)
+            ent.pack(side='left',padx=(4,2))
+            go=lambda e=None,k=kind:self._move_go(k)
+            ent.bind('<Return>',go)
+            _plbl(r2,unit,font=('Courier',8),width=11,anchor='w').pack(side='left')
+            b(r2,'GO',go).pack(side='left',padx=(2,0))
+            self._move_entries[kind]=(var,ent,limit)
+
+    def _move_go(self,kind):
+        var,ent,limit=self._move_entries[kind]
+        try:
+            v=float(var.get().strip().replace('°','').replace('cm',''))
+        except ValueError:
+            ent.config(highlightbackground=C_RED,highlightcolor=C_RED); return
+        ent.config(highlightbackground=C_BORDER,highlightcolor=C_BLUE)
+        self.root.focus_set()                 # give W/S/A/D/SPACE back to the robot
+        self._move_manual(kind,max(-limit,min(limit,v)))
+
+    def _move_manual(self,kind,amount):
+        if self.sim_mode or self.self_driving or amount==0: return
+        self._mover.request(kind,amount,'manual')
+
+    @property
+    def self_driving(self):
+        """The wheels are moving by themselves: a traverse or rotation in progress (from
+        the GUI or the LLM), or the LLM's older approach_plant drive. The motion controls
+        are ignored meanwhile; SPACE / STOP cancel (_estop)."""
+        return self.auto is not None or self._mover.active
 
     def _cam_sliders(self,parent):
-        # pan: -45…+45 (GUI-limited, 2026-10-03; firmware still accepts -90…+90) (0 = front,
-        # + = left); tilt: 0…180
+        # The servo parameters (pan, tilt), same meaning as the servo command: pan 0 = front,
+        # + = left, -45…+45 (GUI/command cap since 2026-10-03; the firmware accepts ±90);
+        # tilt 0 = level, + = up (signed since 2026-11-10; tilt_angle itself stays the raw
+        # servo angle for the wire, the CSV and the frame API — see tilt_to_raw()).
         for attr,label,top,bot,init,top_txt,bot_txt in [
-                ('pan', 'PAN', 45, -45,0, 'L 45°','R 45°'),
-                ('tilt','TILT',180,0,  90,'180°', '0°')]:
+                ('pan', 'PAN', SERVO_PAN_MAX, -SERVO_PAN_MAX,0, f'L {SERVO_PAN_MAX}°',f'R {SERVO_PAN_MAX}°'),
+                ('tilt','TILT',SERVO_TILT_MAX,-SERVO_TILT_MAX,tilt_from_raw(self.tilt_angle),
+                 f'UP {SERVO_TILT_MAX}°',f'DN {SERVO_TILT_MAX}°')]:
             f=tk.Frame(parent,bg=C_PANEL); f.pack(side='left',padx=2)
             _plbl(f,label,font=('Courier',8,'bold')).pack(pady=(4,0))
             _plbl(f,top_txt,font=('Courier',7)).pack()
@@ -992,9 +1476,13 @@ class RobotControlGUI:
                      length=120,width=16,bg=C_PANEL,fg=C_TEXT,troughcolor='#16162a',
                      activebackground=C_BLUE_HI,highlightthickness=0,bd=0,
                      sliderrelief='flat',sliderlength=20,showvalue=True,
-                     command=lambda v,a=attr:None if self.sim_mode
-                             else setattr(self,f'{a}_angle',int(v))).pack()
+                     command=lambda v,a=attr:self._slider_moved(a,int(float(v)))).pack()
             _plbl(f,bot_txt,font=('Courier',7)).pack(pady=(0,4))
+
+    def _slider_moved(self,attr,v):
+        if self.sim_mode: return
+        if attr=='pan': self.pan_angle=v
+        else:           self.tilt_angle=tilt_to_raw(v)
 
     # ── Position mini-map ─────────────────────────────────────────────────────
     POS_MAP        = 200   # canvas size (px), enlarged 2026-10-03 (was 118, "too small")
@@ -1022,6 +1510,7 @@ class RobotControlGUI:
         self._map_hlabels=[cv.create_text(0,0,text='',fill=C_SUB,font=('Courier',6),anchor='nw') for _ in range(N)]
         self._map_origin = cv.create_oval(0,0,0,0,outline=C_SUB,fill='',state='hidden')
         self._map_trail  = cv.create_line(0,0,0,0,fill=C_BLUE,width=1,state='hidden')
+        self._map_target = cv.create_line(0,0,0,0,fill=C_AMBER,width=2,dash=(4,3),state='hidden')  # where a rotation will end
         self._map_arrow  = cv.create_line(0,0,0,0,fill=C_GREEN,width=3,arrow='last',arrowshape=(10,12,5))
         self._map_dot    = cv.create_oval(0,0,0,0,fill=C_BLUE_HI,outline='')
         self._draw_pos_map()
@@ -1089,6 +1578,13 @@ class RobotControlGUI:
         th=math.radians(heading)
         ax=cxp+24*math.cos(th); ay=cyp-24*math.sin(th)
         cv.coords(self._map_arrow,cxp,cyp,ax,ay)
+        job=self._mover.job
+        if job and job['kind']=='rotate' and not self.sim_mode:
+            tt=math.radians(heading+job['requested']-job['turned'])
+            cv.coords(self._map_target,cxp,cyp,cxp+60*math.cos(tt),cyp-60*math.sin(tt))
+            cv.itemconfig(self._map_target,state='normal')
+        else:
+            cv.itemconfig(self._map_target,state='hidden')
         cv.coords(self._map_dot,cxp-4,cyp-4,cxp+4,cyp+4)
 
     # ── Audio panel ───────────────────────────────────────────────────────────
@@ -1233,7 +1729,7 @@ class RobotControlGUI:
         # internal/debug data the user doesn't need to see (removed 2026-10-03 once the
         # position feature built on them was validated).
         self.lbl_pan=_vallbl(p,'PAN:+00°',fg=C_GREEN,width=12)
-        self.lbl_tlt=_vallbl(p,'TLT:090°',fg=C_AMBER,width=12)
+        self.lbl_tlt=_vallbl(p,'TLT:+00°',fg=C_AMBER,width=12)
         self.lbl_pos=_vallbl(p,'X+0.00 Y+0.00',fg=C_BLUE_HI,width=15)
         self.lbl_hdg=_vallbl(p,'HDG:000°',fg=C_GREEN,width=12)
         pk(self.lbl_lm,(12,3)); pk(self.lbl_rm)
@@ -1251,7 +1747,7 @@ class RobotControlGUI:
         pk(_btn(p,'■  STOP',C_RED,self._estop),(8,8))
         _hline(p)
         pk(_btn(p,'OFF',C_RED,self._off),(8,8))
-        pk(_lbl(p,'⌨  W/S  A/D  SPACE',fg=C_SUB,font=('Courier',8),
+        pk(_lbl(p,f'⌨  W/S ±{TRAV_KEY_STEP_CM} cm · A/D ±{ROT_KEY_STEP_DEG}° · SPACE stop',fg=C_SUB,font=('Courier',8),
                 justify='center',wraplength=150),(4,4))
         self.lbl_tx=_lbl(p,'',fg=C_SUB,font=('Courier',8),
                          wraplength=150,justify='left',anchor='w')
@@ -1260,30 +1756,21 @@ class RobotControlGUI:
     # ── Keyboard ──────────────────────────────────────────────────────────────
     def _bind_keys(self):
         self.root.bind('<KeyPress>',  self._kd)
-        self.root.bind('<KeyRelease>',self._ku)
 
     def _kd(self,e):
-        if self.sim_mode: return
-        self.keys_held.add(e.keysym.lower());  self._k2j()
-    def _ku(self,e):
-        if self.sim_mode: return
-        self.keys_held.discard(e.keysym.lower()); self._k2j()
-    def _k2j(self):
-        if 'space' in self.keys_held:
-            self.joy_x=self.joy_y=0.0
-        else:
-            self.joy_y=float('w' in self.keys_held)-float('s' in self.keys_held)
-            self.joy_x=float('d' in self.keys_held)-float('a' in self.keys_held)
-            self.joy_x=max(-1,min(1,self.joy_x)); self.joy_y=max(-1,min(1,self.joy_y))
-        self._pwm(); self._draw_joy()
-
-    # ── Motor mixing ──────────────────────────────────────────────────────────
-    def _pwm(self):
-        t=self.joy_y; turn=self.joy_x
-        l=t+turn; r=t-turn; s=max(abs(l),abs(r),1.0)
-        self.left_pwm=int(l/s*255); self.right_pwm=int(r/s*255)
+        k=e.keysym.lower()
+        if k=='space': self._estop(); return            # always, also while self-driving
+        if isinstance(e.widget,tk.Entry): return
+        # one step per press; a held key starts the next step when the last one ends
+        step={'w':('traverse', TRAV_KEY_STEP_CM),'s':('traverse',-TRAV_KEY_STEP_CM),
+              'a':('rotate',   ROT_KEY_STEP_DEG),'d':('rotate',  -ROT_KEY_STEP_DEG)}.get(k)
+        if step: self._move_manual(*step)
 
     def _estop(self):
+        """SPACE / STOP: cancels whatever the wheels are doing (a traverse, a rotation, an
+        LLM drive). The cancelled action still reports its end pose."""
+        self._mover.cancel('stopped by the user')
+        self._auto_cancel.set()
         self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0; self._draw_joy()
 
     def _off(self):
@@ -1298,6 +1785,9 @@ class RobotControlGUI:
         and sends a final motor-stop, stops the voice listener, then exits the process."""
         if self._rec_manager.active:
             self._rec_manager.stop()
+        if self._mover.active:              # tell the Arduino to stop spinning (its
+            self._mover.cancel('GUI closed')   # watchdog would too, 0.5 s later)
+            self._mover.step()
         self.left_pwm = self.right_pwm = 0
         self._send_motors()
         self._stop_listener()
@@ -1351,7 +1841,7 @@ class RobotControlGUI:
             # Restore the pre-sim control state so the robot doesn't jump
             # to the last replayed values when real sends resume
             self.pan_angle,self.tilt_angle=self._pre_sim_angles
-            self.pan_var.set(self.pan_angle); self.tilt_var.set(self.tilt_angle)
+            self.pan_var.set(self.pan_angle); self.tilt_var.set(tilt_from_raw(self.tilt_angle))
             self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0
             self._draw_joy()
             self._pos_est.reset(); self._pos_trail.clear()   # real odometry starts fresh
@@ -1372,6 +1862,8 @@ class RobotControlGUI:
         except Exception as e:
             self.lbl_tx.config(text=f'SIM load failed: {e}'[:44]); return
         if self._rec_manager.active: self._toggle_rec()
+        self._estop()                                       # nothing keeps driving into Sim;
+        self._mover.abort('Sim mode started')             # the Arduino's watchdog stops a spin
         self._pre_sim_angles=(self.pan_angle,self.tilt_angle)
         self.enc_left=self.enc_right=None   # not replayed
         self.sim_player=player; self.sim_mode=True; self._sim_ended=False
@@ -1403,7 +1895,7 @@ class RobotControlGUI:
         self.lbl_lm.config(text=f'L:  {l:+04d}')
         self.lbl_rm.config(text=f'R:  {r:+04d}')
         self.lbl_pan.config(text=f'PAN:{pa:+03d}°')
-        self.lbl_tlt.config(text=f'TLT:{ta:03d}°')
+        self.lbl_tlt.config(text=f'TLT:{tilt_from_raw(ta):+03d}°')   # signed: 0 = level, + = up
 
     def _straight_trim(self, l, r):
         """Gyro-assisted straight-line correction (PI on yaw error) — see the STRAIGHT_KP/KI
@@ -1448,8 +1940,11 @@ class RobotControlGUI:
         # further trimmed by _straight_trim() for the gyro-assisted straight-line correction
         # — self.left_pwm/right_pwm (the commanded intent) stay untouched for everything else
         # (PositionEstimator's PWM fallback, the CSV, the frame API).
-        l,r = self._straight_trim(l,r)
-        msg=f'{l},{r},{pa},{ta}\n'.encode()
+        # During a rotation the Arduino owns the wheels: the wire carries 0,0 (or the rotate
+        # message itself), while left_pwm/right_pwm hold the nominal spin PWM for display.
+        if self._mover.active: l,r = self._straight_trim(0,0)
+        else:                    l,r = self._straight_trim(l,r)
+        msg=self._mover.wire_message() or f'{l},{r},{pa},{ta}\n'.encode()
         try:
             if SMBUS2:
                 for off in range(0,len(msg),32):
@@ -1464,17 +1959,23 @@ class RobotControlGUI:
         # Cumulative wheel-encoder counts read back from the Arduino (smbus2 only).
         # A failed or bad read only blanks the readout — it never disconnects, so an
         # encoder problem can't take motor commands down with it.
-        el=er=None
+        # The same read carries the firmware's rotate status in 3 extra bytes; firmware
+        # from before 2026-11-10 sends only the first 10, and the rest fails its check.
+        el=er=seq=st=None
         if self.connected and self.i2c and SMBUS2:
             try:
-                rd=i2c_msg.read(ARDUINO_ADDR,ENC_PKT_LEN)
+                rd=i2c_msg.read(ARDUINO_ADDR,MOT_PKT_LEN)
                 self.i2c.i2c_rdwr(rd)
                 pkt=bytes(rd)
-                if pkt[0]==ENC_PKT_HDR and sum(pkt[:-1])&0xFF==pkt[-1]:
+                if pkt[0]==ENC_PKT_HDR and sum(pkt[:ENC_PKT_LEN-1])&0xFF==pkt[ENC_PKT_LEN-1]:
                     el,er=struct.unpack('<ii',pkt[1:9])
+                    self.fw_motion=((pkt[10]+pkt[11]+MOT_PKT_SALT)&0xFF==pkt[12]
+                                    and pkt[11]<=MOT_ABORTED)
+                    if self.fw_motion: seq,st=pkt[10],pkt[11]
             except Exception:
                 pass
         self.enc_left,self.enc_right=el,er
+        self.fw_mot_seq,self.fw_mot_state=seq,st
 
     # ── Sensor startup ────────────────────────────────────────────────────────
     def _start_sensors(self):
@@ -1503,6 +2004,7 @@ class RobotControlGUI:
         self._update_audio_widgets()
         self._update_video_widgets()
         self._update_position_widgets()
+        self._update_drive_widgets()
         if self._rec_manager.active and not self.sim_mode:
             self._rec_manager.enqueue(self.latest_frame, self.latest_frame_bgr)
         self._update_fps_label()
@@ -1519,6 +2021,13 @@ class RobotControlGUI:
         if not self.connected and time.time()-self._last_reconnect>3:
             self._last_reconnect=time.time()
             self._conn()
+        self._mover.step()
+        job=self._mover.job
+        if job:                                  # nominal PWM, for labels/CSV/sim replay
+            self.left_pwm,self.right_pwm=job['nominal']
+        elif self._was_rotating:
+            self.left_pwm=self.right_pwm=0
+        self._was_rotating=job is not None
         self._send_motors()
         self._read_encoders()
         frame_bgr   = self.camera_reader.get_frame()    if self.camera_reader else None
@@ -1570,7 +2079,7 @@ class RobotControlGUI:
                                   decoded['pan_angle'],decoded['tilt_angle'])
         # Animate the drive/cam controls from the recorded values
         self.pan_var.set(decoded['pan_angle'])
-        self.tilt_var.set(decoded['tilt_angle'])
+        self.tilt_var.set(tilt_from_raw(decoded['tilt_angle']))
         l,r=decoded['left_pwm'],decoded['right_pwm']
         self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # inverse of _pwm mixing
         self.joy_x=max(-1.0,min(1.0,(l-r)/510.0))
@@ -1667,6 +2176,40 @@ class RobotControlGUI:
         self.lbl_pos.config(text=f'X{x:+05.2f} Y{y:+05.2f}')
         self.lbl_hdg.config(text=f'HDG:{int(hdg)%360:03d}°')
         self._draw_pos_map()
+
+    def _update_drive_widgets(self):
+        """The 'who is moving the robot' badge, the dial following the wheels (knob =
+        commanded PWM, ring = rotation progress) and the sliders following servo commands."""
+        now=time.monotonic(); job=self._mover.job; auto=self.auto; last=self._mover.last
+        note=self.servo_note
+        if self.sim_mode:
+            txt,fg='SIM REPLAY',C_BLUE_HI
+        elif job:
+            rot=job['kind']=='rotate'; unit='°' if rot else ' cm'
+            done=job['turned'] if rot else job['moved']
+            who=(f"SELF-DRIVING  {job['kind']}" if job['source']=='llm'
+                 else ('ROTATING' if rot else 'TRAVERSING'))
+            txt=f"{who} {job['requested']:+.0f}{unit} · {abs(job['requested']-done):.0f}{unit} to go"
+            fg=C_AMBER
+        elif auto:
+            txt,fg=f"SELF-DRIVING  {auto['label']} · {max(0.0,auto['t_end']-now):.1f} s left",C_AMBER
+        elif note and now-note[1]<3:
+            txt,fg=f'SELF-DRIVING  {note[0]}',C_AMBER
+        elif last and now-last['t']<5:           # how the last motion ended, for a few seconds
+            if not last['ok']:            txt,fg=f"{last['kind']}: {last['reason']}"[:52],C_RED
+            elif last['kind']=='rotate':  txt,fg=f"turned {last['turned']:+.1f}°",C_GREEN
+            else:                         txt,fg=f"moved {last['moved']:+.1f} cm",C_GREEN
+        else:
+            txt,fg='READY',C_SUB
+        self.lbl_auto.config(text=f'⬤  {txt}',fg=fg)
+        if not self.sim_mode:
+            l,r=self.left_pwm,self.right_pwm
+            self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # same inverse mixing as sim replay
+            self.joy_x=max(-1.0,min(1.0,(l-r)/510.0)) if auto else 0.0
+            if self.pan_var.get()!=self.pan_angle: self.pan_var.set(self.pan_angle)
+            t=tilt_from_raw(self.tilt_angle)
+            if self.tilt_var.get()!=t: self.tilt_var.set(t)
+        self._draw_joy()
 
     def _update_fps_label(self):
         fps = self._fps_ema

@@ -119,7 +119,7 @@ For headless / NoMachine sessions the GUI connects automatically. No display var
   LOGOTS ROBOT CONTROL          ⬤ MIC: asleep  ⬤ LLM: ready  FPS:8.2/10  ⬤ CONNECTED
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
-│  joystick + pan/    │  3D Madgwick AHRS   │
+│  traverse/rotate +  │  3D Madgwick AHRS   │
 │  tilt sliders +     │  YPR display        │
 │  position mini-map  │                     │
 ├─────────────────────┼─────────────────────┤
@@ -135,7 +135,15 @@ The header's `⬤ MIC:`/`⬤ LLM:` indicators and the AUDIO INPUT panel's `ACTIO
 
 A **position mini-map** at the bottom of the DRIVE & CAM panel shows a top-down trail of where the robot thinks its body is (dead-reckoned from motor commands + IMU heading), with an `X/Y/HDG` readout in the status bar and a `⌖ POS` button to reset the origin to "here". See the position note below.
 
-**Keyboard shortcuts:** `W/S` = forward/back · `A/D` = turn · `SPACE` = stop
+**The robot is controlled by three parameters** (2026-11-10; not yet tested on the robot). There is no free driving:
+
+- **Traverse** (cm, + = forward): `FWD 50`/`FWD 10`/`BWD 10`/`BWD 50`, or type a distance and `GO`
+- **Rotate** (degrees, + = left): `L 90°`/`L 15°`/`R 15°`/`R 90°`, or type an angle and `GO`
+- **Servo** (pan, tilt): the two sliders. Pan 0 = front, + = left; tilt 0 = level, + = up
+
+Each press sends one command; the robot carries it out and stops by itself. The dial above the buttons only shows what the wheels are doing, and the badge in the panel title says who is moving the robot. The same three commands are what the LLM sends: see `docs/v2_architecture/motion_commands.md`.
+
+**Keyboard shortcuts:** `W/S` = traverse 10 cm forward/back · `A/D` = rotate 15° left/right · `SPACE` = stop (cancels any motion)
 
 The GUI auto-connects to the Arduino on startup and retries every 3 seconds if the connection drops.
 
@@ -227,6 +235,16 @@ The Arduino echoes each received command to Serial at 9600 baud:
 ```
 OK  L=200 R=200 PAN=90 TILT=45
 ```
+
+**Self-contained motions (added 2026-11-10, not yet tested on the robot).** One message makes the Arduino run the wheels to an encoder-count target and stop by itself:
+
+```
+"R,{seq},{counts},{fast_pwm},{slow_pwm},{ramp_counts},{balance_gain_x100}\n"   rotate on the spot, + = left
+"T,{seq},{counts},{fast_pwm},{slow_pwm},{ramp_counts},{balance_gain_x100}\n"   traverse straight, + = forward
+"S,{seq},{steer_counts}\n"                                                     heading correction during a traverse
+```
+
+`counts = 0` cancels. The GUI converts degrees/cm to counts and uses the IMU to correct a rotation's angle and to hold the heading during a traverse (`Mover` in `src/logots_ui.py`). The firmware also stops the motors if no message arrives for 500 ms. Details: the header of `src/firmware/logots_motor_control/logots_motor_control.ino` and `motion.h` next to it.
 
 ---
 
