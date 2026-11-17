@@ -171,7 +171,7 @@ STRAIGHT_MAX_TRIM = 60    # clamp, so a large transient error can't stall/revers
 # Every number here is sent to the Arduino with each command, so tuning never needs a
 # reflash. NOT YET RUN ON THE ROBOT: all values marked GUESS are starting points.
 # + degrees = left = IMU yaw going up. + cm = forward.
-SPIN_COUNTS_PER_DEG = 20.0  # encoder counts of (right-left)/2 per degree of body rotation.
+SPIN_COUNTS_PER_DEG = 27.5  # encoder counts of (right-left)/2 per degree of body rotation.
                             # GUESS (assumes ~16 cm between the wheels). Mover learns the
                             # real value from the IMU and prints it: copy it here.
 SPIN_DIR          = +1      # flip to -1 if a rotation aborts with "turned the wrong way"
@@ -209,7 +209,7 @@ TRAV_MAX_CM       = 200     # one traverse is clamped to this: there is no obsta
 # Servo command: pan as everywhere else (0 = front, + = left); tilt signed, 0 = level, + = up.
 # The wire, the tilt slider, the CSV and the frame API keep the raw tilt servo angle.
 TILT_LEVEL_DEG    = 90      # raw tilt servo angle with the camera level. GUESS (the start pose)
-TILT_DIR          = +1      # GUESS: +1 if a larger raw angle tilts the camera UP, else -1
+TILT_DIR          = -1      # measured 2026-11-17: a larger raw angle tilts the camera DOWN
 SERVO_PAN_MAX     = 45      # same cap as the GUI pan slider
 SERVO_TILT_MAX    = 90
 SERVO_MS_PER_DEG  = 2       # wait this long per degree of travel before reporting (the

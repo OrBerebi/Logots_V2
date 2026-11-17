@@ -71,7 +71,7 @@ int current_pan_angle  = PAN_CENTER_DEG;
 int current_tilt_angle = 90;
 
 unsigned long lastServoMoveTime = 0;
-const int SERVO_SPEED_DELAY = 1;  // ms per 1-degree step
+const int SERVO_SPEED_DELAY = 10; // ms per 1-degree step (was 1: the fast start reset the Arduino, 2026-11-17)
 
 // ── I2C receive buffer ────────────────────────────────────────────────────
 #define I2C_BUFFER_SIZE 32
