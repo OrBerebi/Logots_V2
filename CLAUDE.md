@@ -33,24 +33,41 @@ conda run -n logots python src/logots_ui.py
 ## Repo structure
 ```
 Logots_V2/
-├── README.md
+├── README.md                — newcomer-facing summary (see note below)
 ├── CLAUDE.md
 ├── environment.yml          — conda env spec (python 3.10, numpy 2.x)
 ├── recordings/              — session CSVs written here (gitignored)
 │   └── session_YYYYMMDD_HHMMSS/
 │       └── session_YYYYMMDD_HHMMSS.csv
+├── runs/                    — decision logs, motion-test reports (gitignored)
+├── knowledge/               — prompts + the robot's memory; only identity.md, guidelines.md,
+│                              actions.md, functions/*.md are tracked (roster.md, plants/ are not)
 ├── docs/                    — architecture notes + live test reports (test_report_YYYY-MM-DD.txt)
+│   ├── v2_architecture/     — Asaph's architecture + action API docs, motion_commands.md
 │   └── robot1_system/       — robot #1's pin screenshot + asound demixer block (see "New Jetson setup")
+├── experiments/             — notebooks and investigations, not used at runtime
+├── archive/                 — v1 docs
 └── src/
     ├── logots_ui.py         — main GUI (all sensors + motor control + recording + sim mode)
     ├── logots_api.py        — HTTP client for the frame API (get_latest_frame)
     ├── api_demo.py          — toy example: video+audio playback via the API
+    ├── functions.py         — listener / decision layer (Asaph's)
+    ├── actions.py           — :8788 endpoint (Asaph's)
+    ├── knowledge.py         — reads/writes knowledge/ (Asaph's)
+    ├── mrt_reflective.py    — brains: LlamaCppVisionBrain / VisionBrain, pick_brain() (Asaph's)
+    ├── audio_on_demand.py   — Ears, llama-server management, speak()
+    ├── motion_live_test.py  — live acceptance test for traverse / rotate / servo
     ├── pinout.txt           — full 40-pin header wiring reference
     └── firmware/
         └── logots_motor_control/
             ├── logots_motor_control.ino  — Arduino firmware
             └── motion.h                  — rotate/traverse-by-counts state machine (plain C++, PC-testable)
 ```
+
+**`README.md` is the short, newcomer-facing version of this file** (setup, running, GUI,
+voice, APIs, protocol, remote access, known issues). It was brought in line with this file
+on 2026-11-17. When a fact it states changes here (ports, pin config, commands, hosts,
+hardware, what's untested), update the README in the same commit.
 
 ## Key files
 | File | Purpose |
@@ -85,11 +102,22 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
 - IMX219-160 fisheye CSI on CAM0 port
 - Device tree overlay enabled via `jetson-io.py` (NEVER edit extlinux.conf manually)
 
+### Pin config (`jetson-io.py`)
+All four groups must be on together: `i2c8` (3/5), `i2c2` (27/28), `i2s2` (12/35/38/40),
+`uarta` (8/10). Saving in "Configure header pins manually" rewrites the whole set, so a group
+left out gets switched off (this is how the mic died in June, see Known issues). Reference:
+`docs/robot1_system/header_pinouts.png`.
+
+### Power (12V battery pack, full rules in `src/pinout.txt` §6)
+- One switch on battery (+), then two branches: 12V straight to the shield's EXT_PWR
+  (motors), and a fixed 9V buck converter (mini560 PRO) to the Arduino's barrel jack.
+- **The shield's PWR jumper must be off**, or EXT_PWR ties the 12V branch to the Arduino's VIN.
+
 ## Arduino firmware protocol
 - I2C slave address: `0x08` on `/dev/i2c-1`
 - Message format sent by GUI: `"{left_pwm},{right_pwm},{pan_angle},{tilt_angle}\n"`
   - left/right PWM: -255 to +255, positive = forward — on the wire too, and everywhere in
-    `logots_ui.py` (joystick, keyboard, `ActionReader`/`approach_plant`, `PositionEstimator`,
+    `logots_ui.py` (`Mover`, `ActionReader`/`approach_plant`, `PositionEstimator`,
     the recording CSV). Each wheel's hardware direction is corrected in the firmware's
     **calibration block** (`LEFT_MOTOR_DIR`/`RIGHT_MOTOR_DIR`), per motor. (Until 2026-10-03
     `_send_motors()` flipped both signs globally; that was removed when the motors were rewired
@@ -128,12 +156,13 @@ LV side → Jetson (LV=3.3V from Pin 1), HV side → Arduino (HV=5V).
 - **Tilt on the wire stays the raw servo angle** (0…180). The signed tilt of the servo
   command is converted on the Jetson (`tilt_to_raw()`), so a GUI/firmware version mix can
   never throw the tilt servo to an end stop.
-- **Encoder read-back**: a 10-byte I2C read from `0x08` returns `[0xE5][int32 left][int32 right]
-  [sum8 of bytes 0..8]`, little-endian, read by `_read_encoders()` each real tick and shown as
-  `EL`/`ER` in the side panel (`----` = no reading). Counts are cumulative 4x-quadrature ticks,
-  positive = forward (`LEFT_ENC_DIR`/`RIGHT_ENC_DIR`). Decoded by a pin-change ISR on A0–A3 in
-  the firmware. Display only for now; not in the CSV or frame API, and `PositionEstimator`
-  doesn't use them yet. A failed or bad read blanks the readout but never disconnects.
+- **Encoder read-back**: bytes 0–9 of the read from `0x08` (13 bytes since 2026-11-10, see
+  above) are `[0xE5][int32 left][int32 right][sum8 of bytes 0..8]`, little-endian, read by
+  `_read_encoders()` each real tick. Counts are cumulative 4x-quadrature ticks, positive =
+  forward (`LEFT_ENC_DIR`/`RIGHT_ENC_DIR`), decoded by a pin-change ISR on A0–A3 in the
+  firmware. They feed `PositionEstimator` and `Mover`; they are not shown in the GUI (the
+  `EL`/`ER` readout was removed 2026-10-03) and not in the CSV or frame API. A failed or bad
+  read never disconnects; `PositionEstimator` falls back to the PWM model for that tick.
 - Motor driver: HW-130 (L293D, Adafruit Motor Shield v1 clone, AFMotor.h), M1=right, M4=left
 - Encoders: JGA25-370 Hall encoders, right on A0/A1, left on A2/A3 (full wiring: `src/pinout.txt`)
 - Pan servo: Arduino pin 10. Tilt servo: Arduino pin 9. Both MG90S.
@@ -169,7 +198,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 │  ACTION (last voice │                     │
 │  command decided)   │                     │
 └─────────────────────┴─────────────────────┘
-  L +000  R +000  PAN:+00°  TLT:090°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  OFF
+  L:+000  R:+000  PAN:+00°  TLT:+00°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  OFF
 ```
 - Position mini-map (bottom of DRIVE & CAM, redesigned 2026-10-03, 200×200px): **robot-centered**
   — the heading arrow stays fixed at the canvas center, and the background (1m gridlines +
@@ -267,7 +296,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 
 The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a file dialog for a session CSV; `SimPlayer` then replays it row-by-row inside the same capture `_loop`, rebuilding the snapshot trio as if the data were sampled live. Details:
 - **Playback is paced by the CSV's timestamps** (real-time replay), so it is correct regardless of the rate a given recording actually achieved. `SimPlayer.next_frame()` returns `SimPlayer.WAIT` while the current frame should be held.
-- The joystick knob and pan/tilt sliders animate from the recorded values; user input to those controls is blocked during sim, and pre-sim pan/tilt is restored on exit (so servos don't jump when real sends resume).
+- The motion dial and pan/tilt sliders animate from the recorded values (the dial replays the recorded PWM); the motion controls are ignored during sim, and pre-sim pan/tilt is restored on exit (so servos don't jump when real sends resume).
 - Works on any machine (macOS included) — only needs the `logots` conda env and a recording CSV. Hardware readers keep running but are ignored (stopping `IMUReader` would force a ~10 s recalibration per toggle); I2C sends and reconnects are skipped.
 - **LOOP** checkbox: wrap at end-of-file vs freeze on last frame (`SIM ended`).
 - REC is disabled during sim (auto-stopped when entering); malformed CSV rows are skipped and counted; canceling the file dialog stays in Real mode.
@@ -292,7 +321,8 @@ completion contract `functions.py`'s `wait_for_done()` actually blocks on (up to
 that report's asks #2/#3) closes the loop from this side:
 
 - **The reader**: polls `GET :8788/latest_action` every 0.2 s, dedupes on `action_id`. When the
-  action is `approach_plant`, it drives the motors exactly the way the joystick does — sets
+  action is `approach_plant`, it drives the motors the way manual driving did before
+  2026-11-10 — sets
   `gui.left_pwm`/`right_pwm` from the action's args (clamped to ±255) for `duration_s` seconds,
   then zeros them; `_send_motors()`'s normal per-tick I2C send does the rest. Blocked while
   `sim_mode` is on. Tolerates `:8788` not being up yet (functions.py not running) — just keeps
@@ -901,7 +931,9 @@ calibration" in Known issues); git credentials ("Git setup").
   the curving above in software rather than chasing the mechanical cause. Called from
   `_send_motors()` — the single choke point every drive command passes through (joystick,
   keyboard, and `ActionReader`'s autonomous `approach_plant`) — so it applies automatically
-  everywhere, with no caller changes. Whenever the commanded PWM is equal and nonzero (a
+  everywhere, with no caller changes. **Since 2026-11-10 it only matters for `approach_plant`**:
+  the joystick and hold-to-drive keys are gone, and during a `Mover` motion the wire carries
+  0,0 (the firmware owns the wheels; a traverse holds its heading with the S steer instead). Whenever the commanded PWM is equal and nonzero (a
   "drive straight" command), it locks the IMU yaw at that moment and each tick applies a PI
   correction (P on the current heading error, I on the error accumulated over time, to kill
   the P-only controller's steady-state residual) by trimming one wheel down and the other up
@@ -990,7 +1022,7 @@ calibration" in Known issues); git credentials ("Git setup").
     swing the heading) than a hardware defect. **Next**, now that direction is fixed in
     hardware too: retest straight-line driving at a higher PWM (200+) — if it still drifts
     there, look at alignment/weight distribution instead of the motors.
-- Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`); transformation + mart + decision layers not yet written.
+- Staging layer CSV + sim mode + frame API done (Asaph can develop off-robot against `logots_api.get_latest_frame()`). The decision layer exists as Asaph's `functions.py` (initiation + `--listen`, see "Voice assistant"); routines beyond initiation (e.g. watering) are not written yet.
 - Color recording not yet exercised on the Jetson (grayscale→color change verified on Mac only) — record a short session next time on the robot and confirm the JPEGs are RGB.
 - The capture loop is **drift-compensated**: it waits `PERIOD_MS` minus the time the tick's work took, so the actual rate tracks `TARGET_FPS` (default **10 Hz**, set in `logots_ui.py`) as long as the per-tick work fits inside the period. The header shows a live `FPS:actual/target` readout (green within 10% of target, amber below) — run on the Jetson and, if it can't hold green, set `TARGET_FPS` just under the sustained value. The camera runs at `CAMERA_FPS` (default 15, down from the sensor's 30) since the loop only keeps the latest frame; if `nvarguscamerasrc` rejects that framerate for its sensor mode, raise it or drop frames downstream with a `videorate` element. Recordings are timestamped, so sim playback is unaffected by the exact rate.
 - **`ROBOT_MAX_SPEED_MPS` is now a fallback-only constant (2026-10-03)**: `PositionEstimator`'s primary model uses encoder counts for distance (see "Recording feature" position note), so this PWM-speed guess only matters on the rare tick where the encoder read-back fails. Calibrating it is no longer a blocker for `pos_x`/`pos_y` accuracy — if it's ever worth tightening, drive a known distance at full PWM for a known time and set the constant to `distance/time`. Position still assumes no wheel slip and drifts with IMU yaw drift over long sessions.
