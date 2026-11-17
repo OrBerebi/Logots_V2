@@ -17,3 +17,6 @@ knowledge/**
 experiments/initiation_e/*.csv
 experiments/initiation_e_2/*.csv
 runs/
+
+# full-resolution photos; web-sized copies live in docs/pics/
+docs/pics/originals/

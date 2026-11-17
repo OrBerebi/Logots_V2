@@ -1,5 +1,13 @@
 # Logots V2 — PlantSitter
 
+<p align="center">
+  <img src="docs/pics/robo.jpg" height="380" alt="The Logots robot from the front: a two-wheeled base with stacked decks of electronics and a pan/tilt camera on top">
+  &nbsp;&nbsp;
+  <img src="docs/pics/robo_2.jpg" height="380" alt="The Logots robot from a three-quarter angle: the Jetson Orin Nano with its fan on the top deck and the pan/tilt camera beside it">
+  <br>
+  <sub><i>Front and three-quarter views: the camera on its pan/tilt servos, the Jetson Orin Nano on the top deck, the Arduino motor shield and two encoder gear motors below.</i></sub>
+</p>
+
 A home plant-monitoring and care robot. Logots moves around your home, keeps an eye on your plants, streams live camera and audio, and inspects plants up close with a pan/tilt camera tower. You can talk to it ("Hey Jarvis …") or move it from a single GUI with three commands: traverse, rotate and servo.
 
 Built around a **Jetson Orin Nano** running JetPack 6, with an **Arduino** handling motor and servo control over I2C.

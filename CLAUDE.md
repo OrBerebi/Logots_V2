@@ -47,7 +47,8 @@ Logots_V2/
 │                              actions.md, functions/*.md are tracked (roster.md, plants/ are not)
 ├── docs/                    — architecture notes + live test reports (test_report_YYYY-MM-DD.txt)
 │   ├── v2_architecture/     — Asaph's architecture + action API docs, motion_commands.md
-│   └── robot1_system/       — robot #1's pin screenshot + asound demixer block (see "New Jetson setup")
+│   ├── robot1_system/       — robot #1's pin screenshot + asound demixer block (see "New Jetson setup")
+│   └── pics/                — photos of the robot, web-sized (robo.jpg + robo_2.jpg head the README); full-resolution originals in originals/ (gitignored)
 ├── experiments/             — notebooks and investigations, not used at runtime
 ├── archive/                 — v1 docs
 └── src/
