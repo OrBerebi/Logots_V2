@@ -1,18 +1,26 @@
 name: logots
+# Everything src/ imports (audited 2026-11-17). Sync an existing env with:
+#   conda env update -n logots -f environment.yml
 channels:
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
   - numpy>=2.0
-  - matplotlib>=3.8
-  - portaudio        # required by sounddevice
+  - matplotlib>=3.8   # GUI: IMU 3D view
+  - scipy             # mic high-pass before the gain (logots_ui AudioReader), VAD high-pass (audio_on_demand Ears)
+  - portaudio         # required by sounddevice
   - pip
   - pip:
-      - pillow
-      - sounddevice
-      - soundfile
-      - smbus2
-      - pyaudio
-      - openwakeword
-      - piper-tts
+      - pillow        # frame encoding + GUI display (PIL, not cv2: see CLAUDE.md Critical rule 3)
+      - sounddevice   # mic input, speaker output
+      - soundfile     # wav replay: functions.py --listen --wav
+      - smbus2        # I2C to the IMU and the Arduino (Jetson)
+      - openwakeword  # "Hey Jarvis" wake word; models: run download_models() once per env (CLAUDE.md)
+      - onnxruntime   # openwakeword's backend, forced in Ears (tflite-runtime breaks under NumPy 2)
+      - piper-tts     # text to speech
+# Not listed on purpose:
+# - torch + transformers: only the fallback brain (VOICE_BRAIN=gemma, mrt_reflective.VisionBrain)
+#   uses them, when there is no llama-server. Heavy, and the Jetson needs NVIDIA's own torch wheel.
+# - llama-server and the Gemma/Piper model files under ~/models/: set up separately (README).
+# - pyaudio: was listed until 2026-11-17, nothing imports it.

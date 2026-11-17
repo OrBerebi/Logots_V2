@@ -13,7 +13,10 @@ All work happens in the git repo, which lives on two machines:
 ```bash
 conda run -n logots python src/logots_ui.py
 ```
-- Conda env: `logots` (Python 3.10, NumPy 2.x) — `environment.yml` works on both Jetson and macOS
+- Conda env: `logots` (Python 3.10, NumPy 2.x) — `environment.yml` works on both Jetson and macOS.
+  It lists every package `src/` imports (audited 2026-11-17, each with its reason); bring an
+  existing env up to date with `conda env update -n logots -f environment.yml`. When code starts
+  importing a new package, add it there in the same commit.
 - Always run through conda — system Python is missing deps and system OpenCV is incompatible (NumPy 1.x vs 2.x)
 - This one command starts the whole robot: the GUI launches the voice listener
   (`functions.py --listen`) as its own process. **If no plants are known yet, the robot then runs
@@ -190,28 +193,31 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  traverse/rotate +  │  3D Madgwick AHRS   │
-│  tilt sliders +     │  YPR display        │
-│  position mini-map  │                     │
+│  pan/tilt sliders,  │  YPR display        │
+│  map below (full w) │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS +   │  live IMX219 feed   │
+│  GAIN slider +      │                     │
 │  ACTION (last voice │                     │
 │  command decided)   │                     │
 └─────────────────────┴─────────────────────┘
-  L:+000  R:+000  PAN:+00°  TLT:+00°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  OFF
+  L:+000  R:+000  PAN:+00°  TLT:+00°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  CLOSE GUI
 ```
-- Position mini-map (bottom of DRIVE & CAM, redesigned 2026-10-03, 200×200px): **robot-centered**
+- Position mini-map (redesigned 2026-10-03; since 2026-11-17 it fills the whole lower half of
+  DRIVE & CAM, 460×202 px on the Mac, sized from the canvas's `<Configure>` so font differences
+  can't clip it): **robot-centered**
   — the heading arrow stays fixed at the canvas center, and the background (1m gridlines +
   trail) pans underneath it as the robot moves, like a radar display, instead of the old
-  auto-zoom-to-fit-the-whole-trail behavior. Fixed scale (`POS_MAP_PX_PER_M`=28, ~±3.6m visible
-  each direction) so the gridlines are meaningful, labeled distance marks from the session/
+  auto-zoom-to-fit-the-whole-trail behavior. Fixed scale (`POS_MAP_PX_PER_M`=28, ~±8 m visible
+  left/right, ~±3.6 m up/down) so the gridlines are meaningful, labeled distance marks from the session/
   recording origin (brighter axis line + a small circle marker when the origin is in view) —
   older trail points scroll off-canvas as the robot moves on, which is expected for this
   local-area style. `⌖ POS` in the status bar zeros the estimate (origin = here).
 - **Encoder counts (`EL`/`ER`) are read internally (feed `PositionEstimator`) but are no
   longer shown in the GUI** (removed 2026-10-03, once the position feature built on them was
   validated) — internal/debug data, not something the user needs to see.
-- **`OFF` button (2026-10-03)**: closes the GUI application only — does **not** shut down the
+- **`CLOSE GUI` button (2026-10-03; labeled `OFF` until 2026-11-17)**: closes the GUI application only — does **not** shut down the
   Jetson. Confirms first, then `_shutdown()`: flushes any active recording, sends a final
   motor-stop, stops the voice listener, exits. Closing the window and SIGTERM take the same
   `_shutdown()` path, without the confirmation (2026-10-31).
@@ -223,10 +229,9 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
 - **Three parameters, no free driving (2026-11-10, Or's decision)**: the robot is moved
   only by `traverse` (cm, + = forward), `rotate` (degrees, + = left) and `servo` (pan, tilt)
   — from the GUI and from the LLM alike. The joystick is gone; **don't bring back
-  drag-to-drive or hold-a-key driving.** In DRIVE & CAM, left column, top to bottom:
-  - the **motion dial** (`_motion_dial()`/`_draw_joy()`): display only. The knob moves
-    up/down with a traverse, the outer ring fills with a rotation (dim arc = requested,
-    bright arc = done, up = heading at the start). In Sim it replays the recorded PWM.
+  drag-to-drive or hold-a-key driving.** In DRIVE & CAM, left column, top to bottom (the
+  display-only motion dial that sat above them was removed 2026-11-17, Or: it looked like a
+  joystick; the badge below says what the wheels are doing):
   - **TRAVERSE**: `FWD 50` `FWD 10` `BWD 10` `BWD 50`, and a box + `GO` (±200 cm)
   - **ROTATE**: `L 90°` `L 15°` `R 15°` `R 90°`, and a box + `GO` (±180°)
   - **Servo** = the PAN and TILT sliders (right column). TILT is signed since 2026-11-10:
@@ -241,11 +246,14 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
   (`lbl_auto`, drawn by `_update_drive_widgets()`) shows `⬤ READY`, `⬤ TRAVERSING +10 cm ·
   6 cm to go` / `⬤ ROTATING +15° · 6° to go` (from the GUI), `⬤ SELF-DRIVING  traverse -30 cm
   · 12 cm to go` / `rotate …` / `servo (+45, +10)` / `approach_plant · 1.4 s left` (from the
-  LLM), then how the last motion ended for 5 s. While `self_driving` is true the dial's knob
-  is amber and the mini-map shows a dashed line at a rotation's target heading. **The motion
+  LLM), then how the last motion ended for 5 s. While `self_driving` is true the mini-map
+  shows a dashed line at a rotation's target heading. **The motion
   controls are ignored meanwhile; only SPACE and `■ STOP` (`_estop()`) cancel**, and the
   cancelled action still reports where the robot ended up.
 - Arduino auto-connects on startup, retries every 3s if lost
+- Button text is `C_BTN_TEXT` (2026-11-17): black on macOS, where Tk draws `tk.Button` as a
+  native white button and ignores `bg`, and `C_TEXT` (light) on the Jetson, where the dark
+  `bg` shows. Use it for any new button's `fg`/`activeforeground`.
 
 ## Recording feature
 
@@ -263,7 +271,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `yaw` | JSON array | all IMU yaw readings (°) since last frame |
 | `pitch` | JSON array | all IMU pitch readings (°) since last frame |
 | `roll` | JSON array | all IMU roll readings (°) since last frame |
-| `audio_samples` | JSON array | all mic samples since last frame (~1600 floats at 10 FPS) |
+| `audio_samples` | JSON array | all mic samples since last frame (~1600 floats at 10 FPS). Since 2026-11-17: high-passed at 40 Hz, then `mic_gain_db` applied, clipped to ±1 |
 | `left_pwm` | int | left motor command, –255…+255 |
 | `right_pwm` | int | right motor command, –255…+255 |
 | `pan_angle` | int | camera pan, –90…+90° (0 = front, + = left). Recordings made before 2026-10-03 hold raw servo degrees 0…180 from the old horn position; sim replays them as-is, without converting |
@@ -271,6 +279,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 | `pos_x` | float | estimated body X position (m), origin = recording start; see position note |
 | `pos_y` | float | estimated body Y position (m), origin = recording start |
 | `heading` | float | body heading (°) used for the estimate = IMU yaw at that tick |
+| `mic_gain_db` | int | the GAIN slider (dB) applied to `audio_samples`; absent before 2026-11-17 (= 0) |
 
 > **Position is dead-reckoned from wheel encoders + IMU heading (2026-10-03), not measured
 > odometry.** `PositionEstimator` computes each tick's forward distance from the two wheels'
@@ -296,7 +305,7 @@ recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
 
 The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a file dialog for a session CSV; `SimPlayer` then replays it row-by-row inside the same capture `_loop`, rebuilding the snapshot trio as if the data were sampled live. Details:
 - **Playback is paced by the CSV's timestamps** (real-time replay), so it is correct regardless of the rate a given recording actually achieved. `SimPlayer.next_frame()` returns `SimPlayer.WAIT` while the current frame should be held.
-- The motion dial and pan/tilt sliders animate from the recorded values (the dial replays the recorded PWM); the motion controls are ignored during sim, and pre-sim pan/tilt is restored on exit (so servos don't jump when real sends resume).
+- The pan/tilt sliders animate from the recorded values; the motion controls are ignored during sim, and pre-sim pan/tilt is restored on exit (so servos don't jump when real sends resume).
 - Works on any machine (macOS included) — only needs the `logots` conda env and a recording CSV. Hardware readers keep running but are ignored (stopping `IMUReader` would force a ~10 s recalibration per toggle); I2C sends and reconnects are skipped.
 - **LOOP** checkbox: wrap at end-of-file vs freeze on last frame (`SIM ended`).
 - REC is disabled during sim (auto-stopped when entering); malformed CSV rows are skipped and counted; canceling the file dialog stays in Real mode.
@@ -304,7 +313,7 @@ The **▶ SIM** button in the status bar toggles Real/Sim. Entering Sim opens a 
 
 ## Frame API (for downstream processing)
 
-`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the capture tick never pays for it; the four array fields are real JSON arrays; `pos_x`/`pos_y` (m) and `heading` (°) carry the dead-reckoned body position; `sim_mode` (bool) is included. Client helper:
+`FrameServer` inside the GUI serves `GET http://localhost:8787/latest_frame` (JSON) in both modes. `frame_data` is base64 color JPEG — in Real mode it's encoded lazily per request (cached by `frame_id`) so the capture tick never pays for it; the four array fields are real JSON arrays; `pos_x`/`pos_y` (m) and `heading` (°) carry the dead-reckoned body position; `mic_gain_db` is the gain already applied to `audio_samples` (the listener reads it, see "Mic gain"); `sim_mode` (bool) is included. Client helper:
 
 ```python
 from logots_api import get_latest_frame   # src/logots_api.py
@@ -418,7 +427,7 @@ client, and imports `Ears`, `speak` and the `llama-server` plumbing from `audio_
 - **Auto-initiation (2026-10-31)**: once the model has loaded, `_initiate_if_needed()` checks the
   roster. If no plants are known, the listener announces it out loud, runs initiation, and only
   then starts listening, so **the robot drives by itself right after launch and can't hear you
-  until initiation ends** (up to 12 steps). `OFF` is the only full stop. It's skipped when plants
+  until initiation ends** (up to 12 steps). `CLOSE GUI` is the only full stop. It's skipped when plants
   are known, during Sim (a recording's plants don't belong in this robot's memory), with no camera
   frame after 20 s (it says so out loud), and with `--wav`. If it doesn't finish, nothing is
   written and the roster stays empty, so it runs again on the next launch. A run that finishes
@@ -482,8 +491,9 @@ client, and imports `Ears`, `speak` and the `llama-server` plumbing from `audio_
   and don't carry over between envs — run `python -c "from openwakeword.utils import
   download_models; download_models()"` once per new env that needs it (the pip package alone
   doesn't include them).
-- **`environment.yml`** now includes `soundfile`, `openwakeword`, `piper-tts` (added
-  2026-08-16) alongside the existing `sounddevice`. The Jetson-specific piece —
+- **`environment.yml`** lists every package `src/` imports (audited 2026-11-17: `scipy` and
+  `onnxruntime` added explicitly, unused `pyaudio` dropped; `torch`/`transformers` for the
+  fallback brain deliberately left out). The Jetson-specific piece —
   `~/llama.cpp/build/bin/llama-server` plus the downloaded GGUF/mmproj/Piper files under
   `~/models/` — is **not** part of the repo or `environment.yml`; see "Can Asaph run this on
   his Mac?" below for what that means off-robot.
@@ -505,7 +515,26 @@ client, and imports `Ears`, `speak` and the `llama-server` plumbing from `audio_
   no longer cuts the capture; with no speech at all it closes after `NO_SPEECH_S`=4 s. Captures
   now end ~1 s after speech (3-6 s, one request each). Verified live with `functions.py --listen`.
   If capture length regresses, measure clip RMS *after* a 100 Hz high-pass before touching the
-  threshold — raw RMS is dominated by the drift.
+  threshold — raw RMS is dominated by the drift. These numbers are at 0 dB mic gain; since
+  2026-11-17 `Ears` uses `SILENCE_RMS × gain` (next entry).
+- **Mic gain (2026-11-17, Or: fixed gain, not adaptive)**: GAIN slider in AUDIO INPUT,
+  `MIC_GAIN_DB_MIN`…`MAX` = −30…+20 dB (Or's range), default 0 dB. Double-click resets to 0; the value is
+  saved per machine in `~/.config/logots/ui_settings.json` when the mouse is released. The label
+  turns red `CLIP` for 1 s after a sample hits ±1.
+  - `AudioReader._process()`: 40 Hz high-pass (`MIC_HIGHPASS_HZ`, 2nd-order Butterworth, state
+    kept across blocks) → gain → clip to ±1. The high-pass is **before** the gain because the
+    mic's 1–3 Hz drift is 98% of its energy (measured on the July recordings): at +20 dB the
+    drift alone peaks at 0.24–0.30 of full scale without it, 0.07–0.15 with it (at +30 dB,
+    beyond the slider, it was 0.76–0.94 vs 0.22–0.48). Same audio for
+    waveform, CSV, frame API and listener.
+  - Listener: `api_chunks()` reads `mic_gain_db` from each frame into
+    `audio_on_demand._source_gain` and clips before the int16 conversion (a float past ±1 used
+    to wrap around). `Ears.feed()` compares against `SILENCE_RMS × _source_gain`, so
+    end-of-speech timing doesn't change with the slider (checked: capture ends at 3.04 s at
+    0 dB and at +20 dB; with the threshold unscaled, +20 dB never ends).
+  - The robot's mic is quiet: about −63 dBFS RMS after the high-pass on the July recordings.
+    Untested on the robot: what gain the wake word and Gemma like best. Try +10…+20 dB and
+    watch for `CLIP` while speaking close to it; if +20 dB isn't enough, raise `MIC_GAIN_DB_MAX`.
 - **One voice listener (2026-10-20, agreed Or+Asaph)**: talking to the robot goes through
   `functions.py --listen`, the 4-action contract. The GUI's old in-process `VoiceAssistant` and
   its v1 action list were deleted in PR #7, along with `GemmaBrain` and `audio_on_demand.py`'s
@@ -603,7 +632,7 @@ Login Keyring") on every launch.
    `sudo poweroff`. On a GNOME desktop, log out and back in instead of `xfce4-panel -r`. If
    `pkaction --version` is newer than 0.105 (e.g. an Ubuntu 24.04-based JetPack), `.pkla`
    files are ignored and the same rules must be written as JavaScript in
-   `/etc/polkit-1/rules.d/` — not tested. (The robot GUI's `OFF` button only closes
+   `/etc/polkit-1/rules.d/` — not tested. (The robot GUI's `CLOSE GUI` button only closes
    `logots_ui.py`, never the Jetson.)
 5. **Chromium's password prompt.** `sudo apt install -y seahorse`, run `seahorse`, then
    Passwords and Keys → right-click **Login** → Change Password → current password as the old
@@ -722,7 +751,7 @@ calibration" in Known issues); git credentials ("Git setup").
   assistant". Asaph tested it on the robot the same day and is happy with the listening.
 - **Auto-initiation pushed without drive limits — open discussion for Asaph and Or
   (2026-10-31)**: the listener now runs initiation at launch when no plants are known (see "Voice
-  assistant"). **It hasn't run on the robot yet**: clear the floor and be ready at `OFF` the first
+  assistant"). **It hasn't run on the robot yet**: clear the floor and be ready at `CLOSE GUI` the first
   time. In the Mac test (real GUI, listener, model and `ActionReader`, no motors, a frozen camera
   frame, log `runs/initiation_20261031_120116.log` on Asaph's Mac) it inspected at steps 1 and 4,
   then chose `approach_plant` 8 times in a row, each time saying it needed "one more approach"

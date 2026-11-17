@@ -54,7 +54,7 @@ conda env create -f environment.yml
 conda activate logots
 ```
 
-> Requires [Miniconda](https://docs.conda.io/en/latest/miniconda.html). The same `environment.yml` works on the Jetson and on macOS.
+> Requires [Miniconda](https://docs.conda.io/en/latest/miniconda.html). The same `environment.yml` works on the Jetson and on macOS. To bring an existing env up to date: `conda env update -n logots -f environment.yml`.
 > Always run through conda: the system Python lacks required packages and the system OpenCV is incompatible with NumPy 2.x.
 
 ### 3. Configure the Jetson's pins (one-time)
@@ -121,7 +121,7 @@ conda run -n logots python src/logots_ui.py
 
 This starts the whole robot: the GUI, then the voice listener as its own process. The model takes about a minute to load on the Jetson. No display variable is needed under NoMachine; the camera pipeline sets `EGL_PLATFORM=surfaceless` itself.
 
-> **The robot may start driving by itself.** If it doesn't know any plants yet, the listener runs *initiation* as soon as the model has loaded: it looks around and drives toward plants to learn them, for up to 12 steps, and can't hear you until it's done. Clear the floor the first time. `OFF` in the GUI stops everything.
+> **The robot may start driving by itself.** If it doesn't know any plants yet, the listener runs *initiation* as soon as the model has loaded: it looks around and drives toward plants to learn them, for up to 12 steps, and can't hear you until it's done. Clear the floor the first time. The `CLOSE GUI` button stops everything.
 
 To start the GUI without the listener (no voice, no initiation), for example to run `functions.py` by hand or to test motion:
 
@@ -140,14 +140,15 @@ Only one listener can run at a time; a second one exits with a message.
 ┌─────────────────────┬─────────────────────┐
 │  DRIVE & CAM        │  IMU ORIENTATION    │
 │  traverse/rotate +  │  3D Madgwick AHRS   │
-│  pan/tilt sliders + │  YPR display        │
-│  position mini-map  │                     │
+│  pan/tilt sliders,  │  YPR display        │
+│  map below (full w) │                     │
 ├─────────────────────┼─────────────────────┤
 │  AUDIO INPUT        │  VIDEO FEED         │
 │  waveform + RMS +   │  live IMX219 feed   │
+│  GAIN slider +      │                     │
 │  last voice action  │                     │
 └─────────────────────┴─────────────────────┘
-  L:+000  R:+000  PAN:+00°  TLT:+00°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  OFF
+  L:+000  R:+000  PAN:+00°  TLT:+00°  X+0.00 Y+0.00  HDG:090°  ⌖ POS  LOOP  ▶ SIM  ⚫ REC  ■ STOP  CLOSE GUI
 ```
 
 **The robot is moved by three commands only.** There is no free driving:
@@ -156,19 +157,19 @@ Only one listener can run at a time; a second one exits with a message.
 - **Rotate** (degrees, + = left): `L 90°`/`L 15°`/`R 15°`/`R 90°`, or type an angle (up to ±180°) and `GO`
 - **Servo** (pan, tilt): the two sliders. Pan 0 = front, + = left (±45°); tilt 0 = level, + = up
 
-Each press sends one command; the robot carries it out and stops by itself. The dial above the buttons shows what the wheels are doing, and the badge in the panel title says who is moving the robot (you or the LLM). While the LLM is moving it, the buttons are ignored; `SPACE` and `■ STOP` still cancel.
+Each press sends one command; the robot carries it out and stops by itself. The badge in the panel title shows what the wheels are doing and who is moving the robot (you or the LLM). While the LLM is moving it, the buttons are ignored; `SPACE` and `■ STOP` still cancel.
 
 **Keyboard:** `W/S` = traverse 10 cm forward/back · `A/D` = rotate 15° left/right · `SPACE` = stop
 
 The **position mini-map** shows a top-down trail of where the robot is, worked out from the wheel encoders and the IMU heading (about 2% error over 1 m in a tape-measure test). The map is centered on the robot with 1 m gridlines. `⌖ POS` sets the origin to "here".
 
-`OFF` closes the GUI and the listener; it does not shut down the Jetson. The GUI connects to the Arduino on startup and retries every 3 seconds if the connection drops. The header's `FPS:actual/target` turns amber when the loop can't keep up with `TARGET_FPS` (10 Hz, set at the top of `src/logots_ui.py`).
+`CLOSE GUI` closes the GUI and the listener; it does not shut down the Jetson. The GUI connects to the Arduino on startup and retries every 3 seconds if the connection drops. The header's `FPS:actual/target` turns amber when the loop can't keep up with `TARGET_FPS` (10 Hz, set at the top of `src/logots_ui.py`).
 
 ---
 
 ## Sim mode (no robot needed)
 
-Press **▶ SIM** and pick a session CSV (the output of **⚫ REC**). The GUI replays the recording as if it were live: video, IMU, audio waveform, the motion dial, sliders and motor values all come from the file, paced by the recording's own timestamps. **LOOP** chooses whether playback wraps or freezes on the last frame. Press **⏹ REAL** to return to live sensors.
+Press **▶ SIM** and pick a session CSV (the output of **⚫ REC**). The GUI replays the recording as if it were live: video, IMU, audio waveform, sliders and motor values all come from the file, paced by the recording's own timestamps. **LOOP** chooses whether playback wraps or freezes on the last frame. Press **⏹ REAL** to return to live sensors.
 
 Sim mode runs on any machine, no hardware needed:
 
@@ -209,7 +210,8 @@ from logots_api import get_latest_frame
 frame = get_latest_frame()
 frame['image']           # 640×640×3 uint8 RGB numpy array (None if no camera)
 frame['yaw']             # list of yaw readings (°) since the previous frame
-frame['audio_samples']   # list of mic samples (~1600 per frame at 10 FPS)
+frame['audio_samples']   # list of mic samples (~1600 per frame at 10 FPS), GAIN already applied
+frame['mic_gain_db']     # that gain, in dB (the GAIN slider in AUDIO INPUT)
 frame['left_pwm']        # motor/servo commands: left_pwm, right_pwm, pan_angle, tilt_angle
 frame['pos_x']           # body position (m): pos_x, pos_y, and heading (°)
 ```
@@ -290,6 +292,6 @@ recordings/             session CSVs from ⚫ REC (not tracked)
 ## Known issues
 
 - **Traverse, rotate and servo have not run on the robot yet.** The tuning values in `src/logots_ui.py` (`SPIN_*`, `ROT_*`, `TRAV_*`, `TILT_*`) are starting guesses; the first-run checklist is in `CLAUDE.md` under "Known issues".
-- **Initiation has no limit on driving yet.** In one off-robot test it chose to drive 8 times in a row. There is no obstacle detection, so watch it and keep `OFF` within reach.
+- **Initiation has no limit on driving yet.** In one off-robot test it chose to drive 8 times in a row. There is no obstacle detection, so watch it and keep `CLOSE GUI` within reach.
 - Position trusts the IMU's yaw, which drifts slowly over a long session.
 - The camera has a pink/IR hue: the IMX219-160 fisheye has no IR cut filter. Fix: an M12 IR cut filter (hardware).

@@ -75,6 +75,28 @@ IMU_I2C_BUS   = 7
 MPU_ADDR      = 0x68
 AUDIO_RATE    = 16000
 AUDIO_BLOCK   = 512
+# Mic gain (2026-11-17), the GAIN slider in AUDIO INPUT. Applied to the live mic in
+# AudioReader, so the waveform, the recording, the frame API and the voice listener all
+# get the same audio; the frame carries it as mic_gain_db, and the listener scales its
+# end-of-speech threshold by it (audio_on_demand.Ears). Saved per machine in SETTINGS_PATH.
+MIC_GAIN_DB_MIN = -30
+MIC_GAIN_DB_MAX = 20
+MIC_HIGHPASS_HZ = 40    # removes the mic's 1-3 Hz drift before the gain (AudioReader)
+SETTINGS_PATH   = os.path.expanduser('~/.config/logots/ui_settings.json')
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH) as f: return json.load(f)
+    except Exception:
+        return {}
+
+def _save_settings(**changes):
+    s=_load_settings(); s.update(changes)
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH),exist_ok=True)
+        with open(SETTINGS_PATH,'w') as f: json.dump(s,f,indent=1)
+    except Exception as e:
+        print(f'[settings] could not save {SETTINGS_PATH}: {e}',flush=True)
 
 # ── Capture loop rate ─────────────────────────────────────────────────────────
 # Sensory-capture / recording tick rate. The loop is drift-compensated (it waits
@@ -204,6 +226,9 @@ C_BLUE_HI = '#3498db'
 C_GREEN   = '#27ae60'
 C_RED     = '#c0392b'
 C_AMBER   = '#e67e22'
+# macOS draws tk.Button natively (white) and ignores bg, so light text is unreadable
+# there; on the Jetson (X11) the dark bg shows and the light text is right.
+C_BTN_TEXT = '#000000' if sys.platform == 'darwin' else C_TEXT
 
 # ── Madgwick AHRS ─────────────────────────────────────────────────────────────
 class Madgwick:
@@ -665,6 +690,34 @@ class AudioReader:
         self.status    = 'stopped'
         self._drain_buf  = []
         self._drain_lock = threading.Lock()
+        self.gain_db     = 0
+        self._gain       = 1.0
+        # High-pass BEFORE the gain: the I2S mic's baseline drifts at ~1-3 Hz (see
+        # audio_on_demand.VAD_HIGHPASS_HZ). Measured 2026-11-17 on the robot's July
+        # recordings: 98% of the energy is below 40 Hz, and at +20 dB (the slider's max) the
+        # drift alone peaks at 0.24-0.30 of full scale without the high-pass, 0.07-0.15 with it.
+        # 40 Hz is below speech.
+        try:
+            from scipy.signal import butter, sosfilt
+            self._hp=butter(2,MIC_HIGHPASS_HZ,'hp',fs=AUDIO_RATE,output='sos')
+            self._sosfilt=sosfilt; self._hp_zi=None
+        except Exception as e:      # scipy comes with openwakeword; without it, no high-pass
+            print(f'[audio] no high-pass ({e})',flush=True); self._hp=None
+
+    def set_gain_db(self,db):
+        self.gain_db=db; self._gain=10.0**(db/20.0)
+
+    def _process(self,x):
+        """Live mic block (float32, ±1) -> high-pass, gain, clip."""
+        if self._hp is not None:
+            if self._hp_zi is None:          # start in steady state at the first sample's level
+                from scipy.signal import sosfilt_zi
+                self._hp_zi=sosfilt_zi(self._hp)*float(x[0]) if len(x) else None
+            if self._hp_zi is not None:
+                x,self._hp_zi=self._sosfilt(self._hp,x,zi=self._hp_zi)
+        if self._gain!=1.0:
+            x=x*self._gain
+        return np.clip(x,-1.0,1.0)   # past ±1 the listener's int16 conversion would wrap
 
     def start(self):
         if not AUDIO_OK:
@@ -677,8 +730,9 @@ class AudioReader:
             self.status=f'error: {e}'
 
     def _cb(self,indata,frames,t,status):
+        x=self._process(indata[:, 0].astype(np.float64))
         with self._drain_lock:
-            self._drain_buf.extend(indata[:, 0].tolist())
+            self._drain_buf.extend(x.tolist())
 
     def drain_samples(self):
         with self._drain_lock:
@@ -972,7 +1026,8 @@ class RecordingManager:
         'left_pwm', 'right_pwm', 'pan_angle', 'tilt_angle',
     ]
     # pos_x/pos_y (metres) + heading (deg): dead-reckoning estimate, see PositionEstimator.
-    FIELDNAMES = CORE_FIELDNAMES + ['pos_x', 'pos_y', 'heading']
+    # mic_gain_db: the GAIN slider's value, already applied to audio_samples (2026-11-17).
+    FIELDNAMES = CORE_FIELDNAMES + ['pos_x', 'pos_y', 'heading', 'mic_gain_db']
 
     def __init__(self):
         self._active   = False
@@ -1131,6 +1186,7 @@ class SimPlayer:
             'pos_x':         decoded['pos_x'],
             'pos_y':         decoded['pos_y'],
             'heading':       decoded['heading'],
+            'mic_gain_db':   fnum('mic_gain_db', 0.0),   # 0 dB for CSVs made before the slider
         }
         return frame, decoded, _decode_frame(frame['frame_data'])
 
@@ -1211,22 +1267,18 @@ def _vallbl(p,txt,fg=C_BLUE,width=0,**kw):
                     width=width,**kw)
 
 def _btn(p,txt,color,cmd,**kw):
-    return tk.Button(p,text=txt,bg=color,fg=C_TEXT,relief='flat',
+    return tk.Button(p,text=txt,bg=color,fg=C_BTN_TEXT,relief='flat',
                      font=('Courier',10,'bold'),padx=12,pady=3,command=cmd,
-                     cursor='hand2',activebackground=color,activeforeground=C_TEXT,**kw)
+                     cursor='hand2',activebackground=color,activeforeground=C_BTN_TEXT,**kw)
 
 # ── Main GUI ──────────────────────────────────────────────────────────────────
 class RobotControlGUI:
-    JOY_R = 84     # the motion dial (display only since 2026-11-10)
-    JOY_T = 20
-
     def __init__(self, root):
         self.root=root
         root.title('Logots — Robot Control')
         root.configure(bg=C_BG)
         root.resizable(False,False)
 
-        self.joy_x=self.joy_y=0.0
         self.left_pwm=self.right_pwm=0
         self.pan_angle=0     # -90…+90, 0 = camera facing front, + = left
         self.tilt_angle=90
@@ -1237,8 +1289,11 @@ class RobotControlGUI:
         self.auto=None                      # {'label','t_end'} while ActionReader drives
         self.servo_note=None                # (text, time) of the last servo command, for the badge
         self._auto_cancel=threading.Event() # set by SPACE / STOP to end that drive early
-        self._joy_drawn=None                # last state drawn on the joystick
         self._was_rotating=False
+        g=_load_settings().get('mic_gain_db',0)
+        self._mic_gain_db=int(max(MIC_GAIN_DB_MIN,min(MIC_GAIN_DB_MAX,g if isinstance(g,(int,float)) else 0)))
+        self._clip_t=0.0                    # time.monotonic() of the last clipped sample
+        self._gain_lbl_state=None
         self._straight_target=None   # locked IMU yaw for the gyro straight-line trim, see _straight_trim()
         self._straight_integral=0.0  # accumulated yaw error for the trim's integral term
         self._straight_t=None        # time.monotonic() of the last _straight_trim() call
@@ -1342,78 +1397,25 @@ class RobotControlGUI:
         _plbl(h,'DRIVE  &  CAM',font=('Courier',9,'bold')).pack(side='left')
         # READY, or what the wheels/servos are doing right now (see _update_drive_widgets)
         self.lbl_auto=_plbl(h,'⬤  READY',font=('Courier',9,'bold')); self.lbl_auto.pack(side='right')
-        row=tk.Frame(p,bg=C_PANEL); row.pack(padx=10,pady=(0,8))
-        lc=tk.Frame(row,bg=C_PANEL); lc.pack(side='left',anchor='n')   # dial, traverse + rotate below
-        self._motion_dial(lc)
+        # top half: traverse + rotate (left), pan/tilt sliders (right); bottom half: the map,
+        # full width, filling whatever height is left (so font size differences between the
+        # Mac and the Jetson can't clip it, see the 2026-10-03 layout entry in CLAUDE.md)
+        row=tk.Frame(p,bg=C_PANEL); row.pack(fill='x',padx=10,pady=(0,4))
+        lc=tk.Frame(row,bg=C_PANEL); lc.pack(side='left',anchor='n')
         self._motion_controls(lc)
-        rc=tk.Frame(row,bg=C_PANEL); rc.pack(side='left')   # sliders on top, map below
-        sl=tk.Frame(rc,bg=C_PANEL); sl.pack(side='top')
+        sl=tk.Frame(row,bg=C_PANEL); sl.pack(side='right',anchor='n')
         self._cam_sliders(sl)
-        self._position_map(rc)
-
-    def _motion_dial(self,parent):
-        """Display only (2026-11-10): the robot is controlled by three parameters, traverse
-        (cm), rotate (degrees) and servo (pan, tilt), from the controls below and the
-        sliders. There is no free driving any more. The dial shows what the wheels are
-        doing: the knob moves up/down with a traverse, the ring fills with a rotation.
-        Every item is created once here and updated in place by _draw_joy(), which runs
-        every tick (creating canvas items per tick is what cost the FPS on 2026-10-03)."""
-        sz=(self.JOY_R+14)*2
-        cv=self.joy_cv=tk.Canvas(parent,width=sz,height=sz,bg=C_PANEL,highlightthickness=0)
-        cv.pack(side='top',padx=(4,10))
-        R=self.JOY_R; tr=self.JOY_T; cx=cy=R+14
-        cv.create_oval(cx-R,cy-R,cx+R,cy+R,fill='#16162a',outline=C_BORDER,width=2)
-        for f in (.5,1.): r2=R*f; cv.create_oval(cx-r2,cy-r2,cx+r2,cy+r2,outline=C_BORDER,fill='')
-        cv.create_line(cx-R+8,cy,cx+R-8,cy,fill=C_BORDER)
-        cv.create_line(cx,cy-R+8,cx,cy+R-8,fill=C_BORDER)
-        for txt,x,y in [('FWD',cx,cy-R+8),('BWD',cx,cy+R-8),('L',cx-R+8,cy),('R',cx+R-8,cy)]:
-            cv.create_text(x,y,text=txt,fill=C_SUB,font=('Courier',7))
-        # rotation shown on the ring: up = heading when it started, left turn = anticlockwise
-        ra=R+7; box=(cx-ra,cy-ra,cx+ra,cy+ra)
-        self._joy_arc_req =cv.create_arc(*box,start=90,extent=0,style='arc',outline='#7a5a1e',width=5,state='hidden')
-        self._joy_arc_done=cv.create_arc(*box,start=90,extent=0,style='arc',outline=C_AMBER,width=5,state='hidden')
-        self._joy_mark    =cv.create_line(0,0,0,0,fill=C_TEXT,width=3,state='hidden')
-        self._joy_glow=cv.create_oval(0,0,0,0,fill='#0d2a40',outline='')
-        self._joy_knob=cv.create_oval(0,0,0,0,fill=C_BLUE,outline='#5bb3e8')
-        self._joy_dot =cv.create_oval(0,0,0,0,fill='#cce8ff',outline='')
-        self._draw_joy()
-
-    def _draw_joy(self):
-        job=self._mover.job
-        rot=(round(job['requested']),round(job['turned'])) if job and job['kind']=='rotate' else None
-        driving=self.self_driving
-        state=(round(self.joy_x,3),round(self.joy_y,3),driving,rot)
-        if state==self._joy_drawn: return
-        self._joy_drawn=state
-        cv=self.joy_cv; R=self.JOY_R; tr=self.JOY_T; cx=cy=R+14
-        mr=R-tr-2; tx=cx+self.joy_x*mr; ty=cy-self.joy_y*mr
-        g=tr+7; cv.coords(self._joy_glow,tx-g,ty-g,tx+g,ty+g)
-        cv.coords(self._joy_knob,tx-tr,ty-tr,tx+tr,ty+tr)
-        cv.coords(self._joy_dot,tx-4,ty-4,tx+4,ty+4)
-        cv.itemconfig(self._joy_knob,fill=(C_AMBER if driving else C_BLUE),
-                      outline=('#f0b070' if driving else '#5bb3e8'))
-        cv.itemconfig(self._joy_glow,fill=('#40280d' if driving else '#0d2a40'))
-        if rot:
-            req,done=rot
-            lim=lambda v: max(-359,min(359,v))
-            cv.itemconfig(self._joy_arc_req, extent=lim(req), state='normal')
-            cv.itemconfig(self._joy_arc_done,extent=lim(done),state='normal')
-            a=math.radians(90+req)
-            cv.coords(self._joy_mark,cx+(R-2)*math.cos(a),cy-(R-2)*math.sin(a),
-                                     cx+(R+13)*math.cos(a),cy-(R+13)*math.sin(a))
-            cv.itemconfig(self._joy_mark,state='normal')
-        else:
-            for item in (self._joy_arc_req,self._joy_arc_done,self._joy_mark):
-                cv.itemconfig(item,state='hidden')
+        mp=tk.Frame(p,bg=C_PANEL); mp.pack(fill='both',expand=True,padx=10,pady=(0,10))
+        self._position_map(mp)
 
     def _motion_controls(self,parent):
         """The only wheel controls: TRAVERSE in cm (+ = forward) and ROTATE in degrees
         (+ = left). Step buttons, or type any value and GO. Each sends one command; the
         robot carries it out and stops by itself."""
         def b(p,txt,cmd):
-            return tk.Button(p,text=txt,bg=C_BORDER,fg=C_TEXT,relief='flat',font=('Courier',9,'bold'),
+            return tk.Button(p,text=txt,bg=C_BORDER,fg=C_BTN_TEXT,relief='flat',font=('Courier',9,'bold'),
                              padx=4,pady=2,command=cmd,cursor='hand2',
-                             activebackground=C_BLUE,activeforeground=C_TEXT)
+                             activebackground=C_BLUE,activeforeground=C_BTN_TEXT)
         self._move_entries={}
         for kind,title,steps,unit,init,limit in [
                 ('traverse','TRAVERSE',[('FWD 50',50),('FWD 10',10),('BWD 10',-10),('BWD 50',-50)],
@@ -1485,17 +1487,22 @@ class RobotControlGUI:
         else:           self.tilt_angle=tilt_to_raw(v)
 
     # ── Position mini-map ─────────────────────────────────────────────────────
-    POS_MAP        = 200   # canvas size (px), enlarged 2026-10-03 (was 118, "too small")
-    POS_MAP_PX_PER_M = 28  # fixed scale — ~±3.6m visible each direction from the robot
-
-    POS_MAP_N_GRID = 10   # pool size per axis — more than the ~9 gridlines ever visible at once
+    # Size: fills the lower half of DRIVE & CAM (2026-11-17, was a 200 px square beside the
+    # dial); the real size comes from <Configure>, these are only the minimum.
+    POS_MAP_MIN_W, POS_MAP_MIN_H = 200, 120
+    POS_MAP_PX_PER_M = 28  # fixed scale (unchanged), so a wider map shows more floor
+    POS_MAP_N_GRID = 24    # pool size per axis — enough for a 670 px side at this scale
 
     def _position_map(self,parent):
         _plbl(parent,'POSITION (m)',font=('Courier',7,'bold')).pack(pady=(2,0))
-        cv=tk.Canvas(parent,width=self.POS_MAP,height=self.POS_MAP,
+        cv=tk.Canvas(parent,width=self.POS_MAP_MIN_W,height=self.POS_MAP_MIN_H,
                      bg='#16162a',highlightthickness=1,highlightbackground=C_BORDER)
-        cv.pack(pady=(1,0))
+        cv.pack(fill='both',expand=True,pady=(1,0))
         self.pos_cv=cv
+        self._map_w,self._map_h=self.POS_MAP_MIN_W,self.POS_MAP_MIN_H
+        def resized(e):
+            self._map_w,self._map_h=e.width,e.height; self._draw_pos_map()
+        cv.bind('<Configure>',resized)
         # Pre-create a fixed pool of canvas items, updated in place every redraw via
         # coords()/itemconfig() instead of delete()+create() — found 2026-10-03 that
         # recreating ~16 canvas text items cost ~65ms total on this system (each
@@ -1504,8 +1511,8 @@ class RobotControlGUI:
         # Creation order here also fixes the stacking order permanently (grid under trail
         # under arrow/dot), so it never needs re-asserting on redraw.
         N=self.POS_MAP_N_GRID
-        self._map_vlines =[cv.create_line(0,0,0,self.POS_MAP,fill='#25253a') for _ in range(N)]
-        self._map_hlines =[cv.create_line(0,0,self.POS_MAP,0,fill='#25253a') for _ in range(N)]
+        self._map_vlines =[cv.create_line(0,0,0,1,fill='#25253a') for _ in range(N)]
+        self._map_hlines =[cv.create_line(0,0,1,0,fill='#25253a') for _ in range(N)]
         self._map_vlabels=[cv.create_text(0,0,text='',fill=C_SUB,font=('Courier',6),anchor='nw') for _ in range(N)]
         self._map_hlabels=[cv.create_text(0,0,text='',fill=C_SUB,font=('Courier',6),anchor='nw') for _ in range(N)]
         self._map_origin = cv.create_oval(0,0,0,0,outline=C_SUB,fill='',state='hidden')
@@ -1523,22 +1530,22 @@ class RobotControlGUI:
         meaningful distance marks, not a shrinking/growing scale. +X right, +Y up on screen.
         Updates the item pool created in _position_map() in place — see that method's
         comment for why (performance)."""
-        cv=self.pos_cv; S=self.POS_MAP; PPM=self.POS_MAP_PX_PER_M
+        cv=self.pos_cv; W,H=self._map_w,self._map_h; PPM=self.POS_MAP_PX_PER_M
         pts=list(self._pos_trail)
         rx,ry = pts[-1] if pts else (0.0,0.0)   # robot's current world position
         heading = self.latest_frame.get('heading',0.0) if self.latest_frame else 0.0
-        cxp=cyp=S/2   # the robot is always drawn here — canvas center never moves
+        cxp,cyp=W/2,H/2   # the robot is always drawn here — canvas center never moves
         def to_px(wx,wy):
             return cxp+(wx-rx)*PPM, cyp-(wy-ry)*PPM   # world -> screen, robot-centered
         # metre gridlines, panning with the robot — origin's axis line drawn brighter so you
         # can always tell which way back to the start (session/recording origin) is
-        half_m = (S/2)/PPM
-        xs = list(range(math.floor(rx-half_m), math.ceil(rx+half_m)+1))
-        ys = list(range(math.floor(ry-half_m), math.ceil(ry+half_m)+1))
+        half_x, half_y = (W/2)/PPM, (H/2)/PPM
+        xs = list(range(math.floor(rx-half_x), math.ceil(rx+half_x)+1))
+        ys = list(range(math.floor(ry-half_y), math.ceil(ry+half_y)+1))
         for i,item in enumerate(self._map_vlines):
             if i<len(xs):
                 gx=xs[i]; px,_=to_px(gx,ry)
-                cv.coords(item,px,0,px,S); cv.itemconfig(item,fill=(C_SUB if gx==0 else '#25253a'),state='normal')
+                cv.coords(item,px,0,px,H); cv.itemconfig(item,fill=(C_SUB if gx==0 else '#25253a'),state='normal')
             else:
                 cv.itemconfig(item,state='hidden')
         for i,item in enumerate(self._map_vlabels):
@@ -1550,7 +1557,7 @@ class RobotControlGUI:
         for i,item in enumerate(self._map_hlines):
             if i<len(ys):
                 gy=ys[i]; _,py=to_px(rx,gy)
-                cv.coords(item,0,py,S,py); cv.itemconfig(item,fill=(C_SUB if gy==0 else '#25253a'),state='normal')
+                cv.coords(item,0,py,W,py); cv.itemconfig(item,fill=(C_SUB if gy==0 else '#25253a'),state='normal')
             else:
                 cv.itemconfig(item,state='hidden')
         for i,item in enumerate(self._map_hlabels):
@@ -1561,7 +1568,7 @@ class RobotControlGUI:
                 cv.itemconfig(item,state='hidden')
         # origin marker (session/recording start), only shown while it's in view
         ox,oy=to_px(0.0,0.0)
-        if 0<=ox<=S and 0<=oy<=S:
+        if 0<=ox<=W and 0<=oy<=H:
             cv.coords(self._map_origin,ox-3,oy-3,ox+3,oy+3); cv.itemconfig(self._map_origin,state='normal')
         else:
             cv.itemconfig(self._map_origin,state='hidden')
@@ -1597,9 +1604,24 @@ class RobotControlGUI:
         self.wav_cv.pack(padx=8,pady=(0,4))
         self._wave_idle()
         br=tk.Frame(p,bg=C_PANEL); br.pack(fill='x',padx=8,pady=(0,4))
-        _plbl(br,'RMS',font=('Courier',8)).pack(side='left')
+        _plbl(br,'RMS',font=('Courier',8),width=5,anchor='w').pack(side='left')
         self.rms_cv=tk.Canvas(br,width=286,height=8,bg='#16162a',highlightthickness=0)
         self.rms_cv.pack(side='left',padx=6)
+        # Mic gain, see MIC_GAIN_DB_MIN. Saved when the mouse is released; double-click = 0 dB.
+        gr=tk.Frame(p,bg=C_PANEL); gr.pack(fill='x',padx=8,pady=(0,4))
+        _plbl(gr,'GAIN',font=('Courier',8),width=5,anchor='w').pack(side='left')
+        self.mic_gain_var=tk.IntVar(value=self._mic_gain_db)
+        sc=tk.Scale(gr,from_=MIC_GAIN_DB_MIN,to=MIC_GAIN_DB_MAX,variable=self.mic_gain_var,
+                    orient='horizontal',length=286,width=10,bg=C_PANEL,fg=C_TEXT,
+                    troughcolor='#16162a',activebackground=C_BLUE_HI,highlightthickness=0,bd=0,
+                    sliderrelief='flat',sliderlength=14,showvalue=False,
+                    command=lambda v:self._mic_gain_moved(int(float(v))))
+        sc.pack(side='left',padx=6)
+        sc.bind('<ButtonRelease-1>',lambda e:_save_settings(mic_gain_db=self._mic_gain_db))
+        sc.bind('<Double-Button-1>',lambda e:(self.mic_gain_var.set(0),self._mic_gain_moved(0),
+                                              _save_settings(mic_gain_db=0)))
+        self.lbl_gain=_plbl(gr,'',font=('Courier',8,'bold'),fg=C_TEXT); self.lbl_gain.pack(side='left')
+        self._update_gain_label()
         ar=tk.Frame(p,bg=C_PANEL); ar.pack(fill='x',padx=8,pady=(0,8))
         _plbl(ar,'ACTION',font=('Courier',8)).pack(side='left',anchor='n')
         self.lbl_voice_action=_plbl(ar,'(no action yet)',font=('Courier',8),fg=C_SUB)
@@ -1622,6 +1644,19 @@ class RobotControlGUI:
         for i,s in enumerate(samples):
             pts.extend([i*w/(n-1), mid-float(s)*mid*0.9*8])
         cv.create_line(*pts,fill=C_GREEN,width=1,smooth=True)
+
+    def _mic_gain_moved(self,db):
+        self._mic_gain_db=db
+        if self.audio_reader: self.audio_reader.set_gain_db(db)
+        self._update_gain_label()
+
+    def _update_gain_label(self):
+        clip=time.monotonic()-self._clip_t<1.0   # a clipped sample in the last second
+        state=(self._mic_gain_db,clip)
+        if state==self._gain_lbl_state: return
+        self._gain_lbl_state=state
+        self.lbl_gain.config(text=f'{self._mic_gain_db:+d} dB'+('  CLIP' if clip else ''),
+                             fg=(C_RED if clip else C_TEXT))
 
     def _draw_rms(self,rms):
         cv=self.rms_cv; cv.delete('all')
@@ -1746,7 +1781,7 @@ class RobotControlGUI:
         _hline(p)
         pk(_btn(p,'■  STOP',C_RED,self._estop),(8,8))
         _hline(p)
-        pk(_btn(p,'OFF',C_RED,self._off),(8,8))
+        pk(_btn(p,'CLOSE GUI',C_RED,self._off),(8,8))
         pk(_lbl(p,f'⌨  W/S ±{TRAV_KEY_STEP_CM} cm · A/D ±{ROT_KEY_STEP_DEG}° · SPACE stop',fg=C_SUB,font=('Courier',8),
                 justify='center',wraplength=150),(4,4))
         self.lbl_tx=_lbl(p,'',fg=C_SUB,font=('Courier',8),
@@ -1771,7 +1806,7 @@ class RobotControlGUI:
         LLM drive). The cancelled action still reports its end pose."""
         self._mover.cancel('stopped by the user')
         self._auto_cancel.set()
-        self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0; self._draw_joy()
+        self.left_pwm=self.right_pwm=0
 
     def _off(self):
         """Closes the GUI app only — does NOT shut down the Jetson itself. Confirms first
@@ -1781,7 +1816,7 @@ class RobotControlGUI:
         self._shutdown()
 
     def _shutdown(self):
-        """Every way out (OFF, window close, SIGTERM): flushes any active recording, zeros
+        """Every way out (CLOSE GUI, window close, SIGTERM): flushes any active recording, zeros
         and sends a final motor-stop, stops the voice listener, then exits the process."""
         if self._rec_manager.active:
             self._rec_manager.stop()
@@ -1842,8 +1877,7 @@ class RobotControlGUI:
             # to the last replayed values when real sends resume
             self.pan_angle,self.tilt_angle=self._pre_sim_angles
             self.pan_var.set(self.pan_angle); self.tilt_var.set(tilt_from_raw(self.tilt_angle))
-            self.joy_x=self.joy_y=0.0; self.left_pwm=self.right_pwm=0
-            self._draw_joy()
+            self.left_pwm=self.right_pwm=0
             self._pos_est.reset(); self._pos_trail.clear()   # real odometry starts fresh
             self.btn_sim.config(text='▶  SIM',bg=C_SUB)
             self.btn_rec.config(state='normal')
@@ -1983,7 +2017,8 @@ class RobotControlGUI:
             self.imu_reader=IMUReader(); self.imu_reader.start()
         except Exception as e:
             self.lbl_is.config(text=f'error: {e}',fg=C_RED)
-        self.audio_reader=AudioReader(); self.audio_reader.start()
+        self.audio_reader=AudioReader(); self.audio_reader.set_gain_db(self._mic_gain_db)
+        self.audio_reader.start()
         self.camera_reader=CameraReader(); self.camera_reader.start()
         self._conn()
 
@@ -2052,6 +2087,7 @@ class RobotControlGUI:
             'pos_x':         round(self._pos_est.x, 4),
             'pos_y':         round(self._pos_est.y, 4),
             'heading':       round(self._pos_est.heading, 2),
+            'mic_gain_db':   self.audio_reader.gain_db if self.audio_reader else 0,
         }
         with self._frame_lock:
             self.latest_frame     = frame
@@ -2080,10 +2116,6 @@ class RobotControlGUI:
         # Animate the drive/cam controls from the recorded values
         self.pan_var.set(decoded['pan_angle'])
         self.tilt_var.set(tilt_from_raw(decoded['tilt_angle']))
-        l,r=decoded['left_pwm'],decoded['right_pwm']
-        self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # inverse of _pwm mixing
-        self.joy_x=max(-1.0,min(1.0,(l-r)/510.0))
-        self._draw_joy()
         sp=self.sim_player
         if sp.total_rows:
             pct=min(100,int(sp.row_index/sp.total_rows*100))
@@ -2158,13 +2190,16 @@ class RobotControlGUI:
     def _draw_audio(self):
         samples=self.latest_decoded.get('audio') or []
         if samples:
-            arr=np.clip(np.asarray(samples,dtype=float),-0.5,0.5)  # reject glitches
+            arr=np.asarray(samples,dtype=float)
+            if np.max(np.abs(arr))>=0.999: self._clip_t=time.monotonic()   # hit the ±1 clip
+            arr=np.clip(arr,-0.5,0.5)  # reject glitches
             raw=float(np.sqrt(np.mean(arr**2)))
             self._rms_ema=0.25*raw+0.75*self._rms_ema   # smooth out spikes
             self._draw_wave(arr[-512:])
         else:
             self._draw_wave(np.zeros(512))
         self._draw_rms(self._rms_ema)
+        self._update_gain_label()
 
     def _update_position_widgets(self):
         """Read pos_x/pos_y/heading from the current snapshot (Real: live estimate,
@@ -2203,13 +2238,9 @@ class RobotControlGUI:
             txt,fg='READY',C_SUB
         self.lbl_auto.config(text=f'⬤  {txt}',fg=fg)
         if not self.sim_mode:
-            l,r=self.left_pwm,self.right_pwm
-            self.joy_y=max(-1.0,min(1.0,(l+r)/510.0))   # same inverse mixing as sim replay
-            self.joy_x=max(-1.0,min(1.0,(l-r)/510.0)) if auto else 0.0
             if self.pan_var.get()!=self.pan_angle: self.pan_var.set(self.pan_angle)
             t=tilt_from_raw(self.tilt_angle)
             if self.tilt_var.get()!=t: self.tilt_var.set(t)
-        self._draw_joy()
 
     def _update_fps_label(self):
         fps = self._fps_ema

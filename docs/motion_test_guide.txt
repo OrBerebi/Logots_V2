@@ -1,0 +1,86 @@
+LOGOTS - MOTION TEST: FLASH + ROBOT TEST
+========================================
+For Asaph, 2026-11-17. Asaph does every step; Or watches on Zoom.
+
+Have ready:
+  - Your Mac with Arduino IDE, and a USB cable for the Arduino
+  - A tape measure
+  - About 1 m of clear floor around the robot
+
+On Zoom:
+  - Share your screen
+  - Point a phone (also on the call) at the robot so Or can see it move
+
+
+1. FLASH THE FIRMWARE (your Mac)
+--------------------------------
+1. In Logots_V2, run:  git pull
+2. Lift the wheels off the floor. Plug the Arduino into the Mac over USB.
+3. In Arduino IDE, open:
+     src/firmware/logots_motor_control/logots_motor_control.ino
+   (motion.h opens as a second tab by itself.)
+   - Board: Arduino Uno
+   - Port: the "usbmodem" / "usbserial" one
+   - If the compile fails, install "Adafruit Motor Shield library" (v1)
+     and "Servo" from the Library Manager.
+4. Click Upload. Open the Serial Monitor at 9600 baud. It should print:
+     Logots V2 motor controller ready.
+5. Leave the USB plugged in. The Serial Monitor helps if something goes
+   wrong later.
+
+
+2. START THE ROBOT GUI (NoMachine from your Mac)
+-----------------------------------------------
+6. Connect to logots-desktop.local, open a terminal and run:
+     cd ~/Desktop/Logots_V2 && git pull
+     LISTEN=0 conda run -n logots python src/logots_ui.py
+   Keep LISTEN=0: without it the robot may start initiation and drive on
+   its own.
+7. Turn the battery on. The GUI header should show CONNECTED.
+
+
+3. WHEELS STILL OFF THE FLOOR
+-----------------------------
+8.  Press FWD 10. Both wheels turn forward, then stop.
+    The badge shows "moved +10.0 cm".
+9.  Press L 15 deg. The right wheel turns forward, the left one backward.
+    Ending with "off after 4 passes" is normal here (the body can't turn
+    while raised).
+10. Move the TILT slider up and watch the camera.
+    - Tilts down instead?     Set TILT_DIR = -1
+    - Slider at 0 not level?  Adjust TILT_LEVEL_DEG
+    Both are near the top of src/logots_ui.py. Restart the GUI after an
+    edit.
+11. In a second terminal:
+      cd ~/Desktop/Logots_V2
+      conda run --no-capture-output -n logots python src/motion_live_test.py --stage raised
+
+
+4. ON THE FLOOR (keep a hand near SPACE - it stops everything)
+--------------------------------------------------------------
+12. Press L 15 deg, L 90 deg, R 90 deg.
+    - Badge says "turned the wrong way"?  Set SPIN_DIR = -1, restart the GUI.
+    - The terminal prints counts per degree on each big turn. Put the
+      value it settles on into SPIN_COUNTS_PER_DEG.
+13. Press FWD 50 next to the tape measure. It should land within a couple
+    of cm.
+    - Weaves left-right?   Lower TRAV_STEER_K
+    - Curves steadily?     Raise TRAV_STEER_K
+14. Run the remaining stages:
+      conda run --no-capture-output -n logots python src/motion_live_test.py --stage floor   (about 3 min)
+      conda run --no-capture-output -n logots python src/motion_live_test.py --stage tape    (asks for tape readings)
+    Each stage prints PASS/FAIL per check.
+
+
+5. SAVE THE RESULTS
+-------------------
+15. On the Jetson, commit and push any tuned values:
+      git add src/logots_ui.py && git commit -m "Tune motion constants" && git push origin main
+    The test reports are saved in runs/motion_test_*.txt
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+- Nothing moves and the badge says "Arduino gave up":
+  check the Serial Monitor for "ROT seq=..." or "TRAV seq=..." lines.
+- Any motion: SPACE or the STOP button in the GUI cancels it.

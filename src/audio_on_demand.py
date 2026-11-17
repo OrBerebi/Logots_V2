@@ -53,6 +53,11 @@ VAD_HIGHPASS_HZ = 100     # the I2S mic's baseline drifts at ~1-3 Hz (RMS ~150, 
                           # past 400) — filtered out, silence is ~4 and speech 20-170
 NO_SPEECH_S     = 4.0     # silence only counts once speech starts; give up after this
 MAX_UTTERANCE_S = 28.0    # hard cap (Gemma's audio ceiling is 30 s)
+# Linear gain the GUI's GAIN slider applied to the audio being fed (the frame API's
+# mic_gain_db, set by api_chunks; 1.0 for wav replay). Ears scales SILENCE_RMS by it, so
+# end-of-speech detection behaves the same at any slider setting: at +12 dB the mic's
+# silence alone would otherwise read ~16 and every capture would run to MAX_UTTERANCE_S.
+_source_gain    = 1.0
 ACTION_PORT     = 8788
 MODEL_ID        = "google/gemma-4-E4B-it"
 
@@ -125,7 +130,7 @@ class Ears:
         from scipy.signal import sosfilt
         hp, self._hp_zi = sosfilt(self._hp, chunk.astype(np.float64), zi=self._hp_zi)
         rms = float(np.sqrt(np.mean(hp ** 2)))
-        loud = rms >= SILENCE_RMS
+        loud = rms >= SILENCE_RMS * _source_gain
         # Two loud chunks in a row = speech has started (a lone one is the wake tail
         # or a click); before that, a pause after "Hey Jarvis" must not close it.
         self._loud_chunks = self._loud_chunks + 1 if loud else 0
@@ -284,6 +289,7 @@ def wav_chunks(path: str, realtime: bool = False):
 
 def api_chunks(host: str = "localhost", port: int = 8787):
     """Live mode: pull the mic stream from the frame API, dedupe on frame_id."""
+    global _source_gain
     print(f"[ears] connecting to frame API on {host}:{port} …", flush=True)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from logots_api import get_latest_frame
@@ -305,8 +311,9 @@ def api_chunks(host: str = "localhost", port: int = 8787):
             if last is None:
                 print("[ears] receiving live audio", flush=True)
             last = fr["frame_id"]
-            floats = np.asarray(fr["audio_samples"], dtype=np.float32)
-            pcm = np.concatenate([leftover, (floats * 32767).astype(np.int16)])
+            _source_gain = 10.0 ** (float(fr.get("mic_gain_db") or 0.0) / 20.0)
+            floats = np.clip(np.asarray(fr["audio_samples"], dtype=np.float32), -1.0, 1.0)
+            pcm = np.concatenate([leftover, (floats * 32767).astype(np.int16)])  # >1 would wrap
             n = (len(pcm) // CHUNK) * CHUNK
             for i in range(0, n, CHUNK):
                 yield pcm[i:i + CHUNK]
