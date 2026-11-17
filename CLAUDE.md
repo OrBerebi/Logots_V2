@@ -131,7 +131,7 @@ left out gets switched off (this is how the mic died in June, see Known issues).
     was re-seated so servo 90 = front). The firmware maps it to a servo angle with
     `PAN_CENTER_DEG`/`PAN_DIR` from its calibration block and starts at front on power-up.
   - tilt: 0 to 180 degrees
-- **Motion messages (2026-11-10, untested on the robot — see Known issues)**: sent once,
+- **Motion messages (2026-11-10, passed the live test 2026-11-17 — see Known issues)**: sent once,
   the Arduino runs the wheels to an encoder-count target and stops by itself (`motion.h`):
   - `"R,{seq},{counts},{fast},{slow},{ramp},{kb}\n"` — rotate on the spot until
     `(right_delta − left_delta)/2` reaches `counts` (+ = left turn)
@@ -238,7 +238,7 @@ Frames are read from the FIFO in `CameraReader` thread. PIL (not cv2) used for d
   - **Servo** = the PAN and TILT sliders (right column). TILT is signed since 2026-11-10:
     0 = level, + = up, shown as `TLT:+10°`. Internally `tilt_angle` is still the raw servo
     angle (wire, CSV, frame API), converted by `tilt_to_raw()`/`tilt_from_raw()` with
-    `TILT_LEVEL_DEG`/`TILT_DIR` — which way is "up" is a guess until checked on the robot.
+    `TILT_LEVEL_DEG`/`TILT_DIR` — checked on the robot 2026-11-17 (`TILT_DIR = -1`, level at 90).
   Each press sends one command to `Mover`; the robot carries it out and stops by itself.
 - Keyboard: W/S = traverse `TRAV_KEY_STEP_CM` (10 cm) forward/back, A/D = rotate
   `ROT_KEY_STEP_DEG` (15°) left/right, one step per press (a held key starts the next step
@@ -686,8 +686,29 @@ calibration" in Known issues); git credentials ("Git setup").
    testing (`speaker-test`, `aplay`, etc.) from a NoMachine terminal.
 
 ## Known issues / next steps
-- **Motion commands (traverse / rotate / servo) written 2026-11-10 and NOT YET RUN ON THE
-  ROBOT — Asaph, start here.** Or wrote them on the Mac with the robot in Berlin. What was
+- **Motion live test, 2026-11-17 (Asaf on the robot, commit `df747df`) — passed.**
+  Reports in `runs/motion_test_*_20261117_*.txt` on the Jetson (gitignored).
+  - Raised 29/30, floor 86/88, tape 8/8. Tape: 100 cm drive measured 99 cm (twice), 0.5 cm
+    sideways; 90° turn measured 90°. Floor: 4×90° back within 1.2°, out-and-back traverses
+    end 0.6 cm from the start.
+  - Tuned: `TILT_DIR = -1` (slider up tilted the camera down); `SPIN_COUNTS_PER_DEG` 20 →
+    **27.5** (measured 27.2–27.9 on every turn). `SPIN_DIR`, `TRAV_STEER_K`, `TILT_LEVEL_DEG`
+    were fine as they were.
+  - **Servo moves reset the Arduino** (found here): the encoder counts went back to 0 mid
+    servo sweep — the position jumped ~10 cm with the wheels still — and I2C dropped ~1 s.
+    Reproduced 1 in 3 rounds of the sweep. Both MG90S run off the Arduino's own 5V regulator;
+    starting them at full speed most likely dips it. **Fixed** in firmware:
+    `SERVO_SPEED_DELAY` 1 → 10 ms/deg (~100°/s): 0 resets in 40 moves after the reflash.
+  - **Still open, left on purpose**: 2 of those 40 servo moves still failed one I2C write.
+    The GUI disconnects on a single failed write (`_send_motors()`) and reconnects within
+    3 s, so the servo report says "Arduino not connected". Cheapest fix if it matters: retry
+    the write once before `_disc()`. Proper fix: a capacitor or own 5V supply for the servos.
+  - Known limitation of the test: a 10 cm traverse ran at 3.7 cm/s, just under the test's
+    4 cm/s floor (short drives are mostly ramp). Not a problem.
+  - Gotcha for Claude: `pkill -f '<pattern>'` kills the calling shell too when the same
+    command line contains the pattern. Use `pgrep -f '^python src/logots_ui[.]py'` + `kill`.
+- **Motion commands (traverse / rotate / servo), written 2026-11-10 — the original first-run
+  recipe, kept for a new robot.** Or wrote them on the Mac with the robot in Berlin. What was
   checked: the firmware compiles; `motion.h` reaches its count target against a simulated
   motor model on a PC (sticky wheels, unequal wheels, steer, cancel, watchdog, dead motors);
   the GUI side passes 42 checks against a fake Arduino and fake IMU (rotate with a wrong
