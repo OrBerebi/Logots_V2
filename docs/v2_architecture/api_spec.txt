@@ -1,0 +1,530 @@
+LOGOTS ROBOT API
+================
+For Asaph, from Or. 2026-11-17.
+
+How your code reaches the robot's hardware:
+
+    READ the robot     get_latest_frame()   camera, IMU, mic, position, servos
+    MOVE the robot     ep.publish(...)      traverse (drive), rotate (turn)
+    MOVE the camera    ep.publish(...)      servo (pan, tilt)
+    SPEAK              speak("...")         the loudspeaker
+
+The first three go through the robot layer (the GUI). The loudspeaker is
+played directly from your own process (section 4).
+
+The robot moves only by traverse, rotate and servo. There is no way to drive
+the motors directly.
+
+Everything here works today, except items marked NEW (agreed, Or builds it
+next) or GOING (still works, removed soon).
+
+Part 1 shows how to use the API. Part 2 has the details.
+
+
+PART 1: HOW TO USE IT
+=====================
+
+
+1. READ THE ROBOT
+-----------------
+
+    from logots_api import get_latest_frame          # src/logots_api.py
+
+    fr = get_latest_frame()
+
+    fr["image"]                          # what the camera sees
+    fr["pos_x"], fr["pos_y"]             # where the robot is
+    fr["heading"]                        # which way it faces
+    fr["audio_samples"]                  # the last ~100 ms of mic audio
+
+You get the newest snapshot as a dict. The GUI makes 10 snapshots a second.
+
+What's in it:
+
+    field          example                meaning
+    -------------  ---------------------  ------------------------------------
+    frame_id       4182                   snapshot number
+    timestamp      "2026-11-17T14:02:11"  when it was taken (local time)
+    image          640x640x3 array        camera, RGB uint8; None = no camera
+    frame_data     "/9j/4AAQSk..."        the same image as base64 JPEG
+    pos_x          0.31                   metres along heading 0
+    pos_y          0.02                   metres along heading 90 (left)
+    heading        12.4                   degrees, + = turned left
+    pan_angle      45                     camera pan: 0 = front, + = left
+    tilt_angle     100                    camera tilt as the RAW servo angle:
+                                          90 = level, so 100 = 10° up
+    yaw            [12.38, 12.40, ...]    IMU degrees from the last ~100 ms
+    pitch, roll    [...]                  the same for pitch and roll
+    audio_samples  [0.002, -0.001, ...]   mic from the last ~100 ms:
+                                          16 kHz, -1 ... +1, ~1600 values
+    mic_gain_db    10                     gain already applied to the audio
+    left_pwm       0                      read-only: what the wheels were
+    right_pwm      0                      told. For logs, not a control
+    sim_mode       false                  true = replaying a recording
+
+To follow the robot live, poll and act on each new frame_id:
+
+    last = None
+    while True:
+        fr = get_latest_frame()
+        if fr["frame_id"] != last:       # a new snapshot
+            last = fr["frame_id"]
+            ...                          # use it
+        time.sleep(0.03)
+
+Errors: ConnectionError = the GUI isn't running. RuntimeError = the GUI has
+just started and has no snapshot yet.
+
+NEW, coming next: fr["traverse"], fr["rotate"] and fr["servo"] will say which
+motion is in effect at that moment. See B.
+
+
+2. MOVE THE ROBOT
+-----------------
+
+    from actions import open_endpoint                # src/actions.py
+    from functions import wait_for_done              # src/functions.py
+
+    ep = open_endpoint()                             # serves :8788
+    a = ep.publish({"action": "traverse", "args": {"cm": 30}})
+    report = wait_for_done(ep, a["action_id"])       # waits; None after 120 s
+
+    print(report)
+    # {"action_id": 1794306249655, "pos_x": 0.31, "pos_y": 0.02,
+    #  "heading": 12.4, "moved_cm": 29.6}
+
+Send one command, wait for its report, then send the next. The robot does the
+whole motion and stops by itself. You don't stream or time anything.
+
+The two wheel commands:
+
+    command   example args       what it does
+    --------  -----------------  ----------------------------------------------
+    traverse  {"cm": -30}        drive straight. + = forward, - = backward
+                                 range -200 ... +200 cm
+    rotate    {"degrees": 90}    turn on the spot. + = left, - = right
+                                 range -180 ... +180°
+
+What comes back:
+
+    every report    action_id, pos_x, pos_y, heading     (pose at the end)
+    traverse adds   moved_cm      how far it really drove (encoders)
+    rotate adds     turned_deg    how far it really turned (IMU)
+    sometimes       problem       text, only when it didn't go exactly as
+                                  asked: "stopped by the user",
+                                  "cm limited to ±200", ...
+
+The numbers are always what really happened. Give problem to the LLM as text.
+
+No report comes, so you wait the full 120 s, when: the GUI is in Sim mode, you
+send any other action (speak, inspect, ...), or args are missing. See D.
+
+GOING: approach_plant {"left_pwm", "right_pwm", "duration_s"} still works so
+today's LLM side keeps running. It's direct motor control, and it's removed
+once actions.md uses traverse, rotate and servo.
+
+
+3. MOVE THE CAMERA
+------------------
+
+The camera sits on two servos: pan (left/right) and tilt (up/down). Point it
+with the servo command, through the same ep as above:
+
+    a = ep.publish({"action": "servo", "args": {"pan": 45, "tilt": 10}})
+    report = wait_for_done(ep, a["action_id"])       # under 1 s
+
+    print(report)
+    # {"action_id": 1794306250112, "pos_x": 0.31, "pos_y": 0.02,
+    #  "heading": 12.4, "pan": 45, "tilt": 10}
+
+    pan    -45 ... +45°    0 = straight ahead    + = left    - = right
+    tilt   -90 ... +90°    0 = level             + = up      - = down
+
+The angles are absolute: where to point, not how far to move from here.
+
+    {"pan": 0,   "tilt": 0}       look straight ahead
+    {"pan": 45,  "tilt": 0}       look 45° to the left
+    {"pan": -30, "tilt": -20}     look 30° to the right and 20° down
+    {"pan": 0,   "tilt": 10}      look ahead, 10° up
+
+Send both angles every time. To change only one, read the other from the
+frame first:
+
+    fr = get_latest_frame()
+    pan_now  = fr["pan_angle"]
+    tilt_now = fr["tilt_angle"] - 90         # tilt_angle in the frame is raw
+    ep.publish({"action": "servo", "args": {"pan": pan_now, "tilt": -15}})
+
+The report's pan and tilt are the angles really set: anything outside the
+range is limited to the edge, and problem says so. The wheels don't move.
+(Which way is "up" hasn't been checked on the robot yet, see J.)
+
+
+4. SPEAK THROUGH THE LOUDSPEAKER
+--------------------------------
+
+    from audio_on_demand import speak                # src/audio_on_demand.py
+
+    speak("Hello, I found a spider plant.")          # returns when it's said
+
+Text to speech with Piper, played on the robot's speaker. This doesn't go
+through the GUI or any port: your process plays the sound itself.
+
+- speak() blocks until playback ends. The first call also loads the voice, so
+  it takes longer.
+- It never raises. If something fails it prints "[mouth] speak failed: ..."
+  and returns, so a correct decision doesn't prove the robot spoke. When
+  testing, check the output for [mouth].
+- Set the GUI's status to "speaking" while it talks (section 5).
+
+To play other audio (a sound file, a beep), use the same output device:
+
+    import sounddevice as sd, soundfile as sf
+    from audio_on_demand import SPEAKER_DEVICE
+
+    data, fs = sf.read("chime.wav")
+    sd.play(data, fs, device=SPEAKER_DEVICE)
+    sd.wait()
+
+Always pass device=SPEAKER_DEVICE. See K for why.
+
+
+5. SHOW WHAT YOU'RE DOING IN THE GUI
+------------------------------------
+
+    ep.set_status(stage="thinking")
+    ep.set_status(last_action="traverse(cm=30)")
+
+The GUI shows stage in its header (MIC: thinking) and last_action in the
+ACTION row of the AUDIO INPUT panel. Stages: off, loading, asleep, listening,
+thinking, acting, speaking, or a routine's name such as initiation. See F.
+
+
+
+PART 2: DETAILS
+===============
+
+    A. Raw HTTP (without the Python helpers)
+    B. The frame fields in more detail
+    C. Sample arrays and polling speed
+    D. Commands: limits, timing, failures
+    E. All problem messages
+    F. Status stages
+    G. Processes and ports
+    H. Recordings and Sim mode
+    I. What the LLM side needs to change
+    J. Not tested yet
+    K. The loudspeaker
+
+
+A. RAW HTTP
+-----------
+
+All HTTP + JSON, no auth.
+
+Frame API, served by the GUI on 0.0.0.0:8787 (other machines can read it):
+
+    GET /latest_frame
+        200  the snapshot: the fields in part 1 except image; yaw, pitch, roll
+             and audio_samples are JSON arrays
+        503  {"error": "no frame yet"}
+        404  {"error": "unknown path, use /latest_frame"}
+        500  {"error": "..."}
+
+Action API, served by the LLM side (actions.py) on localhost:8788. The GUI is
+the client:
+
+    GET /latest_action      the GUI reads the newest action
+        200  {"action_id": 1794306249655, "ts": "2026-11-17T14:02:11.123456",
+              "action": "traverse", "args": {"cm": 30}, "thought": "..."}
+             (thought is optional; the robot ignores it)
+        503  no action published yet
+
+    POST /action_done       the GUI sends the report (part 1, sections 2, 3)
+        204  ok
+        400  body isn't JSON with an action_id
+
+    GET /status             the GUI reads what the listener is doing
+        200  {"stage": "asleep", "last_action": "traverse(cm=30)"}
+
+action_id is unique and grows, also across listener restarts (it starts from
+the clock in ms). The GUI polls /latest_action every 0.2 s and executes each
+action_id once. It only sees the newest action, so an action replaced before
+the GUI read it is never executed: one at a time.
+
+
+B. THE FRAME FIELDS IN MORE DETAIL
+----------------------------------
+
+frame_id
+    Starts at 0 with the GUI and goes back to 0 when a recording stops. In
+    Sim it comes from the CSV and jumps back when the replay loops. Test
+    "changed", not "grew".
+
+image, frame_data
+    Color, 640x640: the camera's 640x480 image stretched to square. No
+    camera: image is None and frame_data is "". The camera has a pink tint
+    (no IR filter).
+
+pos_x, pos_y
+    Estimated from the wheel encoders + IMU heading, about 2% of the distance
+    driven (tape measure, 2026-10-03). Assumes the wheels don't slip. Zeroed
+    when a recording starts and by the POS button in the GUI.
+
+heading
+    The IMU yaw, + = turned left, same sign as rotate. NOT zeroed by POS. It
+    drifts slowly over a long session.
+
+pan_angle
+    The camera pan in effect. Can be -90 ... +90, but the GUI and the servo
+    command stop at ±45.
+
+tilt_angle
+    The RAW tilt servo angle in effect, 0 ... 180, 90 = level. The servo
+    command uses signed tilt: signed = tilt_angle - 90, + = up.
+
+audio_samples, mic_gain_db
+    16 kHz floats. Processed in this order: high-pass at 40 Hz (removes the
+    mic's slow drift), gain (the GAIN slider, mic_gain_db, -30 ... +20 dB),
+    clipped to ±1. If you threshold on loudness, scale the threshold by the
+    gain: the listener's wake-word code does.
+
+left_pwm, right_pwm
+    Read-only, -255 ... +255. During a traverse or rotate they show the
+    nominal PWM, not what the Arduino really applied. Kept for recordings and
+    diagnosis.
+
+NEW, motion fields. Each snapshot will also say which motion is in effect,
+with the same names and units as the commands:
+
+    "traverse": {"cm": 30, "moved_cm": 12.4, "source": "llm"}
+    "rotate":   {"degrees": -45, "turned_deg": -20.1, "source": "gui"}
+    "servo":    {"pan": 45, "tilt": 10}
+
+    traverse, rotate: null when none is running. cm / degrees = the target,
+    moved_cm / turned_deg = progress so far. source = "llm" (from :8788) or
+    "gui" (a button or key in the GUI).
+    servo: always there, the angles in effect, signed like the command.
+    Recorded in the CSV too; old recordings give null.
+
+
+C. SAMPLE ARRAYS AND POLLING SPEED
+----------------------------------
+
+yaw, pitch, roll and audio_samples hold one snapshot's worth, about 100 ms.
+They do NOT hold "everything since your last request". The GUI empties its
+sensor buffers into a new snapshot every tick, whether anyone reads it or not,
+and serves only the newest one. Ask again after 5 s and you get the last
+~100 ms; the rest is gone for you (it's in the CSV if REC is on).
+
+- For audio without gaps (the wake word), poll faster than 10 Hz and check
+  that frame_id went up by exactly 1. A bigger jump means missed snapshots.
+  The listener's api_chunks() polls every 30 ms.
+- If the GUI runs slower than 10 Hz, a snapshot just covers more time and
+  holds more samples. Nothing is lost on the GUI side.
+- Image, position, heading and servo angles are "latest value" fields, so a
+  slow client loses nothing there.
+
+
+D. COMMANDS: LIMITS, TIMING, FAILURES
+-------------------------------------
+
+Limits. A value outside the range is limited to the edge, the robot does that,
+and problem says so ("cm limited to ±200"). Numbers may be int or float.
+Servo angles are rounded to whole degrees.
+
+traverse
+    Distance comes from the wheel encoders. The heading at the start is held
+    from the IMU while driving. cm = 0 reports at once without moving.
+
+rotate
+    After the turn the IMU is checked, and up to 3 correction passes run until
+    it is within 1.5°. turned_deg comes from the IMU, or from the encoders if
+    there is no IMU.
+
+servo
+    Both pan and tilt are required (a missing one means no report, see
+    below). The report is sent once the servos have had time to arrive,
+    about 2 ms per degree of travel plus 0.25 s.
+
+How long: traverse about 6 s per metre, rotate a few seconds (limit 20 s),
+servo under 1 s. functions.py's DONE_WAIT_S = 120 s covers all of them.
+
+No report ever comes, and the wait runs out, when:
+- the GUI is in Sim mode (actions are read and dropped)
+- args are missing or not numbers, e.g. {"cm": "thirty"}
+- the action isn't traverse, rotate, servo or approach_plant
+- the GUI isn't running, or closes during the command
+- a newer action replaced it before the GUI read it (see A)
+
+People and the GUI:
+- A person can always stop a motion with SPACE or STOP in the GUI. The command
+  ends and still reports, with problem "stopped by the user".
+- While your command runs, the GUI's motion buttons are ignored.
+- If a motion started from the GUI is still running, your command waits for it
+  to end, then runs.
+- The LLM side has no cancel.
+
+Until the Arduino gets the 2026-11-10 firmware, traverse and rotate report at
+once with problem "Arduino needs the new firmware (reflash)" and nothing
+moves. servo works either way.
+
+Lines for knowledge/actions.md, ready to paste:
+
+    traverse:  cm:int(-200..200)
+    rotate:    degrees:int(-180..180)
+    servo:     pan:int(-45..45), tilt:int(-90..90)
+
+
+E. ALL PROBLEM MESSAGES
+-----------------------
+
+Several are joined with "; ". Treat them as text for the LLM, not codes: the
+wording may change.
+
+    cm limited to ±200
+    degrees limited to ±180
+    pan limited to ±45
+    tilt limited to what the servo can reach
+    stopped by the user                   SPACE or STOP in the GUI
+    timed out after N s                   traverse: 10 s + 0.3 s per cm;
+                                          rotate: 20 s
+    Arduino not connected
+    Arduino disconnected
+    Arduino needs the new firmware (reflash)
+    no encoder reading from the Arduino
+    Arduino gave up: wheels not turning?
+    Arduino stopped it (lost contact with the Jetson)
+    stopped +N.N cm from the target       traverse ended more than 1 cm off
+    still +N.N° off after N passes        rotate didn't get within 1.5°
+    turned the wrong way: flip SPIN_DIR in logots_ui.py     (setup error)
+    no IMU: wheels matched, heading not checked
+    no IMU: angle from the wheel encoders only
+    traverse did not run
+    rotate did not run
+
+
+F. STATUS STAGES
+----------------
+
+    off          no listener or routine active
+    loading      model loading
+    asleep       waiting for the wake word
+    listening    recording a request
+    thinking     Gemma deciding
+    acting       waiting for a command to finish
+    speaking     Piper speaking
+    initiation   running the initiation routine (for any routine, send its
+                 name)
+
+The GUI reads /status 5 times a second. Any other stage is shown as-is
+("MIC: <stage>"). The LLM indicator shows "ready" for every stage except off
+and loading. The GUI works out two states itself: "loading" while the listener
+it started is running but :8788 doesn't answer yet, and "error" once that
+process has exited. last_action is shown up to 120 characters, and the GUI
+keeps the last non-empty one.
+
+
+G. PROCESSES AND PORTS
+----------------------
+
+    port   served by                  read by     what
+    8787   GUI (logots_ui.py)         LLM side    frame API
+    8788   listener (functions.py)    GUI         actions, reports, status
+    8789   listener                   listener    llama-server (internal)
+
+- The GUI starts the listener itself, right after launch:
+      <the GUI's python> src/functions.py --listen
+  LISTEN=0 in the environment skips that, for a manual functions.py run.
+- When the GUI closes it sends the listener SIGTERM, waits up to 8 s, then
+  kills it. The listener must exit on SIGTERM and stop its llama-server (it
+  does today).
+- Only one process can hold :8788. open_endpoint() returns None if it's taken
+  (start the GUI with LISTEN=0 to run your own).
+- If the GUI crashes, the listener keeps running, and a new GUI works with it.
+
+
+H. RECORDINGS AND SIM MODE
+--------------------------
+
+REC in the GUI writes one row per snapshot to
+
+    recordings/session_YYYYMMDD_HHMMSS/session_YYYYMMDD_HHMMSS.csv
+
+with the frame fields except image and sim_mode (lists as JSON strings). SIM in
+the GUI replays a CSV through :8787 at the recorded pace, so your code sees the
+same API with sim_mode = true. Commands are not executed in Sim. No robot
+needed:
+
+    LISTEN=0 conda run -n logots python src/logots_ui.py   # then SIM, a CSV
+
+Older recordings may lack pos_x / pos_y / heading (read as 0) or mic_gain_db
+(0 dB). Before 2026-10-03, pan_angle holds the raw servo angle.
+
+
+I. WHAT THE LLM SIDE NEEDS TO CHANGE
+------------------------------------
+
+1. knowledge/actions.md: add traverse, rotate and servo (lines in D), explain
+   units and signs to the LLM as in part 1, and delete approach_plant.
+2. functions.py run_function(): the step history shows only position. A
+   rotate or servo doesn't change position, so it reads as "no change", and
+   the prompt's rule then tells the model to give up. Add heading for rotate,
+   pan/tilt for servo, and problem when present (all in the report).
+3. STEP_PROMPT: replace "several approach_plant drives in a row are normal"
+   with the new commands.
+4. Publish on :8788, and wait for a report, only for traverse / rotate /
+   servo. Today run_function() publishes every action except inspect and
+   finish, so a speak during initiation waits 120 s for a report that never
+   comes. (actions.md says speak is "executed by: actuator", but the robot
+   doesn't execute it.)
+5. mrt_experience._row() keeps pan_angle but not tilt_angle, so the LLM can't
+   see the tilt it set. Add it if the prompts should mention tilt.
+6. Tell Or when it's done. Or then removes approach_plant from the robot and
+   builds the NEW frame fields.
+
+
+J. NOT TESTED YET
+-----------------
+
+- traverse, rotate and servo have never run on the robot. They were written
+  2026-11-10 and tested only against a fake Arduino and IMU. Expect a tuning
+  round. Live test: src/motion_live_test.py (README, "Testing motion").
+- Which way tilt "up" goes, and whether tilt 0 is really level, are guesses
+  until checked on the robot.
+- No obstacle detection. That's why one traverse is capped at 2 m.
+
+
+K. THE LOUDSPEAKER
+------------------
+
+Hardware: an I2S amplifier on the Jetson's 40-pin header (pin 40), wired by
+Or. Software: driven from the LLM side's process with sounddevice. The GUI
+isn't involved.
+
+Output device, SPEAKER_DEVICE in audio_on_demand.py:
+- On the robot (Linux): "demixer", a named ALSA device defined in
+  /etc/asound.conf. It converts any sample rate to the hardware's 48 kHz and
+  lets several programs play at once. Robot #1's block is saved in
+  docs/robot1_system/asound_demixer.conf for setting up a new Jetson.
+- On a Mac: None, meaning the Mac's default output.
+- The SPEAKER_DEVICE environment variable overrides both.
+
+Don't play to ALSA "default" (or no device) on the robot. Under NoMachine,
+"default" goes to the remote client's speakers (your laptop), not the robot.
+Don't use the raw "hw:1,0" either: it has no rate conversion, so Piper's
+22050 Hz plays sped up. For a manual test from a NoMachine terminal, run
+unset PULSE_SERVER first.
+
+Voice: ~/models/piper/en_US-lessac-medium.onnx (PIPER_VOICE overrides it). It
+isn't in the repo; download it once per machine (README).
+
+The mic hears the speaker. The robot's own speech shows up in audio_samples on
+:8787 and in recordings, with no echo cancellation. The listener isn't
+listening while it handles a request, so it doesn't react to its own voice.
+
+Open question for Or and Asaph: the mic goes through the GUI, the speaker
+doesn't. That works, but the GUI only knows the robot is talking from the
+"speaking" stage, and recordings don't mark it. Moving the speaker behind the
+GUI (e.g. a speak command on :8788 that the GUI plays) would put all hardware
+behind one layer. Not decided.
